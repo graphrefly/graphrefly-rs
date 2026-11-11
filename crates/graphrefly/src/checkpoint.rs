@@ -1385,14 +1385,6 @@ fn prepare_checkpoint(
             }
         };
         validate_checkpoint_node_json(node)?;
-        // A computed node with private state saved without what it received is from
-        // an earlier format: refused, never completed from its dependencies.
-        if !node.deps.is_empty() && node.private_state.is_some() && node.received.is_none() {
-            return Err(GraphRestoreError::new(format!(
-                "restore_graph: node '{}' lacks the record of what it received (R-checkpoint)",
-                node.id
-            )));
-        }
         if let Some(received) = &node.received {
             let current = node.lifetime_deps.as_ref().unwrap_or(&node.deps);
             if received.len() != current.len() {
@@ -1573,6 +1565,18 @@ fn construct_prepared(
                     .collect::<RestoreResult<Vec<_>>>()
             })
             .transpose()?;
+        // A computed node saved with a lifetime (private state, a lifetime's own
+        // dependencies, or values while it has not ended) must carry what it received;
+        // without it the checkpoint is refused, never completed from its dependencies'
+        // values (R-checkpoint@1).
+        let saved_lifetime = node.private_state.is_some()
+            || node.lifetime_deps.is_some()
+            || (matches!(node.terminal, GraphCheckpointTerminal::None) && !node.values.is_empty());
+        if !core.is_state() && saved_lifetime && node.received.is_none() {
+            return Err(GraphRestoreError::new(format!(
+                "restore_graph: node '{id}' lacks the record of what it received (R-checkpoint)"
+            )));
+        }
         core.restore_seed(NodeSeed {
             values: json_values(&node.values),
             ended: terminal_from_json(&node.terminal),

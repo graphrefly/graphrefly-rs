@@ -34,10 +34,7 @@ use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
-use crate::batch::{
-    active_batch_committed_token, boundary_drains_blocked, collecting_batch, defer_to_batch,
-    register_boundary_root,
-};
+use crate::batch::{batch_frame_open, collecting_batch, defer_to_batch};
 use crate::checkpoint::{
     unregister_backend_state_contributor, unregister_backend_state_contributor_key,
 };
@@ -319,6 +316,15 @@ pub(crate) fn prepare_output(msgs: Wave<AnyValue>) -> Vec<Wave<AnyValue>> {
     frames
 }
 
+/// A queued host input that finds its node ended is refused (R-terminals); the panic
+/// reaches the host reporter as the queued request's failure (R-failure@3).
+fn refuse_if_ended(core: &Core) {
+    assert!(
+        !core.with_inner_edges(|_, e| e.value.terminal),
+        "host input to an ended node is refused (R-terminals)"
+    );
+}
+
 /// Panics when an array breaks the written-order rules: a terminal must be last, and
 /// START is not output (R-wave, R-messages).
 fn check_output_shape(msgs: &[Msg]) {
@@ -423,8 +429,6 @@ struct GraphCore {
     touched_waves: Vec<u64>,
     pins: Vec<usize>,
     free: Vec<usize>,
-    deferred_boundary: VecDeque<BoundaryTask>,
-    draining_boundary: bool,
     /// The domain's host reporter (R-failure@3, R-graph-domain@3).
     reporter: Option<crate::report::HostReporter>,
     /// The graph's wave, request queue and batch (R-graph-domain@3).
@@ -500,8 +504,6 @@ impl GraphCore {
             touched_waves: Vec::new(),
             pins: Vec::new(),
             free: Vec::new(),
-            deferred_boundary: VecDeque::new(),
-            draining_boundary: false,
             reporter: None,
             domain: Domain::new(),
         }
@@ -1631,13 +1633,6 @@ impl ArenaNodePin {
         let (n, e) = g.get_node_and_edges_mut(self.arena_key.node);
         reset_wave_flags_inner(n, e);
     }
-
-    fn boundary_root(&self) -> BoundaryRoot {
-        BoundaryRoot {
-            graph_id: self.arena_key.graph,
-            graph: Rc::downgrade(&self.graph),
-        }
-    }
 }
 
 impl Drop for ArenaNodePin {
@@ -1660,10 +1655,6 @@ impl BatchTarget {
 
     pub(crate) fn matches(&self, core: &Core) -> bool {
         self.pin.arena_key == core.arena_node_key()
-    }
-
-    pub(crate) fn boundary_root(&self) -> BoundaryRoot {
-        self.pin.boundary_root()
     }
 
     pub(crate) fn borrowed_core(&self) -> Option<Core> {
@@ -1884,131 +1875,6 @@ impl DeferredDeliveryAction {
     }
 }
 
-#[derive(Clone)]
-struct CoreToken {
-    graph_id: usize,
-    key: NodeKey,
-    refs: Weak<Cell<usize>>,
-}
-
-impl CoreToken {
-    fn from_core(core: &Core) -> Self {
-        Self {
-            graph_id: Rc::as_ptr(&core.graph) as usize,
-            key: core.key(),
-            refs: Rc::downgrade(&core.refs),
-        }
-    }
-
-    fn pinned_borrowed_core(&self, graph: &Rc<RefCell<GraphCore>>) -> Option<PinnedBorrowedCore> {
-        if Rc::as_ptr(graph) as usize != self.graph_id {
-            return None;
-        }
-        let refs = self.refs.upgrade()?;
-        {
-            let mut g = graph.borrow_mut();
-            if !(g.is_live_key(self.key) && (refs.get() != 0 || g.pin_count(self.key) != 0)) {
-                return None;
-            }
-            if !g.pin_live_key(self.key) {
-                return None;
-            }
-        }
-        let arena_key = ArenaNodeKey {
-            graph: Rc::as_ptr(graph) as usize,
-            node: self.key,
-        };
-        Some(PinnedBorrowedCore {
-            _pin: ArenaNodePin {
-                arena_key,
-                graph: graph.clone(),
-                refs: refs.clone(),
-            },
-            core: Core::from_borrowed_parts(graph.clone(), self.key.id, self.key.generation, refs),
-        })
-    }
-}
-
-struct BoundaryDrainGuard {
-    graph: Rc<RefCell<GraphCore>>,
-    active: bool,
-}
-
-impl BoundaryDrainGuard {
-    fn enter(graph: &Rc<RefCell<GraphCore>>) -> Self {
-        graph.borrow_mut().draining_boundary = true;
-        Self {
-            graph: graph.clone(),
-            active: true,
-        }
-    }
-
-    fn finish(mut self) {
-        self.active = false;
-        self.graph.borrow_mut().draining_boundary = false;
-    }
-}
-
-impl Drop for BoundaryDrainGuard {
-    fn drop(&mut self) {
-        if self.active {
-            self.graph.borrow_mut().draining_boundary = false;
-        }
-    }
-}
-
-struct PinnedBorrowedCore {
-    _pin: ArenaNodePin,
-    core: Core,
-}
-
-enum BoundaryTask {
-    Down {
-        target: CoreToken,
-        frames: Vec<Wave<AnyValue>>,
-        committed: Rc<Cell<bool>>,
-    },
-}
-
-impl BoundaryTask {
-    fn committed(&self) -> bool {
-        match self {
-            BoundaryTask::Down { committed, .. } => committed.get(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct BoundaryRoot {
-    graph_id: usize,
-    graph: Weak<RefCell<GraphCore>>,
-}
-
-impl BoundaryRoot {
-    fn from_core(core: &Core) -> Self {
-        Self {
-            graph_id: Rc::as_ptr(&core.graph) as usize,
-            graph: Rc::downgrade(&core.graph),
-        }
-    }
-
-    pub(crate) fn same_graph(&self, core: &Core) -> bool {
-        self.graph_id == Rc::as_ptr(&core.graph) as usize
-    }
-
-    pub(crate) fn same_root(&self, other: &Self) -> bool {
-        self.graph_id == other.graph_id
-    }
-
-    fn upgrade(&self) -> Option<Rc<RefCell<GraphCore>>> {
-        self.graph.upgrade()
-    }
-}
-
-pub(crate) fn boundary_root_for(target: &Core) -> BoundaryRoot {
-    BoundaryRoot::from_core(target)
-}
-
 /// Reset `inside_run_wave` on scope exit — including unwind, so a panicking function
 /// leaves the flag clean per frame (mirrors TS's try/finally around
 /// `dispatcher.invoke`). The *other* stale wave-flags an unwinding panic leaves on
@@ -2058,13 +1924,9 @@ impl Drop for DepMutationGuard {
 /// ran. When the outermost owner's wave ends, it drains the boundary tasks and then
 /// the queued requests (R-request-order@2).
 struct WaveScope {
-    owner_graph_id: usize,
     /// Process-local wave id used to mark arena nodes once per wave without a
     /// per-touch hash lookup (DR-8/B54 owner-execution hot path).
     wave_id: u64,
-    /// Graph roots that received committed-boundary tasks during this wave but are not
-    /// necessarily the wave owner's graph (nested cross-arena public calls share WAVE).
-    boundary_roots: Vec<BoundaryRoot>,
     /// Every node that mutated a transient wave-flag this wave. DR-8/B54: these are
     /// arena pins keyed by (graph, node id, generation), not counted Core clones.
     touched: Vec<ArenaNodePin>,
@@ -2136,19 +1998,6 @@ fn wave_register(core: &Core) {
     with_wave(&core.domain(), |w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
             let _ = scope.pin_once(core.arena_node_key(), &core.graph, &core.refs);
-        }
-    });
-}
-
-fn wave_register_boundary_root(core: &Core) {
-    with_wave(&core.domain(), |w| {
-        if let Some(scope) = w.borrow_mut().as_mut() {
-            if scope.owner_graph_id == Rc::as_ptr(&core.graph) as usize
-                || scope.boundary_roots.iter().any(|r| r.same_graph(core))
-            {
-                return;
-            }
-            scope.boundary_roots.push(BoundaryRoot::from_core(core));
         }
     });
 }
@@ -2389,9 +2238,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
     }
     with_wave(&d, |w| {
         *w.borrow_mut() = Some(WaveScope {
-            owner_graph_id: Rc::as_ptr(&owner.graph) as usize,
             wave_id: next_wave_scope_id(),
-            boundary_roots: Vec::new(),
             touched: Vec::new(),
             blamed: None,
         });
@@ -2402,7 +2249,6 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
         .borrow_mut()
         .take()
         .expect("wave owner installed a scope");
-    let boundary_roots = std::mem::take(&mut scope.boundary_roots);
     let ret = match result {
         Ok(r) => r,
         Err(payload) => {
@@ -2442,149 +2288,12 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
         }
     };
     drop(std::mem::take(&mut scope.touched));
-    // The wave has ended: drain the boundary tasks (a quiet node's later output) and
-    // then the requests made during the wave, each as a wave of its own
-    // (R-request-order@2). An open batch frame holds the drain until its commit.
-    if !boundary_drains_blocked(&d) {
-        drain_committed_boundaries(std::slice::from_ref(owner), &boundary_roots);
+    // The wave has ended: the requests made during it run, each as a wave of its own
+    // (R-request-order@2). An open batch frame holds them until its commit.
+    if !batch_frame_open(&d) {
         drain_requests(&d);
     }
     ret
-}
-
-fn defer_boundary(owner: &Core, task: BoundaryTask) {
-    wave_register_boundary_root(owner);
-    register_boundary_root(owner);
-    owner.graph.borrow_mut().deferred_boundary.push_back(task);
-}
-
-pub(crate) fn drain_committed_boundary(target: &Core) {
-    drain_deferred_rewires(target);
-}
-
-pub(crate) fn drain_committed_boundary_root(root: &BoundaryRoot) {
-    if let Some(graph) = root.upgrade() {
-        drain_deferred_rewires_for_graph(&graph);
-    }
-}
-
-pub(crate) fn drain_committed_boundaries(core_roots: &[Core], task_roots: &[BoundaryRoot]) {
-    let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
-    for root in core_roots {
-        let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary(root)));
-        if let Err(payload) = result {
-            remember_first_boundary_panic(&mut escaped, Err(payload));
-        }
-    }
-    for root in task_roots {
-        let result = catch_unwind(AssertUnwindSafe(|| drain_committed_boundary_root(root)));
-        if let Err(payload) = result {
-            remember_first_boundary_panic(&mut escaped, Err(payload));
-        }
-    }
-    if let Some(e) = escaped {
-        std::panic::resume_unwind(e);
-    }
-}
-
-fn remember_first_boundary_panic(
-    escaped: &mut Option<Box<dyn std::any::Any + Send>>,
-    result: std::thread::Result<()>,
-) {
-    if let Err(e) = result {
-        if escaped.is_none() {
-            *escaped = Some(e);
-        }
-    }
-}
-
-pub(crate) fn clear_deferred_boundary_root(root: &BoundaryRoot) {
-    if let Some(graph) = root.upgrade() {
-        graph
-            .borrow_mut()
-            .deferred_boundary
-            .retain(BoundaryTask::committed);
-    }
-}
-
-/// Drain the deferred-rewire FIFO at the committed boundary. Each thunk applies one queued
-/// self-rewire as a FRESH wave (its own wave-owner) which may enqueue MORE — appended and
-/// drained by this same loop (DrainExactlyOnce). A single global FIFO yields the drain order
-/// for free: issue order during a synchronous cascade IS causal order (a dep settles before
-/// its dependent's fn runs), so global-FIFO == per-node FIFO + causal-node order. Per-thunk
-/// isolation: a thunk that panics does NOT abandon the rest of the queue (which would strand
-/// thunks to mis-fire at an unrelated later wave); the first escape re-surfaces once the
-/// queue is empty. Process-global is correct per D22 (one sync cascade per causal domain;
-/// cross-domain is the async wire bridge, which never shares this stack — same basis as the
-/// module-global `batch.active`).
-fn drain_deferred_rewires(owner: &Core) {
-    drain_deferred_rewires_for_graph(&owner.graph);
-}
-
-fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
-    if graph.borrow().draining_boundary {
-        return; // a nested wave-owner exit during the drain — the outer loop owns draining
-    }
-    if graph.borrow().deferred_boundary.is_empty() {
-        return; // F-PERF: one empty-queue check per outermost wave when unused (behavior-neutral)
-    }
-    let drain_guard = BoundaryDrainGuard::enter(graph);
-    let mut escaped: Option<Box<dyn std::any::Any + Send>> = None;
-    let mut blocked = 0usize;
-    loop {
-        let task = {
-            let mut g = graph.borrow_mut();
-            if g.deferred_boundary.is_empty() {
-                None
-            } else {
-                g.deferred_boundary.pop_front()
-            }
-        };
-        let Some(task) = task else { break };
-        match catch_unwind(AssertUnwindSafe(|| run_boundary_task(graph, task))) {
-            Ok(Some(task)) => {
-                let queued = {
-                    let mut g = graph.borrow_mut();
-                    g.deferred_boundary.push_back(task);
-                    g.deferred_boundary.len()
-                };
-                blocked += 1;
-                if blocked >= queued {
-                    break;
-                }
-            }
-            Ok(None) => {
-                blocked = 0;
-            }
-            Err(e) => {
-                blocked = 0;
-                if escaped.is_none() {
-                    escaped = Some(e);
-                }
-            }
-        }
-    }
-    drain_guard.finish();
-    if let Some(e) = escaped {
-        std::panic::resume_unwind(e);
-    }
-}
-
-fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) -> Option<BoundaryTask> {
-    match task {
-        BoundaryTask::Down {
-            target,
-            frames,
-            committed,
-        } => {
-            if committed.get() {
-                if let Some(node) = target.pinned_borrowed_core(graph) {
-                    node.core.owned_publish(frames);
-                }
-            }
-        }
-    }
-    None
 }
 
 impl Core {
@@ -2685,7 +2394,7 @@ impl Core {
         if !g.is_live_key(key) {
             return true;
         }
-        if g.pin_count(key) != 0 || g.draining_boundary || !g.deferred_boundary.is_empty() {
+        if g.pin_count(key) != 0 {
             return false;
         }
         let e = g
@@ -3495,6 +3204,16 @@ impl Core {
                     end.push(vec![Message::Invalidate]);
                 }
                 end.push(vec![Message::Error(error.to_string().into())]);
+                if self.with_config(|cfg| cfg.quiet) {
+                    // A quiet node's output is a later wave: the INVALIDATE goes with
+                    // the ERROR (R-wave).
+                    self.with_inner_edges_mut(|_, e| e.wave.pending = false);
+                    let lifetime = self.open_lifetime();
+                    if lifetime.is_some() {
+                        self.publish_later(lifetime, end);
+                    }
+                    return;
+                }
                 self.publish(end);
             }
             SettlePlan::Run {
@@ -3523,16 +3242,20 @@ impl Core {
                     Vec::new()
                 };
                 if quiet {
-                    // What a quiet node outputs is a later wave of its own; only an auto
-                    // INVALIDATE goes on now (R-wave).
+                    // What a quiet node outputs is a later wave of its own, a request
+                    // made through its lifetime; only an auto INVALIDATE goes on now
+                    // (R-wave). Its pending mark is cleared first, so that INVALIDATE
+                    // marks its cone pending and a diamond below settles once.
+                    self.with_inner_edges_mut(|_, e| e.wave.pending = false);
                     if !lead.is_empty() {
                         self.deliver_out(lead);
                     }
-                    self.with_inner_edges_mut(|_, e| e.wave.pending = false);
-                    let mut later = out;
-                    later.extend(postlude);
-                    if !later.is_empty() {
-                        self.request_publish_next(later);
+                    let lifetime = self.open_lifetime();
+                    if lifetime.is_some() {
+                        self.publish_later(lifetime, out);
+                        if !postlude.is_empty() {
+                            self.publish_later(lifetime, postlude);
+                        }
                     }
                     return;
                 }
@@ -3619,16 +3342,35 @@ impl Core {
 
     // ── boundary tasks ──
 
+    /// Sends `msgs` from this node as a later wave: a request, run after the current
+    /// wave in the order requests were made (R-request-order@2).
     pub(crate) fn request_down_next(&self, msgs: Wave<AnyValue>) {
-        defer_boundary(
-            self,
-            BoundaryTask::Down {
-                target: CoreToken::from_core(self),
-                frames: prepare_output(msgs),
-                committed: active_batch_committed_token(&self.domain())
-                    .unwrap_or_else(|| Rc::new(Cell::new(true))),
-            },
-        );
+        let frames = prepare_output(msgs);
+        self.publish_later(None, frames);
+    }
+
+    /// Queues `frames` as a later wave from this node. Made through `lifetime`, it is
+    /// dropped if that lifetime has closed by the time it runs (R-lifetime@2). The
+    /// request holds the node weakly: a node dropped meanwhile is skipped.
+    fn publish_later(&self, lifetime: Option<u64>, frames: Vec<Wave<AnyValue>>) {
+        if frames.is_empty() {
+            return;
+        }
+        let weak = self.downgrade();
+        request(self, move || {
+            let Some((_pin, core)) = weak.pinned_borrowed_core() else {
+                return;
+            };
+            if lifetime.is_some_and(|id| !core.lifetime_open(id)) {
+                return;
+            }
+            core.owned_publish(frames);
+        });
+    }
+
+    /// The id of the node's open lifetime, if it has one.
+    fn open_lifetime(&self) -> Option<u64> {
+        self.with_aux(|a| a.lifetime.as_ref().map(|lt| lt.id))
     }
 
     /// The surgical Option-C mutation + settle (D42), run under a wave-owner. Kept deps
@@ -4100,30 +3842,22 @@ impl Core {
     /// Output through a kept ctx of `lifetime`: in a batch body it is staged with
     /// its lifetime, so it is dropped at the commit if that lifetime has closed by
     /// then (R-request-order@2).
+    /// The array is checked at the call, so an invalid one panics there (R-failure@3);
+    /// during a wave it is a request, dropped if the lifetime has closed by the time it
+    /// runs (R-lifetime@2).
     pub(crate) fn owned_down_from(&self, lifetime: u64, msgs: Wave<AnyValue>) {
+        if self.with_inner_edges(|_, e| e.value.terminal) {
+            return;
+        }
+        let frames = prepare_output(msgs);
         if crate::batch::collecting_batch(&self.domain()) {
-            if self.with_inner_edges(|_, e| e.value.terminal) {
-                return;
-            }
-            let flat: Wave<AnyValue> = prepare_output(msgs).into_iter().flatten().collect();
+            let flat: Wave<AnyValue> = frames.into_iter().flatten().collect();
             if !flat.is_empty() {
                 crate::batch::defer_to_batch_from(self, flat, lifetime);
             }
             return;
         }
-        self.owned_down(msgs);
-    }
-
-    pub(crate) fn owned_down(&self, msgs: Wave<AnyValue>) {
-        let d = self.domain();
-        if crate::batch::collecting_batch(&d) || !wave_in_flight(&d) {
-            with_wave_owner(self, || self.down(msgs), || {});
-            return;
-        }
-        let core = self.clone();
-        request(&core.clone(), move || {
-            with_wave_owner(&core, || core.down(msgs), || {})
-        });
+        self.publish_later(Some(lifetime), frames);
     }
 
     /// Publishes arrays as one wave of their own, under a fresh wave owner.
@@ -4137,19 +3871,6 @@ impl Core {
                 }
             },
             || {},
-        );
-    }
-
-    /// Queues arrays as a later wave from this node, after the current one.
-    fn request_publish_next(&self, frames: Vec<Wave<AnyValue>>) {
-        defer_boundary(
-            self,
-            BoundaryTask::Down {
-                target: CoreToken::from_core(self),
-                frames,
-                committed: active_batch_committed_token(&self.domain())
-                    .unwrap_or_else(|| Rc::new(Cell::new(true))),
-            },
         );
     }
 
@@ -4532,7 +4253,8 @@ impl<T: 'static> Node<T> {
         }
         let core = self.core.clone();
         request(&core.clone(), move || {
-            with_wave_owner(&core, || core.down(msgs), || {})
+            refuse_if_ended(&core);
+            with_wave_owner(&core, || core.down(msgs), || {});
         });
     }
 
@@ -4633,7 +4355,10 @@ impl<T: 'static> Node<T> {
         let core = self.core.clone();
         let f: NodeFn = Rc::new(f);
         request(&self.core, move || {
-            core.replace_instance(deps, f, opts.setup, opts.recipe)
+            // Checked again when it runs, on the topology the requests before it
+            // committed (R-request-order@2), and before the old lifetime closes.
+            core.check_new_deps("replace", &deps);
+            core.replace_instance(deps, f, opts.setup, opts.recipe);
         });
     }
 
@@ -4729,6 +4454,9 @@ impl<T: 'static> State<T> {
         }
         let core = self.node.core.clone();
         request(&self.node.core, move || {
+            // Checked before the write function runs: it does not run for an ended
+            // state.
+            refuse_if_ended(&core);
             if let Some(v) = erased(core.cache_any()) {
                 with_wave_owner(&core, || core.down(vec![Message::Data(v)]), || {});
             }
@@ -5664,10 +5392,10 @@ mod tests {
     }
 
     #[test]
-    fn touched_arena_pins_release_before_committed_boundary_drain() {
-        // R-rewire-deferred/D47 boundary tasks are fresh waves. A touched node whose
-        // final public handle dropped during the prior wave must be cleaned up before
-        // queued boundary tasks run, not kept alive until after the drain.
+    fn touched_arena_pins_release_before_queued_requests_run() {
+        // Queued requests are fresh waves. A touched node whose final public handle
+        // dropped during the prior wave must be cleaned up before queued requests run,
+        // not kept alive until after the drain.
         let arena = GraphArena::new();
         let graph = arena.0.clone();
         let owner = Node::<i32>::state_in_arena(&arena, 1);
@@ -5683,7 +5411,7 @@ mod tests {
                         saw.set(true);
                         assert!(
                             !graph_for_sink.borrow().is_live_key(victim_key),
-                            "touched pins must release before committed-boundary tasks run"
+                            "touched pins must release before queued requests run"
                         );
                     }
                 };
@@ -5704,7 +5432,7 @@ mod tests {
             || {},
         );
 
-        assert!(saw_boundary.get(), "queued boundary INVALIDATE should run");
+        assert!(saw_boundary.get(), "the queued INVALIDATE should run");
         let reused = Node::<i32>::state_in_arena(&arena, 3);
         assert_eq!(victim_key.id, reused.core.key().id);
         assert_ne!(victim_key.generation, reused.core.key().generation);
@@ -6014,35 +5742,9 @@ mod tests {
     }
 
     #[test]
-    fn stale_boundary_owner_action_does_not_target_reused_slot() {
-        // A queued boundary action may outlive its owner if the owner is dropped before a
-        // later explicit drain. The weak owner token + generation check must turn that
-        // action into a no-op, never an operation on a later node that reused the slot.
-        let arena = GraphArena::new();
-        let old = Node::<i32>::state_in_arena(&arena, 1);
-        let old_key = old.core.key();
-        old.core.request_down_next(vec![Message::Invalidate]);
-        drop(old);
-
-        let reused = Node::<i32>::state_in_arena(&arena, 2);
-        assert_eq!(old_key.id, reused.core.key().id);
-        assert_ne!(old_key.generation, reused.core.key().generation);
-
-        drain_committed_boundary(&reused.core);
-
-        assert_eq!(reused.status().cache, crate::CacheStatus::Ready);
-        assert_eq!(
-            reused.cache(),
-            Some(2),
-            "stale queued owner action must not invalidate the reused slot occupant"
-        );
-    }
-
-    #[test]
-    fn batch_boundary_root_tracking_does_not_pin_queued_owner() {
-        // DR-8/B54: batch needs to remember which graph queues boundary work, but that
-        // graph-root bookkeeping must not retain the node owner. Owner liveness remains
-        // exclusively in the queued task's weak CoreToken.
+    fn queued_later_output_does_not_pin_its_node() {
+        // DR-8/B54: a later wave queued as a request holds its node weakly, so the
+        // queue never keeps a node alive.
         let source = Node::<i32>::state(1);
         let refs = source.core.refs.clone();
 
@@ -6052,7 +5754,7 @@ mod tests {
             assert_eq!(
                 refs.get(),
                 before,
-                "batch boundary root is a weak graph root, not a counted Core"
+                "the queued request holds a weak handle, not a counted Core"
             );
         });
 

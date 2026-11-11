@@ -2825,6 +2825,20 @@ fn c38_capture_and_restore() {
         graphrefly::RestoreGraphOptions::new(registry(&counters)),
     );
     assert!(refused.is_err_and(|e| e.to_string().contains("received")));
+    // Without private state too (a plain map node with values): still refused, not
+    // completed from its dependencies (review F 2.7, C F8).
+    let mut plain = checkpoint.clone();
+    {
+        let p = plain.nodes.iter_mut().find(|n| n.id == "p").unwrap();
+        p.private_state = None;
+        p.received = None;
+        assert!(!p.values.is_empty());
+    }
+    let refused = restore_graph(
+        plain,
+        graphrefly::RestoreGraphOptions::new(registry(&counters)),
+    );
+    assert!(refused.is_err_and(|e| e.to_string().contains("received")));
     let mut v1 = checkpoint.clone();
     v1.version = "graphrefly.checkpoint.v1".into();
     assert!(restore_graph(
@@ -3210,4 +3224,238 @@ fn c47_graphs_on_one_thread_share_no_wave_queue_or_batch() {
     });
     assert_eq!(read, Some(json!(5)), "the read sees b's new value");
     assert_eq!(arrays(&a_log), vec![shape(&["PENDING", "DATA"])]);
+}
+
+// ── Review fixes (REVIEW-D797-migration, graphrefly-rs:D797-KERNEL-MIGRATION-RS) ──
+
+fn quiet_opts() -> graphrefly::NodeOpts {
+    graphrefly::NodeOpts {
+        quiet: true,
+        ..graphrefly::NodeOpts::default()
+    }
+}
+
+/// R-lifetime@2 (review F 2.3): output a kept ctx sends during a wave is a request,
+/// and is dropped if its lifetime has closed by the time it runs, even when a new
+/// lifetime has opened meanwhile.
+#[test]
+fn queued_output_of_a_closed_lifetime_is_dropped() {
+    let g = graphrefly::graph();
+    let (n, slot) = driven_in(&g);
+    let trigger = state_in(&g, 0i32);
+    let old_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(Some(n.subscribe(|_| {}))));
+    let old = slot.borrow_mut().take().expect("first lifetime ran");
+    let fresh: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+    let new_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
+    let _ut = {
+        let (n, fresh, old_unsub, new_unsub) = (
+            n.clone(),
+            fresh.clone(),
+            old_unsub.clone(),
+            new_unsub.clone(),
+        );
+        trigger.subscribe(move |msgs: &[Message<AnyValue>]| {
+            let start = msgs.iter().any(|m| matches!(m, Message::Start));
+            if start || !msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                return;
+            }
+            // All three are requests, run after this wave in this order.
+            if let Some(u) = old_unsub.borrow_mut().take() {
+                u();
+            }
+            let sink = fresh.clone();
+            *new_unsub.borrow_mut() = Some(n.subscribe(move |m: &[Message<AnyValue>]| {
+                sink.borrow_mut()
+                    .push(m.iter().map(|x| kind_of(x).to_owned()).collect());
+            }));
+            old.down(vec![data(999)]);
+        })
+    };
+    trigger.set(1);
+    assert_eq!(
+        *fresh.borrow(),
+        vec![shape(&["START"])],
+        "the old lifetime's output does not reach the new one"
+    );
+    assert_eq!(n.cache(), None);
+}
+
+/// R-lifetime@2 with R-wave@2 (review F 2.3): a quiet node's output is a request made
+/// through its lifetime; when the node loses its last subscriber in the same wave,
+/// the output is dropped and the inactive node holds no value.
+#[test]
+fn quiet_output_after_its_lifetime_closed_is_dropped() {
+    let g = graphrefly::graph();
+    let a = state_in(&g, 1i32);
+    let q_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
+    // Subscribed to `a` before Q is, so this sink's request comes first.
+    let _ua = {
+        let q_unsub = q_unsub.clone();
+        a.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                if let Some(u) = q_unsub.borrow_mut().take() {
+                    u();
+                }
+            }
+        })
+    };
+    let q = derived_in::<i32>(&g, vec![a.erased()], quiet_opts(), |ctx| {
+        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        ctx.emit(v * 10);
+    });
+    *q_unsub.borrow_mut() = Some(q.subscribe(|_| {}));
+    a.set(2);
+    assert_eq!(q.status().lifecycle, graphrefly::Lifecycle::Inactive);
+    assert_eq!(q.cache(), None, "the closed lifetime's output was dropped");
+}
+
+/// R-wave@2 with R-request-order@2 (review F 2.4): a quiet node's output waits until
+/// the wave ends and then runs in the order the requests were made.
+#[test]
+fn quiet_output_runs_in_request_order() {
+    let g = graphrefly::graph();
+    let a = state_in(&g, 0i32);
+    let other = state_in(&g, 0i32);
+    let order: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    // A sink of `a` asks for `other.set(99)` before Q settles in the same wave.
+    let _ua = {
+        let other = other.clone();
+        a.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                other.set(99);
+            }
+        })
+    };
+    let q = derived_in::<i32>(&g, vec![a.erased()], quiet_opts(), |ctx| {
+        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        ctx.emit(v + 100);
+    });
+    let sink = |name: &'static str| {
+        let order = order.clone();
+        move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(|m| matches!(m, Message::Data(_)))
+                && !msgs.iter().any(|m| matches!(m, Message::Start))
+            {
+                order.borrow_mut().push(name.to_owned());
+            }
+        }
+    };
+    let _uq = q.subscribe(sink("q"));
+    let _uo = other.subscribe(sink("other"));
+    order.borrow_mut().clear();
+    a.set(1);
+    assert_eq!(*order.borrow(), vec!["other", "q"]);
+    assert_eq!(q.cache(), Some(101));
+}
+
+/// R-wave@2 (the Rust arm of review F 2.10): the auto INVALIDATE a quiet node passes
+/// on now marks its cone pending, so a diamond below settles once.
+#[test]
+fn quiet_auto_invalidate_settles_a_diamond_once() {
+    let g = graphrefly::graph();
+    let a = state_in(&g, 1i32);
+    let q = derived_in::<i32>(&g, vec![a.erased()], quiet_opts(), |ctx| {
+        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        ctx.emit(v);
+    });
+    let fwd = |ctx: &graphrefly::Ctx| {
+        let v = ctx.data::<i32>(0).map_or(0, |v| *v);
+        ctx.emit(v);
+    };
+    let b = derived_in::<i32>(&g, vec![q.erased()], graphrefly::NodeOpts::default(), fwd);
+    let c = derived_in::<i32>(&g, vec![q.erased()], graphrefly::NodeOpts::default(), fwd);
+    let runs = Rc::new(Cell::new(0usize));
+    let d = {
+        let runs = runs.clone();
+        derived_in::<i32>(
+            &g,
+            vec![b.erased(), c.erased()],
+            graphrefly::NodeOpts {
+                invalidate: graphrefly::Policy::Manual,
+                ..graphrefly::NodeOpts::default()
+            },
+            move |_ctx| runs.set(runs.get() + 1),
+        )
+    };
+    let _ud = d.subscribe(|_| {});
+    assert_eq!(b.cache(), Some(1));
+    let before = runs.get();
+    a.invalidate();
+    assert_eq!(b.cache(), None);
+    assert_eq!(runs.get(), before + 1, "D settles once on the diamond");
+}
+
+/// R-terminals@1 with R-failure@3 (review F 2.8): a write queued behind a terminal is
+/// refused when it runs; the refusal goes to the reporter and the write function does
+/// not run.
+#[test]
+fn a_write_queued_behind_a_terminal_is_refused_and_reported() {
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let g = reporting_graph(&reports);
+    let trigger = state_in(&g, 0i32);
+    let s = state_in(&g, 1i32);
+    let ran: Rc<RefCell<Vec<Option<i32>>>> = Rc::new(RefCell::new(Vec::new()));
+    let _ut = {
+        let (s, ran) = (s.clone(), ran.clone());
+        trigger.subscribe(move |msgs: &[Message<AnyValue>]| {
+            let start = msgs.iter().any(|m| matches!(m, Message::Start));
+            if start || !msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                return;
+            }
+            s.complete();
+            let ran = ran.clone();
+            s.set(graphrefly::StateWrite::from_fn(move |v: Option<&i32>| {
+                ran.borrow_mut().push(v.copied());
+                Some(2)
+            }));
+            s.set(3);
+        })
+    };
+    trigger.set(1);
+    assert!(ran.borrow().is_empty(), "the write function did not run");
+    assert_eq!(s.status().output, graphrefly::OutputStatus::Completed);
+    assert_eq!(s.cache(), Some(1));
+    let errors: Vec<(String, String)> = reports
+        .borrow()
+        .iter()
+        .map(|f| (f.source.clone(), f.error.clone()))
+        .collect();
+    let refused = (
+        "queued request".to_owned(),
+        "host input to an ended node is refused (R-terminals)".to_owned(),
+    );
+    assert_eq!(errors, vec![refused.clone(), refused]);
+}
+
+/// R-request-order@2 (review F 2.9, C F5): a queued replace is checked again when it
+/// runs, on the topology the requests before it committed, so two replaces in one
+/// batch cannot commit a cycle.
+#[test]
+fn queued_replaces_cannot_commit_a_cycle() {
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let g = reporting_graph(&reports);
+    let a = producer_in::<i32>(&g, graphrefly::NodeOpts::default(), |_| {});
+    let b = producer_in::<i32>(&g, graphrefly::NodeOpts::default(), |_| {});
+    let c = producer_in::<i32>(&g, graphrefly::NodeOpts::default(), |_| {});
+    let noop = |_: &graphrefly::Ctx| {};
+    g.batch(|_| {
+        a.replace(vec![b.erased()], noop, graphrefly::ReplaceOpts::default());
+        b.replace(vec![c.erased()], noop, graphrefly::ReplaceOpts::default());
+        // Legal when asked for; a cycle a -> b -> c -> a once the two above have run.
+        c.replace(vec![a.erased()], noop, graphrefly::ReplaceOpts::default());
+    });
+    let deps = |n: &Node<i32>| n.definition().deps.len();
+    assert_eq!((deps(&a), deps(&b), deps(&c)), (1, 1, 0));
+    let errors: Vec<(String, String)> = reports
+        .borrow()
+        .iter()
+        .map(|f| (f.source.clone(), f.error.clone()))
+        .collect();
+    assert_eq!(
+        errors,
+        vec![(
+            "queued request".to_owned(),
+            "replace: the node would depend on itself (R-request-order)".to_owned()
+        )]
+    );
 }
