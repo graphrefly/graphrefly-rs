@@ -4044,3 +4044,49 @@ fn stop_in_the_middle_of_a_wave() {
         "retain: the released subscription is gone"
     );
 }
+
+/// C-35 (graphrefly:D806, F 2.9) — a queued ctx.rewire is checked again when it runs:
+/// two rewires in one batch, each legal when asked for, cannot commit a cycle. The
+/// refused one changes nothing and goes to the host reporter as a queued request's
+/// failure.
+#[test]
+fn queued_rewires_cannot_commit_a_cycle() {
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let g = reporting_graph(&reports);
+    let (x, x_ctx) = driven_in(&g);
+    let (y, y_ctx) = driven_in(&g);
+    let _ux = x.subscribe(|_| {});
+    let _uy = y.subscribe(|_| {});
+    let x_ctx = x_ctx.borrow_mut().take().unwrap();
+    let y_ctx = y_ctx.borrow_mut().take().unwrap();
+    g.batch(|_| {
+        x_ctx.rewire(vec![y.erased()]);
+        // Legal when asked for; a cycle x -> y -> x once the one above has run.
+        y_ctx.rewire(vec![x.erased()]);
+    });
+    let deps_of = |id: &str| {
+        g.describe()
+            .into_iter()
+            .find(|n| n.id == id)
+            .map(|n| n.deps.len())
+            .unwrap()
+    };
+    let ids: Vec<String> = g.describe().into_iter().map(|n| n.id).collect();
+    assert_eq!(
+        (deps_of(&ids[0]), deps_of(&ids[1])),
+        (1, 0),
+        "the first rewire ran; the second changed nothing"
+    );
+    let errors: Vec<(String, String)> = reports
+        .borrow()
+        .iter()
+        .map(|f| (f.source.clone(), f.error.clone()))
+        .collect();
+    assert_eq!(
+        errors,
+        vec![(
+            "queued request".to_owned(),
+            "rewire: the node would depend on itself (R-request-order)".to_owned()
+        )]
+    );
+}
