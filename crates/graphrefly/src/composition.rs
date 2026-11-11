@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use crate::ctx::{Ctx, DepTerminal};
 use crate::graph::{Graph, GraphNodeOpts};
-use crate::node::{Node, NodeOpts, State};
+use crate::node::{Node, NodeOpts, Policy, State};
 use crate::operators::Operator;
 use crate::protocol::Message;
 
@@ -205,9 +205,8 @@ where
         "stratifyBranch",
         NodeOpts {
             partial: true,
-            complete_when_deps_complete: false,
-            error_when_deps_error: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
+            error: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx: &Ctx| {

@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 use crate::ctx::{Ctx, DepTerminal};
-use crate::node::NodeOpts;
+use crate::node::{NodeOpts, Policy};
 use crate::operators::Operator;
 use crate::protocol::Message;
 
@@ -43,8 +43,7 @@ pub fn with_latest_from<A: Clone + 'static, B: Clone + 'static>() -> Operator<(A
     Operator::with_opts(
         "withLatestFrom",
         NodeOpts {
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -77,8 +76,7 @@ pub fn zip<T: Clone + 'static>() -> Operator<Vec<T>> {
         "zip",
         NodeOpts {
             partial: true,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -143,8 +141,7 @@ pub fn concat<T: Clone + 'static>() -> Operator<T> {
         "concat",
         NodeOpts {
             partial: true,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -199,9 +196,8 @@ pub fn race<T: Clone + 'static>() -> Operator<T> {
         "race",
         NodeOpts {
             partial: true,
-            error_when_deps_error: false,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            error: Policy::Manual,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -267,8 +263,7 @@ pub fn buffer<T: Clone + 'static>() -> Operator<Vec<T>> {
         "buffer",
         NodeOpts {
             partial: true,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -303,8 +298,7 @@ pub fn buffer_count<T: Clone + 'static>(count: usize) -> Operator<Vec<T>> {
     Operator::with_opts(
         "bufferCount",
         NodeOpts {
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -343,9 +337,8 @@ pub fn sample<T: Clone + 'static>() -> Operator<T> {
         "sample",
         NodeOpts {
             partial: true,
-            error_when_deps_error: false,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            error: Policy::Manual,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -392,8 +385,7 @@ pub fn take_until<T: Clone + 'static>() -> Operator<T> {
         "takeUntil",
         NodeOpts {
             partial: true,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx: &Ctx| {

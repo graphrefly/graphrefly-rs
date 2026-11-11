@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::compound_tuple_key;
-use crate::node::{Node, State};
+use crate::node::{Node, Policy, State};
 use crate::operators::Operator;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1131,8 +1131,8 @@ fn normalize_events(events: Option<Vec<String>>) -> Option<HashSet<String>> {
 
 fn no_terminal_opts() -> crate::node::NodeOpts {
     crate::node::NodeOpts {
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..Default::default()
     }
 }

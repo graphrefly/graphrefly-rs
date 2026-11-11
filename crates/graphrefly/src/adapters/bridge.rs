@@ -15,7 +15,7 @@ use super::bridge_protobuf::{
 use crate::ctx::{Ctx, DepTerminal};
 use crate::graph::{Graph, GraphNodeOpts, TopologyGroup, TopologyGroupOptions};
 use crate::identity::{canonical_tuple_key, compound_tuple_key};
-use crate::node::{Core, Node, NodeOpts};
+use crate::node::{Core, Node, NodeOpts, Policy};
 use crate::protocol::{AnyValue, Message};
 use crate::resilience::RetryPolicy;
 use crate::versioning::NodeVersion;
@@ -1133,8 +1133,8 @@ where
         .state_empty_opts::<WireBridgeCommand<TOutbound>>({
             let mut opts = GraphNodeOpts::named(format!("{name}/command"));
             opts.node.partial = true;
-            opts.node.complete_when_deps_complete = false;
-            opts.node.error_when_deps_error = false;
+            opts.node.complete = Policy::Manual;
+            opts.node.error = Policy::Manual;
             opts
         })
         .into_node();
@@ -1604,8 +1604,8 @@ fn graph_node_opts(name: impl Into<String>, factory: impl Into<String>) -> Graph
     let mut opts = GraphNodeOpts::named(name);
     opts.node.factory = Some(factory.into());
     opts.node.partial = true;
-    opts.node.complete_when_deps_complete = false;
-    opts.node.error_when_deps_error = false;
+    opts.node.complete = Policy::Manual;
+    opts.node.error = Policy::Manual;
     opts
 }
 
@@ -3579,8 +3579,8 @@ fn response_command_error<T>(command: &WireBridgeCommand<RemoteCallResponse<T>>)
 fn no_terminal_graph_opts(name: impl Into<String>) -> GraphNodeOpts {
     let mut opts = GraphNodeOpts::named(name);
     opts.node.partial = true;
-    opts.node.complete_when_deps_complete = false;
-    opts.node.error_when_deps_error = false;
+    opts.node.complete = Policy::Manual;
+    opts.node.error = Policy::Manual;
     opts
 }
 
@@ -3793,9 +3793,8 @@ where
         name: Some(format!("{name}/events")),
         node: NodeOpts {
             partial: true,
-            complete_when_deps_complete: false,
-            error_when_deps_error: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
+            error: Policy::Manual,
             ..NodeOpts::default()
         },
         ..GraphNodeOpts::default()

@@ -49,9 +49,11 @@ pub(crate) struct DepRecord {
     pub(crate) prev_data: Option<AnyValue>,
     /// Latest DATA = last of `batch` if present, else `prev_data`.
     pub(crate) latest: Option<AnyValue>,
-    /// The dep's terminal state (R-deps-terminal). `None` ⇔ live. A
-    /// `terminalAsRealInput` fn reads this to react to an inner COMPLETE/ERROR.
+    /// The dependency's terminal in this invocation, if any (R-invocation).
     pub(crate) terminal: Option<DepTerminal>,
+    /// An INVALIDATE arrived on this input in this invocation; set only under the
+    /// manual INVALIDATE policy (R-invalidation).
+    pub(crate) invalidated: bool,
 }
 
 /// The single argument to a node fn. All emission is explicit via [`Ctx::down`] /
@@ -90,6 +92,14 @@ impl Ctx {
     #[must_use]
     pub fn dep_is(&self, i: usize, node: &Core) -> bool {
         self.dep_records.get(i).is_some_and(|r| r.dep.matches(node))
+    }
+
+    /// Whether an INVALIDATE arrived on dependency `i` in this invocation, under the
+    /// manual INVALIDATE policy (R-invalidation); always false under the auto policy,
+    /// where the kernel handles the INVALIDATE without running the function.
+    #[must_use]
+    pub fn invalidated(&self, i: usize) -> bool {
+        self.dep_records.get(i).is_some_and(|r| r.invalidated)
     }
 
     /// Number of declared deps in this fn invocation.

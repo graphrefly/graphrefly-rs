@@ -4608,12 +4608,15 @@ fn higher_order_error_paths_detach_live_inners_and_seal_output() {
     let after_error = shapes.borrow().len();
     inner_a.set(11i32);
     inner_b.set(20i32);
-    source.set(3i32);
     assert_eq!(
         shapes.borrow().len(),
         after_error,
         "terminal higher-order output should be sealed after ERROR"
     );
+    // R-terminals: host input to the ended source is refused.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.set(3i32)));
+    assert!(refused.is_err(), "host input to an ended state is refused");
+    assert_eq!(shapes.borrow().len(), after_error);
 }
 
 #[test]

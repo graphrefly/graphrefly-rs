@@ -14,7 +14,7 @@ use crate::environment::{
     WebSocketDriverEvent, WebSocketEvent, WebSocketRequest, WebSocketSend, WebSocketSendResult,
 };
 use crate::graph::{Graph, GraphNodeOpts};
-use crate::node::Node;
+use crate::node::{Node, Policy};
 use crate::protocol::{GraphError, Message};
 use crate::resilience::RetryPolicy;
 
@@ -1699,8 +1699,7 @@ where
     // folds that event before ending, so it takes the ERROR as input and ends itself
     // (the manual ERROR policy of R-terminals).
     let mut status_opts = GraphNodeOpts::named(format!("{name}/status"));
-    status_opts.node.error_when_deps_error = false;
-    status_opts.node.terminal_as_real_input = true;
+    status_opts.node.error = Policy::Manual;
     let status = graph.node_opts::<OutboundStatus, _>(
         vec![events.erased()],
         move |ctx| {

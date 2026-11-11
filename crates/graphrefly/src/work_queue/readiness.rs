@@ -14,7 +14,7 @@ use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::json::JsonValue;
 use crate::messaging::DataIssue;
-use crate::node::{Node, NodeOpts};
+use crate::node::{Node, NodeOpts, Policy};
 use crate::scheduled_readiness::{
     readiness_issue, ScheduledReadinessAuditRecord, ScheduledReadinessOverdue,
     ScheduledReadinessReady, ScheduledReadinessRequested, SourceRef,
@@ -1366,8 +1366,8 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
     let mut opts = GraphNodeOpts::named(name);
     opts.node = NodeOpts {
         factory: Some(factory.into()),
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..opts.node
     };
     opts

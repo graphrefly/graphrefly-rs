@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::ctx::{Ctx, DepTerminal};
 use crate::dispatcher::Dispatcher;
-use crate::node::{Core, GraphArena, Node, NodeOpts};
+use crate::node::{Core, GraphArena, Node, NodeOpts, Policy};
 use crate::protocol::{AnyValue, Message, Wave};
 
 /// A free-standing operator/source definition.
@@ -221,8 +221,7 @@ pub fn reduce<S: 'static, T: Clone + 'static>(
     Operator::with_opts(
         "reduce",
         NodeOpts {
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -326,8 +325,7 @@ pub fn last<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator
     Operator::with_opts(
         "last",
         NodeOpts {
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -360,8 +358,7 @@ pub fn find<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator
     Operator::with_opts(
         "find",
         NodeOpts {
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -386,8 +383,7 @@ pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
     Operator::with_opts(
         "elementAt",
         NodeOpts {
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -517,9 +513,8 @@ pub fn rescue<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) -> Oper
     Operator::with_opts(
         "rescue",
         NodeOpts {
-            error_when_deps_error: false,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            error: Policy::Manual,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -546,8 +541,7 @@ pub fn valve<S: Clone + 'static>() -> Operator<S> {
         "valve",
         NodeOpts {
             partial: true,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -594,9 +588,9 @@ fn is_default_node_opts(opts: &NodeOpts) -> bool {
         && opts.pool == Default::default()
         && !opts.partial
         && !opts.quiet
-        && opts.complete_when_deps_complete
-        && opts.error_when_deps_error
-        && !opts.terminal_as_real_input
+        && opts.complete == Policy::Auto
+        && opts.error == Policy::Auto
+        && opts.invalidate == Policy::Auto
         && opts.versioning.is_none()
 }
 
@@ -618,14 +612,14 @@ fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
     if caller.quiet {
         opts.quiet = true;
     }
-    if caller.complete_when_deps_complete != default.complete_when_deps_complete {
-        opts.complete_when_deps_complete = caller.complete_when_deps_complete;
+    if caller.complete != default.complete {
+        opts.complete = caller.complete;
     }
-    if caller.error_when_deps_error != default.error_when_deps_error {
-        opts.error_when_deps_error = caller.error_when_deps_error;
+    if caller.error != default.error {
+        opts.error = caller.error;
     }
-    if caller.terminal_as_real_input {
-        opts.terminal_as_real_input = true;
+    if caller.invalidate != default.invalidate {
+        opts.invalidate = caller.invalidate;
     }
     if caller.versioning.is_some() {
         opts.versioning = caller.versioning;

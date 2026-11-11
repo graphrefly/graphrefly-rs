@@ -11,7 +11,7 @@ use crate::json::{
     u128_to_non_negative_decimal_string, validate_strict_json_value, Codec, JsonCodecError,
     JsonCodecResult, JsonValue,
 };
-use crate::node::{Node, NodeOpts};
+use crate::node::{Node, NodeOpts, Policy};
 use crate::operators::Operator;
 use crate::patterns::{
     memory_retrieval_bundle, validate_memory_fragment, FactId, KnowledgeAssertion,
@@ -1933,8 +1933,8 @@ where
 
 fn solution_node_config() -> NodeOpts {
     NodeOpts {
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..NodeOpts::default()
     }
 }

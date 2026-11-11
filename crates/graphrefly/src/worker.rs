@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::ctx::Ctx;
 use crate::dispatcher::{PoolKind, WorkerSubmitError};
 use crate::graph::{Graph, GraphNodeOpts};
-use crate::node::{Core, Node, NodeOpts};
+use crate::node::{Core, Node, NodeOpts, Policy};
 use crate::operators::Operator;
 use crate::protocol::Message;
 
@@ -47,7 +47,7 @@ where
         NodeOpts {
             // A dep COMPLETE must not seal the worker before an in-flight owned
             // compute result returns through DeferredCtx.
-            complete_when_deps_complete: false,
+            complete: Policy::Manual,
             pool: PoolKind::Async,
             ..NodeOpts::default()
         },

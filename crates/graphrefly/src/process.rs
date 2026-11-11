@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::compound_tuple_key;
-use crate::node::{Core, Node};
+use crate::node::{Core, Node, Policy};
 use crate::operators::Operator;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1936,8 +1936,8 @@ fn runtime_projection<
 fn no_terminal_opts() -> crate::node::NodeOpts {
     crate::node::NodeOpts {
         partial: true,
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..Default::default()
     }
 }

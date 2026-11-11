@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use crate::ctx::{Ctx, DepTerminal};
 use crate::higher_order::{merge_map_with_ctx, switch_map_with_ctx};
-use crate::node::{Core, Node, NodeOpts};
+use crate::node::{Core, Node, NodeOpts, Policy};
 use crate::operators::Operator;
 use crate::protocol::Message;
 use crate::sources::{interval, timer};
@@ -26,9 +26,8 @@ fn delayed_value<S: Clone + 'static>(ctx: &Ctx, value: S, ms: u64) -> Node<S> {
             "delayedValue",
             crate::node::NodeOpts {
                 partial: true,
-                error_when_deps_error: false,
-                complete_when_deps_complete: false,
-                terminal_as_real_input: true,
+                error: Policy::Manual,
+                complete: Policy::Manual,
                 ..crate::node::NodeOpts::default()
             },
             move |ctx| {
@@ -114,9 +113,8 @@ fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> 
         factory,
         crate::node::NodeOpts {
             partial: true,
-            error_when_deps_error: false,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            error: Policy::Manual,
+            complete: Policy::Manual,
             ..crate::node::NodeOpts::default()
         },
         move |ctx| body(ctx),
@@ -233,9 +231,8 @@ fn audit_with_ctx<S: Clone + 'static>(
         factory,
         crate::node::NodeOpts {
             partial: true,
-            error_when_deps_error: false,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            error: Policy::Manual,
+            complete: Policy::Manual,
             ..crate::node::NodeOpts::default()
         },
         move |ctx| body(ctx),
@@ -551,9 +548,8 @@ fn scoped_time_source(anchor: &Core, op: Operator<u64>) -> Node<u64> {
 fn time_helper_opts() -> NodeOpts {
     NodeOpts {
         partial: true,
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
-        terminal_as_real_input: true,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..NodeOpts::default()
     }
 }

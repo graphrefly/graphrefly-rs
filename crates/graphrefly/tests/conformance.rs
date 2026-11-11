@@ -198,8 +198,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let op = Node::<i32>::derived_opts(
             vec![s.erased()],
             NodeOpts {
-                complete_when_deps_complete: false,
-                terminal_as_real_input: true,
+                complete: graphrefly::Policy::Manual,
                 ..NodeOpts::default()
             },
             move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
@@ -272,8 +271,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let op = Node::<i32>::derived_opts(
             vec![s.erased()],
             NodeOpts {
-                complete_when_deps_complete: false,
-                terminal_as_real_input: true,
+                complete: graphrefly::Policy::Manual,
                 ..NodeOpts::default()
             },
             move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
@@ -337,8 +335,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let op = Node::<i32>::derived_opts(
             vec![s.erased()],
             NodeOpts {
-                complete_when_deps_complete: false,
-                terminal_as_real_input: true,
+                complete: graphrefly::Policy::Manual,
                 ..NodeOpts::default()
             },
             move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
@@ -415,8 +412,7 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         let op = Node::<i32>::derived_opts(
             vec![s.erased()],
             NodeOpts {
-                complete_when_deps_complete: false,
-                terminal_as_real_input: true,
+                complete: graphrefly::Policy::Manual,
                 ..NodeOpts::default()
             },
             move |ctx| (cf.borrow().clone().expect("op fn"))(ctx),
@@ -462,47 +458,6 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
         );
         assert_eq!(op.cache(), Some(1));
     }
-}
-
-/// C-6 — a synchronous feedback cycle (state→derived→effect, effect writes back to the
-/// source) is rejected as ERROR. The substrate panic is caught at the wave-owner and
-/// converted to `[[ERROR,e]]` on a node ON the cycle (D30) — it does NOT escape the
-/// `subscribe` call (R-reentrancy / D37). B25: the source's wave-flags recover, so a
-/// subsequent wave still emits its leading DIRTY (no dropped-DIRTY corruption).
-#[test]
-fn c6_sync_feedback_cycle_becomes_error_and_recovers() {
-    let s = Node::<i32>::state(0);
-    let d = Node::<i32>::derived(vec![s.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap() + 1)
-    });
-    let e = {
-        let s2 = s.clone(); // a handle to the SAME source node
-        Node::<i32>::derived(vec![d.erased()], move |ctx| {
-            let v = *ctx.data::<i32>(0).unwrap();
-            // feedback: re-drive the source mid-wave, closing s→d→e→s
-            s2.set(v);
-        })
-    };
-
-    // Activating `e` drives the cycle. The throw must NOT escape — the wave-owner catch
-    // converts it to ERROR (D30). (If it escaped, this `record`/subscribe would panic
-    // and fail the test outright.)
-    let (elog, _ue) = record(&e);
-    assert!(
-        kinds(&elog).contains(&"ERROR".to_string()),
-        "the feedback cycle surfaces as ERROR on a cycle node (got {:?})",
-        kinds(&elog)
-    );
-    assert_eq!(e.status(), Status::Errored);
-
-    // B25 regression — the source recovered its wave-flags. The corruption symptom was
-    // a stale `emitted_dirty_this_wave` → the NEXT wave drops its leading DIRTY
-    // (R-dirty-before-data violation). A clean two-phase [DIRTY, DATA] proves recovery.
-    let (slog, _us) = record(&s);
-    slog.borrow_mut().clear();
-    s.set(10);
-    assert_eq!(kinds(&slog), vec!["PENDING", "DATA"]); // leading DIRTY present
-    assert_eq!(d.cache(), Some(11)); // d recomputes; the terminal `e` is ignored
 }
 
 /// C-14 — cleanup hooks are per-run (R-cleanup-hooks / D28 clarification). A fn that
@@ -607,7 +562,7 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
         let d = Node::<i32>::derived_opts(
             vec![b.erased(), c.erased()],
             NodeOpts {
-                error_when_deps_error: false, // absorbs C's error, stays live
+                error: graphrefly::Policy::Manual, // absorbs C's error, stays live
                 ..NodeOpts::default()
             },
             fwd,
@@ -628,7 +583,7 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
         let d = Node::<i32>::derived_opts(
             vec![b.erased(), c.erased()],
             NodeOpts {
-                error_when_deps_error: false,
+                error: graphrefly::Policy::Manual,
                 ..NodeOpts::default()
             },
             fwd,

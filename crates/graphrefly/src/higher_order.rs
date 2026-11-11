@@ -10,7 +10,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::ctx::{Ctx, DepTerminal};
-use crate::node::{Core, Node, NodeOpts};
+use crate::node::{Core, Node, NodeOpts, Policy};
 use crate::operators::Operator;
 use crate::protocol::Message;
 
@@ -162,9 +162,8 @@ pub fn repeat<T: 'static>(factory: impl Fn() -> Node<T> + 'static, count: usize)
     Operator::with_opts(
         "repeat",
         NodeOpts {
-            error_when_deps_error: false,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            error: Policy::Manual,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| body(ctx),
@@ -188,9 +187,8 @@ fn map_operator<TIn: Clone + 'static, TOut: 'static>(
         factory,
         NodeOpts {
             partial: true,
-            error_when_deps_error: false,
-            complete_when_deps_complete: false,
-            terminal_as_real_input: true,
+            error: Policy::Manual,
+            complete: Policy::Manual,
             ..NodeOpts::default()
         },
         move |ctx| body(ctx),

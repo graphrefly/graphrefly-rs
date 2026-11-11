@@ -389,9 +389,8 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
             vec![a.erased(), b.erased()],
             graphrefly::NodeOpts {
                 partial: true,
-                terminal_as_real_input: true,
-                error_when_deps_error: false,
-                complete_when_deps_complete: false,
+                error: graphrefly::Policy::Manual,
+                complete: graphrefly::Policy::Manual,
                 ..graphrefly::NodeOpts::default()
             },
             move |ctx| {
@@ -771,4 +770,637 @@ fn c44_kernel_adds_only_the_settling_resolved_and_quiet_nodes_hold_no_wave() {
     a.invalidate();
     assert_eq!(arrays(&q_log), vec![shape(&["PENDING", "INVALIDATE"])]);
     assert_eq!(arrays(&d_log), vec![shape(&["PENDING", "INVALIDATE"])]);
+}
+
+// ── Phase 3: terminal and INVALIDATE policies; ending closes the lifetime ────
+
+fn opts(
+    complete: graphrefly::Policy,
+    error: graphrefly::Policy,
+    invalidate: graphrefly::Policy,
+) -> graphrefly::NodeOpts {
+    graphrefly::NodeOpts {
+        partial: true,
+        complete,
+        error,
+        invalidate,
+        ..graphrefly::NodeOpts::default()
+    }
+}
+
+use graphrefly::Policy::{Auto, Manual};
+
+fn terminal_name(t: Option<&graphrefly::DepTerminal>) -> Option<String> {
+    t.map(|t| match t {
+        graphrefly::DepTerminal::Complete => "COMPLETE".to_owned(),
+        graphrefly::DepTerminal::Error(e) => format!("ERROR {e}"),
+    })
+}
+
+/// A producer whose kept ctx lets a test send any array from it.
+fn driven() -> (Node<i32>, Rc<RefCell<Option<graphrefly::DeferredCtx>>>) {
+    let slot: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let keep = slot.clone();
+    let node = Node::<i32>::producer(move |ctx| {
+        *keep.borrow_mut() = Some(ctx.defer());
+    });
+    (node, slot)
+}
+
+fn send(slot: &Rc<RefCell<Option<graphrefly::DeferredCtx>>>, wave: Vec<Message<AnyValue>>) {
+    // Taken out for the call, so the sink side can never meet a held borrow.
+    let ctx = slot.borrow_mut().take().expect("producer activated");
+    ctx.down(wave);
+    slot.borrow_mut().get_or_insert(ctx);
+}
+
+fn data(v: i32) -> Message<AnyValue> {
+    Message::Data(Rc::new(v) as AnyValue)
+}
+
+/// C-3 — INVALIDATE through a diamond: one INVALIDATE out, private state kept, the
+/// policy decides who runs.
+#[test]
+fn c3_invalidate_through_a_diamond() {
+    for policy in [Auto, Manual] {
+        let s = Node::<i32>::state(1);
+        let b = Node::<i32>::derived(vec![s.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let c = Node::<i32>::derived(vec![s.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap() * 10)
+        });
+        let runs = Rc::new(RefCell::new(Vec::<(i32, bool, bool)>::new()));
+        let d = {
+            let runs = runs.clone();
+            Node::<i32>::derived_opts(
+                vec![b.erased(), c.erased()],
+                opts(Auto, Auto, policy),
+                move |ctx| {
+                    let count = ctx.state_get::<i32>().map_or(0, |n| *n) + 1;
+                    ctx.state_set(count);
+                    let inv = (ctx.invalidated(0), ctx.invalidated(1));
+                    runs.borrow_mut().push((count, inv.0, inv.1));
+                    if inv.0 || inv.1 {
+                        // Manual policy: the function decides; here it clears its value.
+                        ctx.down(vec![Message::Invalidate]);
+                        return;
+                    }
+                    if let (Some(x), Some(y)) = (ctx.data::<i32>(0), ctx.data::<i32>(1)) {
+                        ctx.emit(*x + *y);
+                    }
+                },
+            )
+        };
+        let (log, _u) = record_arrays(&d);
+        s.set(2);
+        assert_eq!(d.cache(), Some(22));
+        let count_before = runs.borrow().last().unwrap().0;
+        assert!(count_before > 0);
+        log.borrow_mut().clear();
+        runs.borrow_mut().clear();
+
+        s.invalidate();
+        assert_eq!(
+            arrays(&log),
+            vec![shape(&["PENDING", "INVALIDATE"])],
+            "{policy:?}: exactly one INVALIDATE, with the PENDING prefix"
+        );
+        assert_eq!(d.cache(), None, "{policy:?}: D loses its value");
+        match policy {
+            Auto => assert!(runs.borrow().is_empty(), "auto: the function does not run"),
+            Manual => assert_eq!(
+                *runs.borrow(),
+                vec![(count_before + 1, true, true)],
+                "manual: one run with both inputs invalidated"
+            ),
+        }
+
+        // S has no value now, so a second INVALIDATE is dropped.
+        log.borrow_mut().clear();
+        s.invalidate();
+        assert!(
+            arrays(&log).is_empty(),
+            "{policy:?}: no value, no INVALIDATE"
+        );
+
+        // The write after it reaches D as ordinary input; private state continued.
+        let count_after_invalidate = runs.borrow().last().map_or(count_before, |r| r.0);
+        runs.borrow_mut().clear();
+        s.set(3);
+        assert_eq!(d.cache(), Some(33));
+        assert_eq!(
+            *runs.borrow(),
+            vec![(count_after_invalidate + 1, false, false)],
+            "{policy:?}: the count continues"
+        );
+    }
+}
+
+/// C-15 — a dependency's terminal settles its pending mark (no wedge).
+#[test]
+fn c15_dependency_terminal_settles_its_pending_mark() {
+    type Runs = Rc<RefCell<Vec<(Option<String>, Vec<i32>)>>>;
+    fn build() -> (
+        graphrefly::State<i32>,
+        graphrefly::State<i32>,
+        Node<i32>,
+        Runs,
+    ) {
+        let a = Node::<i32>::state(1);
+        let a2 = Node::<i32>::state(10);
+        let b = Node::<i32>::derived(vec![a.erased()], |ctx| {
+            if let Some(v) = ctx.batch::<i32>(0).last() {
+                ctx.emit(**v);
+            }
+        });
+        let c = Node::<i32>::derived(vec![a2.erased()], |ctx| {
+            if let Some(v) = ctx.batch::<i32>(0).last() {
+                ctx.emit(**v);
+            }
+        });
+        let runs: Runs = Rc::new(RefCell::new(Vec::new()));
+        let d = {
+            let runs = runs.clone();
+            Node::<i32>::derived_opts(
+                vec![b.erased(), c.erased()],
+                opts(Manual, Manual, Auto),
+                move |ctx| {
+                    runs.borrow_mut().push((
+                        terminal_name(ctx.terminal(0)),
+                        ctx.batch::<i32>(1).iter().map(|v| **v).collect(),
+                    ));
+                },
+            )
+        };
+        (a, a2, d, runs)
+    }
+
+    // (a) In one batch A ends (B completes without a value) and A2 is written.
+    let (a, a2, d, runs) = build();
+    let (log, _u) = record_arrays(&d);
+    runs.borrow_mut().clear();
+    log.borrow_mut().clear();
+    graphrefly::batch(|_| {
+        a.complete();
+        a2.set(20);
+    });
+    assert_eq!(
+        *runs.borrow(),
+        vec![(Some("COMPLETE".to_owned()), vec![20])],
+        "(a) one run sees B's terminal and C's value"
+    );
+    assert_eq!(arrays(&log), vec![shape(&["PENDING", "RESOLVED"])]);
+
+    // (b) A ends alone: one run; D sends nothing, so it settles with RESOLVED and its
+    // dependent is not left pending.
+    let (a, _a2, d, runs) = build();
+    let e = Node::<i32>::derived(vec![d.erased()], |_| {});
+    let (e_log, _ue) = record_arrays(&e);
+    runs.borrow_mut().clear();
+    e_log.borrow_mut().clear();
+    a.complete();
+    assert_eq!(*runs.borrow(), vec![(Some("COMPLETE".to_owned()), vec![])]);
+    assert_eq!(arrays(&e_log), vec![shape(&["PENDING", "RESOLVED"])]);
+
+    // (c) B ends with ERROR while C sends a value.
+    let (a, a2, d, runs) = build();
+    let _u = d.subscribe(|_| {});
+    runs.borrow_mut().clear();
+    graphrefly::batch(|_| {
+        a.error("boom");
+        a2.set(30);
+    });
+    assert_eq!(
+        *runs.borrow(),
+        vec![(Some("ERROR boom".to_owned()), vec![30])],
+        "(c) one run sees B's ERROR and C's value"
+    );
+    assert_ne!(d.status(), Status::Errored, "manual ERROR: D stays open");
+}
+
+/// C-17 — an ended dependency counts toward auto COMPLETE, whatever ended it and in
+/// any order.
+#[test]
+fn c17_ended_dependency_counts_toward_auto_complete() {
+    for c_first in [true, false] {
+        // B sends a value and COMPLETE in one array.
+        let (b, b_slot) = driven();
+        let c = Node::<i32>::state_empty();
+        let runs = Rc::new(RefCell::new(Vec::<(Option<String>, Option<String>)>::new()));
+        let d = {
+            let runs = runs.clone();
+            Node::<i32>::derived_opts(
+                vec![b.erased(), c.erased()],
+                opts(Auto, Manual, Auto),
+                move |ctx| {
+                    runs.borrow_mut().push((
+                        terminal_name(ctx.terminal(0)),
+                        terminal_name(ctx.terminal(1)),
+                    ));
+                },
+            )
+        };
+        let ctrl_runs = Rc::new(Cell::new(0usize));
+        let dctrl = {
+            let ctrl_runs = ctrl_runs.clone();
+            Node::<i32>::derived_opts(
+                vec![b.erased(), c.erased()],
+                opts(Auto, Auto, Auto),
+                move |_| ctrl_runs.set(ctrl_runs.get() + 1),
+            )
+        };
+        let (log, _u) = record_arrays(&d);
+        let _uc = dctrl.subscribe(|_| {});
+        runs.borrow_mut().clear();
+
+        let end_c = || {
+            let before = ctrl_runs.get();
+            c.error("e");
+            assert_eq!(dctrl.status(), Status::Errored);
+            assert_eq!(ctrl_runs.get(), before, "Dctrl ends without running");
+        };
+        if c_first {
+            end_c();
+            assert_eq!(
+                runs.borrow().last().unwrap(),
+                &(None, Some("ERROR e".to_owned())),
+                "D's function sees C's ERROR as input"
+            );
+            assert_ne!(d.status(), Status::Completed, "D stays open");
+            send(&b_slot, vec![data(1), Message::Complete]);
+        } else {
+            send(&b_slot, vec![data(1), Message::Complete]);
+            assert_ne!(d.status(), Status::Completed, "C is still open");
+            end_c();
+        }
+        assert_eq!(d.status(), Status::Completed, "c_first={c_first}");
+        // ctx.terminal is the terminal in this invocation (R-invocation@2), so the
+        // last run sees only the terminal that arrived last.
+        let last_seen = if c_first {
+            (Some("COMPLETE".to_owned()), None)
+        } else {
+            (None, Some("ERROR e".to_owned()))
+        };
+        assert_eq!(
+            runs.borrow().last().unwrap(),
+            &last_seen,
+            "D completes after the run that sees the last terminal"
+        );
+        let completes = arrays(&log)
+            .iter()
+            .flatten()
+            .filter(|k| *k == "COMPLETE")
+            .count();
+        assert_eq!(completes, 1, "exactly once");
+    }
+}
+
+/// C-36 — input arrays and terminal admission in one invocation.
+#[test]
+fn c36_input_arrays_and_terminal_admission() {
+    // Manual COMPLETE: one invocation sees [[20]] and the COMPLETE together.
+    let (a, slot) = driven();
+    let seen = Rc::new(RefCell::new(Vec::<(Vec<Vec<i32>>, Option<String>)>::new()));
+    let d = {
+        let seen = seen.clone();
+        Node::<i32>::derived_opts(vec![a.erased()], opts(Manual, Auto, Auto), move |ctx| {
+            seen.borrow_mut().push((
+                ctx.batches::<i32>(0)
+                    .iter()
+                    .map(|w| w.iter().map(|v| **v).collect())
+                    .collect(),
+                terminal_name(ctx.terminal(0)),
+            ));
+        })
+    };
+    let _u = d.subscribe(|_| {});
+    seen.borrow_mut().clear();
+    send(&slot, vec![data(20), Message::Complete]);
+    assert_eq!(
+        *seen.borrow(),
+        vec![(vec![vec![20]], Some("COMPLETE".to_owned()))]
+    );
+    assert_ne!(
+        d.status(),
+        Status::Completed,
+        "d stays open until its fn ends it"
+    );
+
+    // Auto COMPLETE: d runs on DATA 5, then completes after its run, with no
+    // balancing RESOLVED.
+    let (a, slot) = driven();
+    let d = Node::<i32>::derived_opts(vec![a.erased()], opts(Auto, Auto, Auto), |ctx| {
+        if let Some(v) = ctx.batch::<i32>(0).last() {
+            ctx.emit(**v);
+        }
+    });
+    let (log, _u) = record_arrays(&d);
+    log.borrow_mut().clear();
+    send(&slot, vec![data(5), Message::Complete]);
+    let flat: Vec<String> = arrays(&log).into_iter().flatten().collect();
+    assert_eq!(flat.first().map(String::as_str), Some("PENDING"));
+    assert!(flat.iter().any(|k| k == "DATA"));
+    assert_eq!(flat.last().map(String::as_str), Some("COMPLETE"));
+    assert!(
+        !flat.iter().any(|k| k == "RESOLVED"),
+        "no balancing RESOLVED"
+    );
+    assert_eq!(d.status(), Status::Completed);
+
+    // [DATA 7, INVALIDATE] goes out as [PENDING, INVALIDATE]; under auto INVALIDATE d
+    // does not run, and both lose their values.
+    let (a, slot) = driven();
+    let runs = Rc::new(Cell::new(0usize));
+    let d = {
+        let runs = runs.clone();
+        Node::<i32>::derived_opts(vec![a.erased()], opts(Auto, Auto, Auto), move |ctx| {
+            runs.set(runs.get() + 1);
+            if let Some(v) = ctx.batch::<i32>(0).last() {
+                ctx.emit(**v);
+            }
+        })
+    };
+    let (a_log, _ua) = record_arrays(&a);
+    let (d_log, _ud) = record_arrays(&d);
+    send(&slot, vec![data(1)]);
+    assert_eq!(d.cache(), Some(1));
+    a_log.borrow_mut().clear();
+    d_log.borrow_mut().clear();
+    let before = runs.get();
+    send(&slot, vec![data(7), Message::Invalidate]);
+    assert_eq!(arrays(&a_log), vec![shape(&["PENDING", "INVALIDATE"])]);
+    assert_eq!(arrays(&d_log), vec![shape(&["PENDING", "INVALIDATE"])]);
+    assert_eq!(runs.get(), before);
+    assert_eq!(a.cache(), None);
+    assert_eq!(d.cache(), None);
+}
+
+/// C-40 — an ended node can be subscribed and depended on (the replace clause lands
+/// with phase 5).
+#[test]
+fn c40_ended_node_can_be_subscribed_and_depended_on() {
+    let s = Node::<i32>::state(1);
+    s.complete();
+    let t = Node::<i32>::state_empty();
+    t.error("e");
+
+    let (log, _u) = record_arrays(&s);
+    assert_eq!(arrays(&log), vec![shape(&["START", "DATA", "COMPLETE"])]);
+
+    let d_runs = Rc::new(RefCell::new(Vec::<i32>::new()));
+    let d = {
+        let d_runs = d_runs.clone();
+        Node::<i32>::derived_opts(vec![s.erased()], opts(Auto, Auto, Auto), move |ctx| {
+            d_runs.borrow_mut().push(*ctx.data::<i32>(0).unwrap());
+        })
+    };
+    let _ud = d.subscribe(|_| {});
+    assert_eq!(*d_runs.borrow(), vec![1], "D runs once on S's snapshot");
+    assert_eq!(
+        d.status(),
+        Status::Completed,
+        "and completes after that run"
+    );
+
+    let e_runs = Rc::new(Cell::new(0usize));
+    let e = {
+        let e_runs = e_runs.clone();
+        Node::<i32>::derived_opts(vec![t.erased()], opts(Auto, Auto, Auto), move |_| {
+            e_runs.set(e_runs.get() + 1)
+        })
+    };
+    let _ue = e.subscribe(|_| {});
+    assert_eq!(e.status(), Status::Errored);
+    assert_eq!(e_runs.get(), 0, "E ends with ERROR e without running");
+
+    let m_seen = Rc::new(RefCell::new(Vec::<Option<String>>::new()));
+    let m = {
+        let m_seen = m_seen.clone();
+        Node::<i32>::derived_opts(vec![t.erased()], opts(Manual, Manual, Auto), move |ctx| {
+            m_seen.borrow_mut().push(terminal_name(ctx.terminal(0)));
+        })
+    };
+    let _um = m.subscribe(|_| {});
+    assert_eq!(*m_seen.borrow(), vec![Some("ERROR e".to_owned())]);
+    assert_ne!(m.status(), Status::Errored, "M stays open");
+
+    let refused = catch_unwind(AssertUnwindSafe(|| s.set(2)));
+    assert!(refused.is_err(), "the set on S is refused");
+    assert_eq!(s.cache(), Some(1), "S never changes again");
+}
+
+/// C-44 — the terminal and manual-INVALIDATE clauses: a wave of terminals holds a
+/// fan-in.
+#[test]
+fn c44_a_wave_of_terminals_holds_a_fan_in() {
+    for (complete, invalidate) in [(Manual, Auto), (Auto, Manual)] {
+        let s = Node::<i32>::state(1);
+        let b = Node::<i32>::derived(vec![s.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let c = Node::<i32>::derived(vec![s.erased()], |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap())
+        });
+        let runs = Rc::new(RefCell::new(Vec::<(
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+        )>::new()));
+        let d = {
+            let runs = runs.clone();
+            Node::<i32>::derived_opts(
+                vec![b.erased(), c.erased()],
+                opts(complete, Auto, invalidate),
+                move |ctx| {
+                    runs.borrow_mut().push((
+                        terminal_name(ctx.terminal(0)),
+                        terminal_name(ctx.terminal(1)),
+                        ctx.invalidated(0),
+                        ctx.invalidated(1),
+                    ));
+                },
+            )
+        };
+        let (b_log, _ub) = record_arrays(&b);
+        let (c_log, _uc) = record_arrays(&c);
+        let _ud = d.subscribe(|_| {});
+        runs.borrow_mut().clear();
+        b_log.borrow_mut().clear();
+        c_log.borrow_mut().clear();
+        if complete == Manual {
+            s.complete();
+            let want = vec![shape(&["PENDING", "COMPLETE"])];
+            assert_eq!(arrays(&b_log), want);
+            assert_eq!(arrays(&c_log), want);
+            assert_eq!(
+                *runs.borrow(),
+                vec![(
+                    Some("COMPLETE".into()),
+                    Some("COMPLETE".into()),
+                    false,
+                    false
+                )],
+                "manual COMPLETE: one run sees both terminals"
+            );
+        } else {
+            s.invalidate();
+            assert_eq!(
+                *runs.borrow(),
+                vec![(None, None, true, true)],
+                "manual INVALIDATE: one run sees both inputs invalidated"
+            );
+        }
+    }
+}
+
+/// C-34 — the terminal fanout, the ended node's lifetime closing, and acquiring an
+/// ended node.
+#[test]
+fn c34_terminal_fanout_closes_the_lifetime() {
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let previous = graphrefly::set_host_reporter(Some({
+        let reports = reports.clone();
+        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
+    }));
+
+    // T is a source with no other dependent; its release is visible as its cleanup.
+    let t_released = Rc::new(Cell::new(false));
+    let t_slot: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let t = {
+        let t_released = t_released.clone();
+        let keep = t_slot.clone();
+        Node::<i32>::producer(move |ctx| {
+            let t_released = t_released.clone();
+            ctx.on_deactivation(move || t_released.set(true));
+            *keep.borrow_mut() = Some(ctx.defer());
+            ctx.emit(0);
+        })
+    };
+    let cleanup = Rc::new(Cell::new(0usize));
+    let s_runs = Rc::new(Cell::new(0usize));
+    let s = {
+        let cleanup = cleanup.clone();
+        let s_runs = s_runs.clone();
+        Node::<i32>::derived(vec![t.erased()], move |ctx| {
+            s_runs.set(s_runs.get() + 1);
+            let cleanup = cleanup.clone();
+            ctx.on_deactivation(move || cleanup.set(cleanup.get() + 1));
+            if *ctx.data::<i32>(0).unwrap() == 1 {
+                ctx.down(vec![data(1), Message::Complete]);
+            }
+        })
+    };
+    let x_log: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+    let z_log: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+    let z_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
+    let _ux = {
+        let x_log = x_log.clone();
+        let z_log = z_log.clone();
+        let z_unsub = z_unsub.clone();
+        let s2 = s.clone();
+        s.subscribe(move |msgs: &[Message<AnyValue>]| {
+            x_log
+                .borrow_mut()
+                .push(msgs.iter().map(|m| format!("{m:?}")).collect());
+            if msgs.iter().any(|m| matches!(m, Message::Complete)) && z_unsub.borrow().is_none() {
+                let z_log = z_log.clone();
+                let unsub = s2.subscribe(move |msgs: &[Message<AnyValue>]| {
+                    z_log
+                        .borrow_mut()
+                        .push(msgs.iter().map(|m| format!("{m:?}")).collect());
+                });
+                *z_unsub.borrow_mut() = Some(unsub);
+                panic!("x broke");
+            }
+        })
+    };
+    let (y_log, _uy) = record_arrays(&s);
+    x_log.borrow_mut().clear();
+    y_log.borrow_mut().clear();
+
+    assert!(!t_released.get());
+    send(&t_slot, vec![data(1)]);
+    let full = vec![
+        "PENDING".to_owned(),
+        "DATA".to_owned(),
+        "COMPLETE".to_owned(),
+    ];
+    assert_eq!(
+        *x_log.borrow(),
+        vec![full.clone()],
+        "X gets the whole array"
+    );
+    assert_eq!(arrays(&y_log), vec![full.clone()], "Y gets the whole array");
+    assert_eq!(cleanup.get(), 1, "S's lifetime closes: its cleanup runs");
+    assert!(t_released.get(), "S releases T, which deactivates");
+    assert_eq!(s.cache(), Some(1), "S keeps its value");
+    assert_eq!(s.status(), Status::Completed, "and its COMPLETE");
+    let z_first = z_log.borrow().first().cloned();
+    assert_eq!(
+        z_first,
+        Some(vec![
+            "START".to_owned(),
+            "DATA".to_owned(),
+            "COMPLETE".to_owned()
+        ]),
+        "Z gets the ended node's snapshot"
+    );
+    let runs = s_runs.get();
+    let _late = s.subscribe(|_| {});
+    assert_eq!(s_runs.get(), runs, "S never runs again");
+    assert_eq!(
+        *reports.borrow(),
+        vec![graphrefly::HostFailure {
+            source: "sink".into(),
+            error: "x broke".into()
+        }],
+        "X's throw goes to the host reporter"
+    );
+    assert_eq!(s.status(), Status::Completed, "and is not S's ERROR");
+    graphrefly::set_host_reporter(previous);
+}
+
+/// R-terminals (phase 3 acceptance): under auto ERROR, an INVALIDATE that reached the
+/// node earlier in the wave takes effect first, whatever the INVALIDATE policy, so the
+/// node never ends holding a value its input invalidated.
+#[test]
+fn auto_error_applies_an_earlier_invalidate_first() {
+    for invalidate in [Auto, Manual] {
+        let a = Node::<i32>::state(1);
+        let b = Node::<i32>::state(2);
+        let runs = Rc::new(Cell::new(0usize));
+        let d = {
+            let runs = runs.clone();
+            Node::<i32>::derived_opts(
+                vec![a.erased(), b.erased()],
+                opts(Auto, Auto, invalidate),
+                move |ctx| {
+                    runs.set(runs.get() + 1);
+                    if let (Some(x), Some(y)) = (ctx.data::<i32>(0), ctx.data::<i32>(1)) {
+                        ctx.emit(*x + *y);
+                    }
+                },
+            )
+        };
+        let (log, _u) = record_arrays(&d);
+        assert_eq!(d.cache(), Some(3));
+        log.borrow_mut().clear();
+        let before = runs.get();
+        graphrefly::batch(|_| {
+            a.invalidate();
+            b.error("x");
+        });
+        let flat: Vec<String> = arrays(&log).into_iter().flatten().collect();
+        let inv = flat.iter().position(|k| k == "INVALIDATE");
+        let err = flat.iter().position(|k| k == "ERROR");
+        assert!(
+            matches!((inv, err), (Some(i), Some(e)) if i < e),
+            "{invalidate:?}: INVALIDATE goes out before the ERROR, got {flat:?}"
+        );
+        assert_eq!(runs.get(), before, "{invalidate:?}: the function does not run");
+        assert_eq!(d.cache(), None, "{invalidate:?}: the ended node holds no value");
+        assert_eq!(d.status(), Status::Errored);
+    }
 }

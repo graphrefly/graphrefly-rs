@@ -20,7 +20,7 @@ use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::canonical_tuple_key;
 use crate::json::JsonValue;
-use crate::node::{Core, Node, NodeOpts, State};
+use crate::node::{Core, Node, NodeOpts, Policy, State};
 use crate::protocol::AnyValue;
 use crate::request::requested;
 
@@ -2513,8 +2513,8 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
     let mut opts = GraphNodeOpts::named(name);
     opts.node = NodeOpts {
         factory: Some(factory.into()),
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..opts.node
     };
     opts

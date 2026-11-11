@@ -84,6 +84,17 @@ impl Status {
     }
 }
 
+/// An auto or manual policy for COMPLETE, ERROR or INVALIDATE, per node (R-terminals,
+/// R-invalidation). Both default to auto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Policy {
+    /// The kernel handles the message without running the function.
+    #[default]
+    Auto,
+    /// The message is the function's input.
+    Manual,
+}
+
 /// Node construction options (substrate-level). Sugar/operator opts are the graph layer
 /// (D6/D24); this is the minimal substrate surface needed to select a pool (D20) and
 /// the dep-terminal propagation policy (R-deps-terminal).
@@ -102,16 +113,20 @@ pub struct NodeOpts {
     /// a mark on, and publishes its function's output as a later wave of its own
     /// (R-wave). Default false.
     pub quiet: bool,
-    /// Auto-emit COMPLETE when ALL deps complete (default `true`; combineLatest
-    /// semantics — ALL not ANY). last/reduce/*Map set `false` to ABSORB inner
-    /// terminals (R-deps-terminal).
-    pub complete_when_deps_complete: bool,
-    /// Auto-emit ERROR when ANY dep errors (default `true`). rescue/catch set `false`.
-    pub error_when_deps_error: bool,
-    /// A dep's terminal is a REAL INPUT the fn reads (rescue/reduce/*Map) rather than an
-    /// absorbed settle — when set, the fn re-runs on a dep terminal and the first-run
-    /// gate treats a terminated dep as settled (R-deps-terminal). Default `false`.
-    pub terminal_as_real_input: bool,
+    /// The COMPLETE policy (R-terminals). Auto: once every dependency has ended, the
+    /// node completes after the run that sees the last terminal; a node with no
+    /// dependencies never completes by itself. Manual: a dependency's COMPLETE is the
+    /// function's input, and the node ends only when its function sends a terminal.
+    pub complete: Policy,
+    /// The ERROR policy (R-terminals). Auto: a dependency's ERROR ends the node with
+    /// that ERROR without running its function. Manual: the ERROR is the function's
+    /// input.
+    pub error: Policy,
+    /// The INVALIDATE policy (R-invalidation). Auto: an input's INVALIDATE invalidates
+    /// the node without running its function. Manual: it is the function's input
+    /// ([`Ctx::invalidated`]), and the node keeps its values until the function clears
+    /// them or sends INVALIDATE itself.
+    pub invalidate: Policy,
     /// D109 node runtime versioning policy. `None` means the package default V0; graph-owned
     /// nodes may inherit a graph default before construction.
     pub versioning: Option<NodeVersioningPolicy>,
@@ -127,9 +142,9 @@ impl Default for NodeOpts {
             pool: PoolKind::default(),
             partial: false,
             quiet: false,
-            complete_when_deps_complete: true,
-            error_when_deps_error: true,
-            terminal_as_real_input: false,
+            complete: Policy::Auto,
+            error: Policy::Auto,
+            invalidate: Policy::Auto,
             versioning: None,
         }
     }
@@ -882,6 +897,9 @@ struct DepInput {
     frames: Vec<Vec<InMsg>>,
     /// Marked pending in this wave and not settled yet.
     pending: bool,
+    /// An INVALIDATE arrived on this input in this wave (shown to the function under
+    /// the manual INVALIDATE policy, R-invalidation).
+    invalidated: bool,
 }
 
 impl DepInput {
@@ -929,10 +947,10 @@ impl DepState {
 
     /// The first-run gate (Rust sugar, graphrefly:D797 (9)): every dependency has a
     /// value, or has ended when its terminal is the function's input.
-    fn all_settled(&self, terminal_as_real_input: bool) -> bool {
+    fn all_settled(&self, terminal_is_input: bool) -> bool {
         self.inputs
             .iter()
-            .all(|input| input.has || (terminal_as_real_input && input.ended.is_some()))
+            .all(|input| input.has || (terminal_is_input && input.ended.is_some()))
     }
 
     fn has_frames(&self) -> bool {
@@ -943,6 +961,7 @@ impl DepState {
         for input in &mut self.inputs {
             input.frames.clear();
             input.pending = false;
+            input.invalidated = false;
         }
         self.pending = 0;
     }
@@ -1041,9 +1060,9 @@ struct NodeCallSlot {
 struct NodeConfigSlot {
     partial: bool,
     quiet: bool,
-    complete_when_deps_complete: bool,
-    error_when_deps_error: bool,
-    terminal_as_real_input: bool,
+    complete: Policy,
+    error: Policy,
+    invalidate: Policy,
     versioning: Option<NodeVersioningPolicy>,
 }
 
@@ -1052,15 +1071,20 @@ impl NodeConfigSlot {
         Self {
             partial: opts.partial,
             quiet: opts.quiet,
-            complete_when_deps_complete: opts.complete_when_deps_complete,
-            error_when_deps_error: opts.error_when_deps_error,
-            terminal_as_real_input: opts.terminal_as_real_input,
+            complete: opts.complete,
+            error: opts.error,
+            invalidate: opts.invalidate,
             versioning: opts.versioning.clone(),
         }
     }
 
+    /// Whether a dependency's terminal is the function's input under some policy.
+    fn terminal_is_input(&self) -> bool {
+        self.complete == Policy::Manual || self.error == Policy::Manual
+    }
+
     fn all_deps_settled(&self, dep: &DepState) -> bool {
-        dep.all_settled(self.terminal_as_real_input)
+        dep.all_settled(self.terminal_is_input())
     }
 }
 
@@ -2720,6 +2744,12 @@ impl Core {
     /// the node yet, so that first output only sets what the new subscriber's START
     /// snapshot carries.
     fn activate(&self) {
+        if self.with_inner_edges(|_, e| e.value.terminal) {
+            // An ended node is connected and gives its snapshot, but never runs again
+            // and holds nothing upstream (R-terminals).
+            self.with_aux_mut(|a| a.activated = true);
+            return;
+        }
         let deps = self.with_node_state_aux_mut(|n, _c, _cfg, _r, e, a| {
             a.activated = true;
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
@@ -2915,7 +2945,7 @@ impl Core {
                     _ => None,
                 })
             });
-            if let (Some(err), true) = (dep_error, cfg.error_when_deps_error) {
+            if let (Some(err), Policy::Auto) = (dep_error, cfg.error) {
                 // An INVALIDATE that reached the node before the ERROR takes effect
                 // first, whatever the INVALIDATE policy (R-terminals).
                 let invalidated_first = e
@@ -2935,6 +2965,7 @@ impl Core {
             for input in &mut e.state.inputs {
                 if let Some(at) = input.frames.iter().rposition(|f| starts_with_invalidate(f)) {
                     input.frames.drain(..=at);
+                    input.invalidated = true;
                     invalidated = true;
                 }
             }
@@ -2943,25 +2974,26 @@ impl Core {
                 .inputs
                 .iter()
                 .any(|input| input.frames.iter().flatten().any(InMsg::is_value));
-            let terminal_input = cfg.terminal_as_real_input
-                && e.state.inputs.iter().any(|input| {
-                    input
-                        .frames
-                        .iter()
-                        .flatten()
-                        .any(|m| m.terminal().is_some())
-                });
+            // A terminal is the function's input under its manual policy.
+            let terminal_input = e.state.inputs.iter().any(|input| {
+                input.frames.iter().flatten().any(|m| match m {
+                    InMsg::Complete => cfg.complete == Policy::Manual,
+                    InMsg::Error(_) => cfg.error == Policy::Manual,
+                    _ => false,
+                })
+            });
+            let invalidate_input = invalidated && cfg.invalidate == Policy::Manual;
             let gate_open = r.has_called_fn_once
                 || cfg.partial
                 || cfg.all_deps_settled(&e.state)
                 || c.handle.is_none();
-            let runs = (values || terminal_input) && gate_open;
+            let runs = (values || terminal_input || invalidate_input) && gate_open;
             let all_ended =
                 !n.deps.is_empty() && e.state.inputs.iter().all(|input| input.ended.is_some());
             Some(SettlePlan::Run {
-                invalidated,
+                invalidated: invalidated && cfg.invalidate == Policy::Auto,
                 runs,
-                auto_complete: cfg.complete_when_deps_complete && all_ended,
+                auto_complete: cfg.complete == Policy::Auto && all_ended,
                 quiet: cfg.quiet,
                 passthrough: c.handle.is_none(),
             })
@@ -3045,10 +3077,10 @@ impl Core {
             let restored_producer = n.deps.is_empty() && r.has_called_fn_once;
             let gate_open = cfg.partial || cfg.all_deps_settled(&e.state);
             Some((
-                dep_error.filter(|_| cfg.error_when_deps_error),
+                dep_error.filter(|_| cfg.error == Policy::Auto),
                 c.handle.is_some() && gate_open && !restored_producer,
                 c.handle.is_none() && !n.deps.is_empty(),
-                cfg.complete_when_deps_complete && all_ended,
+                cfg.complete == Policy::Auto && all_ended,
             ))
         });
         let Some((dep_error, runs, passthrough, auto_complete)) = plan else {
@@ -3205,12 +3237,6 @@ impl Core {
             assert!(
                 !reachable_upstream(d, self),
                 "rewire: would create a cycle — dep already transitively depends on this node (R-rewire / D42)"
-            );
-            // Rust has no resubscribable-terminal opt-in yet (R-terminal, later slice) ⇒
-            // ALL terminal deps are non-resubscribable → adding any terminal dep is rejected.
-            assert!(
-                !d.with_inner_edges(|_n, e| e.value.terminal),
-                "rewire: cannot add a non-resubscribable terminal dep — would wedge (R-rewire / D42)"
             );
         }
         with_wave_owner(self, || self.rewire_apply(new_deps, fn_), || {});
@@ -3427,7 +3453,8 @@ impl Core {
         // Build ctx + call snapshot under one short arena borrow, then invoke
         // borrow-free through the dispatcher (R-dispatch-all / R-sync-core).
         let (handle, dispatcher, ctx, old_on_invalidate, old_on_deactivation) = self
-            .with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
+            .with_node_state_aux_mut(|n, c, cfg, r, e, a| {
+                let invalidate_manual = cfg.invalidate == Policy::Manual;
                 let dep_records: Vec<DepRecord> = e
                     .state
                     .inputs
@@ -3455,6 +3482,7 @@ impl Core {
                         },
                         latest: input.value.clone(),
                         terminal: input.frames.iter().flatten().find_map(InMsg::terminal),
+                        invalidated: input.invalidated && invalidate_manual,
                     })
                     .collect();
                 r.has_called_fn_once = true;
@@ -3679,6 +3707,31 @@ impl Core {
             .collect();
         let subs = self.with_aux(snapshot_subscribers);
         with_delivery_scope(|| deliver_subscriber_snapshot(subs, &out));
+        if self.with_inner_edges(|_, e| e.value.terminal) {
+            self.close_ended_lifetime();
+        }
+    }
+
+    /// A node that ends closes its lifetime at once (R-lifetime, R-terminals): it
+    /// releases its dependencies, runs its cleanup and drops its private state, and
+    /// keeps its values, terminal and subscribers.
+    fn close_ended_lifetime(&self) {
+        let (unsubs, hooks) = self.with_inner_edges_aux_mut(|n, e, a| {
+            for b in &e.idx_boxes {
+                b.set(-1);
+            }
+            let unsubs: Vec<Unsub> = e.unsubs.iter_mut().filter_map(Option::take).collect();
+            e.state = DepState::new(n.deps.len());
+            a.on_invalidate.clear();
+            a.state = None;
+            (unsubs, std::mem::take(&mut a.on_deactivation))
+        });
+        for u in unsubs {
+            u();
+        }
+        for h in hooks {
+            h();
+        }
     }
 
     /// External deferred emit — the async-pool late-emit path used by
@@ -4017,9 +4070,9 @@ impl<T: 'static> Node<T> {
             // `Core::new` defaults to the plain derived behavior (auto-cascade, not an input).
             node.core.with_node_state_mut(|_n, call, cfg, _r, _e| {
                 cfg.partial = opts.partial;
-                cfg.complete_when_deps_complete = opts.complete_when_deps_complete;
-                cfg.error_when_deps_error = opts.error_when_deps_error;
-                cfg.terminal_as_real_input = opts.terminal_as_real_input;
+                cfg.complete = opts.complete;
+                cfg.error = opts.error;
+                cfg.invalidate = opts.invalidate;
                 cfg.versioning = opts.versioning;
                 call.factory = factory;
             });
@@ -4092,11 +4145,8 @@ impl<T: 'static> Node<T> {
     }
 
     fn subscribe_with_kind(&self, sink: impl Fn(&[Msg]) + 'static, kind: SubscriberKind) -> Unsub {
-        assert!(
-            !self.core.with_inner_edges(|_n, e| e.value.terminal),
-            "subscribe: node is terminal and non-resubscribable — the stream is permanently over (R-terminal / D17)"
-        );
-        let sink = Rc::new(sink);
+        // R-failure@3: a user sink's panic goes to the host reporter, not into a node.
+        let sink = Rc::new(crate::report::guard_sink(sink));
         // Record the subscriber id before activation so the error path hands back a real
         // unsubscribe instead of leaking the just-registered sink (no orphaned sink).
         let id_cell: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
@@ -4195,23 +4245,39 @@ impl<T: 'static> State<T> {
 
     /// Writes `v` as one DATA wave. Every occurrence stays DATA, an equal value
     /// included (D49).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the state has ended: host input to an ended node is refused
+    /// (R-terminals). The same holds for every host input below.
     pub fn set(&self, v: T) {
+        self.assert_open();
         self.node.set(v);
     }
 
     /// Removes the retained value, if any, as one INVALIDATE wave (R-invalidation).
     pub fn invalidate(&self) {
+        self.assert_open();
         self.node.down(vec![Message::Invalidate]);
     }
 
     /// Ends the state with COMPLETE (R-terminals).
     pub fn complete(&self) {
+        self.assert_open();
         self.node.down(vec![Message::Complete]);
     }
 
     /// Ends the state with ERROR carrying `error` (R-terminals).
     pub fn error(&self, error: impl Into<GraphError>) {
+        self.assert_open();
         self.node.down(vec![Message::Error(error.into())]);
+    }
+
+    fn assert_open(&self) {
+        assert!(
+            !self.node.core.with_inner_edges(|_, e| e.value.terminal),
+            "host input to an ended state is refused (R-terminals)"
+        );
     }
 }
 
@@ -4337,43 +4403,44 @@ mod tests {
     }
 
     #[test]
-    fn run_wave_post_dispatch_panic_keeps_wave_guard() {
-        // DR-8/B54: if a synthesized RESOLVED callback panics, WaveGuard must
-        // clear `inside_run_wave` on unwind so D30 recovery can proceed.
+    fn sink_panic_goes_to_host_reporter_and_is_not_the_node_error() {
+        // R-failure@3: a sink failure has no node to end. It goes to the host reporter,
+        // the node keeps running, and the wave guard is clear afterwards.
+        let reports = Rc::new(RefCell::new(Vec::<crate::HostFailure>::new()));
+        let previous = crate::set_host_reporter(Some({
+            let reports = reports.clone();
+            Rc::new(move |f: &crate::HostFailure| reports.borrow_mut().push(f.clone()))
+        }));
         let source = Node::<i32>::state_empty();
-        let resolved = Rc::new(Cell::new(false));
-        let resolved_flag = resolved.clone();
         let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
             let _ = ctx.data::<i32>(0).unwrap();
         });
         let _u = derived.subscribe(
             move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
-                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
-                    if matches!(msg, Message::Resolved) {
-                        resolved_flag.set(true);
-                        panic!("resolved callback panic");
-                    }
-                };
-                for msg in msgs {
-                    handle(msg);
+                if msgs.iter().any(|m| matches!(m, Message::Resolved)) {
+                    panic!("resolved callback panic");
                 }
             },
         );
 
         source.set(1);
+        source.set(2);
+        crate::set_host_reporter(previous);
 
-        assert!(
-            resolved.get(),
-            "post-run RESOLVED should still be delivered before callback-panic recovery"
-        );
         assert_eq!(
-            derived.status(),
-            Status::Errored,
-            "panic during callback should land ERROR"
+            *reports.borrow(),
+            vec![
+                crate::HostFailure {
+                    source: "sink".into(),
+                    error: "resolved callback panic".into()
+                };
+                2
+            ]
         );
+        assert_ne!(derived.status(), Status::Errored);
         assert!(
             !derived.core.with_inner_edges(|_, e| e.wave.inside_run_wave),
-            "WaveGuard must clear inside_run_wave during unwind"
+            "the wave guard is clear after the wave"
         );
     }
 
@@ -4499,34 +4566,28 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "terminal")]
-    fn subscribe_to_terminal_node_is_rejected() {
-        // R-terminal (D17): a late subscribe to a non-resubscribable terminal node is
-        // REJECTED (idiomatic error) — the stream is permanently over.
+    fn subscribe_to_ended_node_gets_start_last_data_and_terminal() {
+        // R-terminals / R-subscription@3: an ended node stays subscribable; a late
+        // subscriber gets START, the last DATA array and the terminal.
         let s = Node::<i32>::state(1);
-        let _u = s.subscribe(|_| {}); // keep alive (so the node doesn't deactivate)
-        s.down(vec![Message::Complete]); // S goes terminal
+        let _u = s.subscribe(|_| {});
+        s.down(vec![Message::Complete]);
         assert_eq!(s.status(), Status::Completed);
-        let _u2 = s.subscribe(|_| {}); // late subscribe to a terminal node → panics
+        let (log, sink) = recorder();
+        let _u2 = s.subscribe(sink);
+        assert_eq!(*log.borrow(), vec!["START", "DATA", "COMPLETE"]);
     }
 
     #[test]
-    fn set_on_terminal_node_is_a_noop() {
-        // Terminal-is-forever (D17 / R-terminal): a self-emit (set/ctx.down) on a
-        // terminated node emits nothing and does not resurrect its value.
+    #[should_panic(expected = "host input to an ended state is refused")]
+    fn set_on_ended_state_is_refused() {
+        // R-terminals: host input to an ended node is refused.
         let s = Node::<i32>::state(1);
         let (log, sink) = recorder();
         let _u = s.subscribe(sink);
-        assert_eq!(*log.borrow(), vec!["START", "DATA"]);
-
-        s.down(vec![Message::Complete]); // S terminal
-        assert_eq!(s.status(), Status::Completed);
+        s.down(vec![Message::Complete]);
         assert_eq!(*log.borrow(), vec!["START", "DATA", "PENDING", "COMPLETE"]);
-
-        s.set(5); // self-emit after terminal → no-op (no DATA, value unchanged)
-        assert_eq!(*log.borrow(), vec!["START", "DATA", "PENDING", "COMPLETE"]);
-        assert_eq!(s.cache(), Some(1));
-        assert_eq!(s.status(), Status::Completed);
+        s.set(5);
     }
 
     #[test]
@@ -4836,11 +4897,9 @@ mod tests {
     }
 
     #[test]
-    fn panic_aborted_delivery_clears_deferred_delivery_actions() {
-        // B25/DR-8: delivery-boundary run/settle queues are wave-local. If a subscriber
-        // panics after a dep callback queued a run, the wave-owner catch resets touched
-        // flags AND must discard those queued actions. A later unrelated delivery must
-        // not run stale work against reset dep projections.
+    fn sink_panic_does_not_abort_the_wave() {
+        // R-failure@3: a panicking sink on the source neither aborts the fanout nor
+        // leaves queued delivery work behind; the dependent still runs once.
         DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
 
         let source = Node::<i32>::state_empty();
@@ -4854,35 +4913,23 @@ mod tests {
         let _d_sub = d.subscribe(|_| {});
         let _panic_sub = source.subscribe(
             |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
-                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
-                    if matches!(m, Message::Data(_)) {
-                        panic!("subscriber aborts delivery after dep callback queued run");
-                    }
-                };
-                for m in msgs {
-                    handle(m);
+                if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                    panic!("subscriber panics during the fanout");
                 }
             },
         );
 
         source.set(1);
 
-        assert_eq!(runs.get(), 0, "aborted delivery must not run the queued fn");
+        assert_eq!(runs.get(), 1, "the dependent still runs once");
         DEFERRED_DELIVERY_ACTIONS.with(|queued| {
             assert!(
                 queued.borrow().is_empty(),
-                "aborted wave must clear queued deferred delivery actions"
+                "no delivery work is left queued"
             );
         });
-
-        let unrelated = Node::<i32>::state_empty();
-        let _u = unrelated.subscribe(|_| {});
-        unrelated.set(1);
-        assert_eq!(
-            runs.get(),
-            0,
-            "later unrelated delivery must not drain stale work from the aborted wave"
-        );
+        source.set(2);
+        assert_eq!(runs.get(), 2);
     }
 
     #[test]
@@ -6577,7 +6624,7 @@ mod tests {
     }
 
     #[test]
-    fn rewire_no_kept_fast_path_preserves_remaining_unsubs_on_removed_cleanup_panic() {
+    fn rewire_removed_cleanup_panic_ends_node_and_releases_remaining_edges() {
         // QA regression for the DR-8/B54 no-kept fast path: a panicking removed-dep
         // deactivation hook must not drop later old-edge Unsub handles without running
         // them. The broader half-applied-rewire panic class is tracked by B16; this
@@ -6609,22 +6656,19 @@ mod tests {
             d.replace_deps(vec![c.erased(), e.erased()], |ctx| {
                 ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
             });
+            // R-terminals: the cleanup panic becomes ERROR on the rewiring node, which
+            // ends it and closes its lifetime, so the later old edge is released at once.
+            assert_eq!(d.status(), Status::Errored);
+            assert!(
+                b_deactivated.get(),
+                "ending the rewiring node runs the remaining old-edge unsubscribe"
+            );
             assert_eq!(
                 b.core.subscriber_count(),
-                1,
-                "later old edge remains owned by the rewiring node after the first cleanup panic"
+                0,
+                "remaining old edge is not leaked after the node ends"
             );
         }
-
-        assert!(
-            b_deactivated.get(),
-            "dropping the rewiring node must still run the remaining old-edge unsubscribe"
-        );
-        assert_eq!(
-            b.core.subscriber_count(),
-            0,
-            "remaining old edge is not leaked after owner drop"
-        );
     }
 
     #[test]
@@ -6714,10 +6758,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "terminal dep")]
-    fn rewire_rejects_adding_terminal_dep() {
+    fn rewire_adding_ended_dep_delivers_its_terminal() {
+        // R-terminals: an ended node stays subscribable, so adding it as a dep is allowed;
+        // under the auto COMPLETE policy the node ends once every dep has completed.
         let term: Node<i32> = Node::producer(|ctx| ctx.down(vec![Message::Complete]));
-        let _ut = term.subscribe(|_| {}); // activate → producer completes
+        let _ut = term.subscribe(|_| {});
         assert_eq!(term.status(), Status::Completed);
         let a = Node::<i32>::state(1);
         let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
@@ -6725,7 +6770,13 @@ mod tests {
         });
         let _u = d.subscribe(|_| {});
         d.subscribe_dep(term.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
-        // terminal dep → panic
+        assert_ne!(
+            d.status(),
+            Status::Completed,
+            "a live dep keeps the node open"
+        );
+        a.down(vec![Message::Complete]);
+        assert_eq!(d.status(), Status::Completed);
     }
 
     #[test]
@@ -6803,7 +6854,7 @@ mod tests {
         let d: Node<i32> = Node::derived_opts(
             vec![a.erased()],
             NodeOpts {
-                error_when_deps_error: false,
+                error: Policy::Manual,
                 ..NodeOpts::default()
             },
             |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),

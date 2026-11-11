@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::json::JsonValue;
-use crate::node::{Node, NodeOpts};
+use crate::node::{Node, NodeOpts, Policy};
 use crate::operators::Operator;
 
 /// Stable identity for a semantic-memory fact.
@@ -1442,8 +1442,8 @@ where
 
 fn pattern_node_config() -> NodeOpts {
     NodeOpts {
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..NodeOpts::default()
     }
 }

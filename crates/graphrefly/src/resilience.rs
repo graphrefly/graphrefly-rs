@@ -6,7 +6,7 @@
 
 use crate::ctx::DepTerminal;
 use crate::graph::{Graph, GraphNodeOpts};
-use crate::node::Node;
+use crate::node::{Node, Policy};
 use crate::time::timeout;
 
 /// Delay strategy for retry/reconnect attempts.
@@ -526,9 +526,8 @@ fn timeout_projection_opts(name: String) -> GraphNodeOpts {
     GraphNodeOpts {
         name: Some(name),
         node: crate::node::NodeOpts {
-            complete_when_deps_complete: false,
-            error_when_deps_error: false,
-            terminal_as_real_input: true,
+            complete: Policy::Manual,
+            error: Policy::Manual,
             ..crate::node::NodeOpts::default()
         },
         ..GraphNodeOpts::default()

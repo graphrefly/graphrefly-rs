@@ -84,6 +84,7 @@ pub mod patterns;
 pub mod process;
 pub mod protocol;
 pub mod render;
+mod report;
 mod request;
 pub mod resilience;
 pub mod scheduled_readiness;
@@ -253,7 +254,7 @@ pub use messaging::{
     CONTEXT_TOPIC, DEFERRED_TOPIC, INJECTIONS_TOPIC, PROMPTS_TOPIC, RESPONSES_TOPIC, SPAWNS_TOPIC,
     STANDARD_TOPICS, TODOS_TOPIC,
 };
-pub use node::{Core, Node, NodeOpts, State, Status};
+pub use node::{Core, Node, NodeOpts, Policy, State, Status};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
     last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
@@ -293,6 +294,7 @@ pub use render::{
     describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,
     describe_to_pretty, mermaid_live_url, DiagramDirection,
 };
+pub use report::{set_host_reporter, HostFailure, HostReporter};
 pub use resilience::{
     breaker_status_node, rate_limit_bundle, retry_status_node, timeout_bundle, BackoffPolicy,
     BreakerState, BreakerStatus, RateLimitBundle, RateLimitStatus, RetryEvent, RetryPolicy,

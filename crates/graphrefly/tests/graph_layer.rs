@@ -1284,7 +1284,9 @@ fn observe_traverses_mounted_graphs_with_prefixed_paths() {
 }
 
 #[test]
-fn observe_cleans_partial_subscriptions_when_later_target_panics() {
+fn observe_includes_ended_nodes_and_keeps_live_ones() {
+    // R-terminals: an ended node stays subscribable, so observing a graph that holds
+    // one succeeds; the ended node replays its terminal and live nodes keep flowing.
     let g = graph();
     let live = g.state_opts(1i32, GraphNodeOpts::named("live"));
     let terminal = g.state_opts(9i32, GraphNodeOpts::named("terminal"));
@@ -1293,20 +1295,20 @@ fn observe_cleans_partial_subscriptions_when_later_target_panics() {
 
     let observed = Rc::new(RefCell::new(Vec::new()));
     let observed_sink = observed.clone();
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let _observer = g
-            .observe()
-            .subscribe(move |event| observed_sink.borrow_mut().push(event));
+    let observer = g
+        .observe()
+        .subscribe(move |event| observed_sink.borrow_mut().push(event));
+    assert!(observed.borrow().iter().any(|e| {
+        e.path == "terminal" && matches!(e.msg, graphrefly::ObserveMessage::Complete)
     }));
-    assert!(result.is_err());
-    let after_panic = observed.borrow().len();
 
+    let before = observed.borrow().len();
     live.set(2);
-    assert_eq!(
-        observed.borrow().len(),
-        after_panic,
-        "already-created observe subscriptions are cleaned up on panic"
-    );
+    assert!(observed.borrow()[before..].iter().any(|e| {
+        e.path == "live"
+            && matches!(&e.msg, graphrefly::ObserveMessage::Data(v) if v.as_ref().downcast_ref::<i32>() == Some(&2))
+    }));
+    observer.unsubscribe();
 }
 
 #[test]

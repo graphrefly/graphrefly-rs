@@ -20,7 +20,7 @@ use crate::messaging::{
     MessageBusAvailableParams, MessageBusCommand, MessageBusStatus, MessageBusStatusKind,
     MessageBusSubscriptionFrom, MessageBusSubscriptionOptions, MessageEnvelope,
 };
-use crate::node::{Core, Node, NodeOpts, State};
+use crate::node::{Core, Node, NodeOpts, Policy, State};
 use crate::protocol::Message;
 use crate::request::requested;
 use crate::resilience::{BackoffPolicy, RetryPolicy};
@@ -3354,8 +3354,8 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
     let mut opts = GraphNodeOpts::named(name);
     opts.node = NodeOpts {
         factory: Some(factory.into()),
-        complete_when_deps_complete: false,
-        error_when_deps_error: false,
+        complete: Policy::Manual,
+        error: Policy::Manual,
         ..opts.node
     };
     opts
