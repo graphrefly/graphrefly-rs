@@ -442,7 +442,26 @@ pub(crate) struct Domain {
     deferred_delivery: RefCell<Vec<DeferredDeliveryAction>>,
     requests: RefCell<VecDeque<QueuedRequest>>,
     draining: Cell<bool>,
+    /// The deferred settles are being drained: a delivery that ends inside the drain
+    /// leaves its settles to the running loop instead of draining again, so a long
+    /// chain settles with a constant stack depth (review Q15).
+    settling: Cell<bool>,
+    /// Lifetime closes in progress, as work items run by one loop (review Q15).
+    closing: RefCell<VecDeque<CloseWork>>,
+    closing_loop: Cell<bool>,
+    /// Nodes whose dependents still have to receive the pending mark, passed on by one
+    /// loop (review Q15); only dependent nodes receive a lone mark, so its order is not
+    /// observable.
+    marking: RefCell<VecDeque<Core>>,
+    marking_loop: Cell<bool>,
     pub(crate) batch: crate::batch::BatchCell,
+}
+
+/// One step of closing a lifetime: release one dependency, or, after the releases,
+/// run the node's cleanup and drop its private state.
+enum CloseWork {
+    Release(Core, Unsub),
+    Finish(Core, Option<crate::lifetime::Lifetime>),
 }
 
 pub(crate) type DomainRef = Rc<Domain>;
@@ -456,6 +475,11 @@ impl Domain {
             deferred_delivery: RefCell::new(Vec::new()),
             requests: RefCell::new(VecDeque::new()),
             draining: Cell::new(false),
+            settling: Cell::new(false),
+            closing: RefCell::new(VecDeque::new()),
+            closing_loop: Cell::new(false),
+            marking: RefCell::new(VecDeque::new()),
+            marking_loop: Cell::new(false),
             batch: RefCell::new(None),
         })
     }
@@ -1383,7 +1407,7 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
     if refs.get() != 0 {
         return;
     }
-    let (mut inner, _topology, mut call, _config, mut edges, mut aux) = {
+    let (mut inner, topology, mut call, config, mut edges, mut aux) = {
         let mut graph = graph_ref.borrow_mut();
         if graph.pin_count(key) != 0 {
             return;
@@ -1418,6 +1442,35 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
     inner.cleanup_before_free(&mut call, &mut edges, &mut aux, graph_reporter(graph_ref));
     free_slot.armed = false;
     graph_ref.borrow_mut().free.push(key.id.0);
+    // The freed node's parts hold handles to its dependencies, whose own frees would
+    // nest one level per node: they are dropped by one loop instead, so a long chain
+    // frees with a constant stack depth (review Q15).
+    drop_later(Box::new((inner, topology, call, config, edges, aux)));
+}
+
+thread_local! {
+    /// Freed nodes' parts waiting to be dropped, and whether the loop that drops them
+    /// is running.
+    static DROPS: RefCell<Vec<Box<dyn std::any::Any>>> = const { RefCell::new(Vec::new()) };
+    static DROPPING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn drop_later(parts: Box<dyn std::any::Any>) {
+    DROPS.with(|drops| drops.borrow_mut().push(parts));
+    if DROPPING.with(Cell::get) {
+        return;
+    }
+    DROPPING.with(|dropping| dropping.set(true));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DROPPING.with(|dropping| dropping.set(false));
+        }
+    }
+    let _reset = Reset;
+    while let Some(parts) = DROPS.with(|drops| drops.borrow_mut().pop()) {
+        drop(parts);
+    }
 }
 
 struct ArenaNodePin {
@@ -1903,15 +1956,33 @@ fn with_delivery_scope(domain: &DomainRef, body: impl FnOnce()) {
     guard.finish();
 }
 
+/// Runs the settles deferred to the delivery boundary. One loop serves the domain: a
+/// delivery that ends while it runs leaves its settles to it, and the settles a step
+/// adds run before the rest of the batch, the order nested drains gave, with a
+/// constant stack depth however long the chain (review Q15).
 fn drain_deferred_runs(d: &Domain) {
-    loop {
-        let actions = std::mem::take(&mut *d.deferred_delivery.borrow_mut());
-        if actions.is_empty() {
-            break;
+    if d.settling.get() {
+        return;
+    }
+    d.settling.set(true);
+    let _reset = ResetCell(&d.settling);
+    let mut pending: VecDeque<DeferredDeliveryAction> =
+        std::mem::take(&mut *d.deferred_delivery.borrow_mut()).into();
+    while let Some(action) = pending.pop_front() {
+        action.apply();
+        let added = std::mem::take(&mut *d.deferred_delivery.borrow_mut());
+        for action in added.into_iter().rev() {
+            pending.push_front(action);
         }
-        for action in &actions {
-            action.apply();
-        }
+    }
+}
+
+/// Clears a domain flag when its loop ends, a panic included.
+struct ResetCell<'a>(&'a Cell<bool>);
+
+impl Drop for ResetCell<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
     }
 }
 
@@ -2556,6 +2627,50 @@ impl Core {
             self.activate_seeded(seed);
             return;
         }
+        // The inactive nodes upstream are activated first, deepest first, each held by
+        // a temporary subscription, so no activation recurses into its dependencies
+        // and a long chain activates with a constant stack depth (review Q15). The
+        // order of first runs is the one nested activations gave.
+        let holds = self.hold_inactive_upstream();
+        self.activate_on_held_deps();
+        for release in holds.into_iter().rev() {
+            release();
+        }
+    }
+
+    /// Holds every inactive node upstream of this one, deepest first; returns the
+    /// releases.
+    fn hold_inactive_upstream(&self) -> Vec<Unsub> {
+        let mut order: Vec<Core> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack: Vec<(Core, bool)> =
+            self.deps().into_iter().rev().map(|d| (d, false)).collect();
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                order.push(node);
+                continue;
+            }
+            if node.with_aux(|a| a.activated) || !seen.insert(node.identity_key()) {
+                continue;
+            }
+            let deps = node.deps();
+            stack.push((node, true));
+            stack.extend(deps.into_iter().rev().map(|d| (d, false)));
+        }
+        order
+            .into_iter()
+            .map(|node| {
+                let id = Cell::new(None);
+                node.subscribe_recording_id_with_kind(
+                    Rc::new(|_: &[Msg]| {}),
+                    SubscriberKind::External,
+                    &id,
+                )
+            })
+            .collect()
+    }
+
+    fn activate_on_held_deps(&self) {
         let deps = self.with_node_state_aux_mut(|n, _c, _cfg, e, a| {
             a.activated = true;
             a.lifetime = Some(crate::lifetime::Lifetime::open());
@@ -2647,9 +2762,38 @@ impl Core {
     /// state, then drop the private state. Each step's panic goes to the host
     /// reporter and the close completes.
     fn finish_close(&self, unsubs: Vec<Unsub>, lifetime: Option<crate::lifetime::Lifetime>) {
-        for u in unsubs {
-            run_reported(self.reporter().as_ref(), "release", u);
+        // The releases, then this node's cleanup, as work items in front of whatever
+        // close is in progress: a released dependency's own close runs before the rest
+        // of this one, as nested calls did, with a constant stack depth (review Q15).
+        let d = self.domain();
+        {
+            let mut work = d.closing.borrow_mut();
+            work.push_front(CloseWork::Finish(self.clone(), lifetime));
+            for u in unsubs.into_iter().rev() {
+                work.push_front(CloseWork::Release(self.clone(), u));
+            }
         }
+        if d.closing_loop.get() {
+            return;
+        }
+        d.closing_loop.set(true);
+        let _reset = ResetCell(&d.closing_loop);
+        loop {
+            let Some(item) = d.closing.borrow_mut().pop_front() else {
+                break;
+            };
+            match item {
+                CloseWork::Release(core, u) => {
+                    run_reported(core.reporter().as_ref(), "release", u);
+                }
+                CloseWork::Finish(core, lifetime) => core.finish_cleanup(lifetime),
+            }
+        }
+    }
+
+    /// The end of a close, after the releases: the cleanup, which may still read the
+    /// private state, then the private state is dropped.
+    fn finish_cleanup(&self, lifetime: Option<crate::lifetime::Lifetime>) {
         if let Some(cleanup) = lifetime.and_then(|lt| lt.cleanup) {
             let cctx = crate::lifetime::CleanupCtx {
                 state: self.get_state(),
@@ -2902,8 +3046,20 @@ impl Core {
 
     /// Sends the pending mark to this node's dependents.
     fn mark_dependents(&self) {
-        let deps = self.with_aux(snapshot_dependents);
-        deliver_subscriber_snapshot(deps, &[vec![Message::Pending]]);
+        let d = self.domain();
+        d.marking.borrow_mut().push_back(self.clone());
+        if d.marking_loop.get() {
+            return;
+        }
+        d.marking_loop.set(true);
+        let _reset = ResetCell(&d.marking_loop);
+        loop {
+            let Some(node) = d.marking.borrow_mut().pop_front() else {
+                break;
+            };
+            let deps = node.with_aux(snapshot_dependents);
+            deliver_subscriber_snapshot(deps, &[vec![Message::Pending]]);
+        }
     }
 
     /// Marks this node pending as the source of a wave, and its cone with it.

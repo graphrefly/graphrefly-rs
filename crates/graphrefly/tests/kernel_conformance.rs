@@ -4346,3 +4346,35 @@ fn built_in_operators_and_sources_restore_from_their_recipes() {
     assert_eq!(rfirsts.status().output, graphrefly::OutputStatus::Completed);
     assert_eq!(rthird.cache(), Some(json!(3)));
 }
+
+/// Review Q15 (F 2.11) — activation, delivery, pending marks, closing and freeing are
+/// iterative: a chain far longer than 3,000 nodes activates, carries a wave, closes,
+/// activates again and is freed, on a test thread's small stack.
+#[test]
+fn a_chain_of_many_thousand_nodes_runs_on_a_small_stack() {
+    const N: usize = 20_000;
+    let g = graphrefly::graph();
+    let src = g.state(0i32);
+    let mut last = src.erased();
+    let mut tail = None;
+    for _ in 0..N {
+        let node = g.node::<i32, _>(vec![last.clone()], |ctx| {
+            if let Some(v) = ctx.dep(0).value::<i32>() {
+                ctx.emit(*v + 1);
+            }
+        });
+        last = node.erased();
+        tail = Some(node);
+    }
+    let tail = tail.unwrap();
+    let stop = tail.subscribe(|_| {});
+    assert_eq!(tail.cache(), Some(N as i32), "activation reaches the end");
+    src.set(1);
+    assert_eq!(tail.cache(), Some(N as i32 + 1), "one wave reaches the end");
+    stop();
+    assert_eq!(tail.cache(), None, "closing reaches the source");
+    let again = tail.subscribe(|_| {});
+    assert_eq!(tail.cache(), Some(N as i32 + 1));
+    again();
+    drop((tail, last, src, g));
+}
