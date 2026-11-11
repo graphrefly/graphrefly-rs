@@ -577,6 +577,9 @@ impl Graph {
 
     /// Value-level derived sugar: return `Some(value)` to emit DATA, `None` for
     /// a no-emit/RESOLVED settle. Reads dep values through [`Values`], not raw `Ctx`.
+    /// The callback runs once every dependency has a value, then whenever one sends
+    /// DATA; the kernel itself has no such gate ([`Graph::node`] runs on whatever its
+    /// dependencies hold).
     pub fn derived<T: 'static, F: Fn(&Values<'_>) -> Option<T> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -599,6 +602,9 @@ impl Graph {
             deps,
             self.apply_default_node_opts(opts.node.clone()),
             move |ctx| {
+                if !sugar_gate(ctx) {
+                    return;
+                }
                 let values = Values::new(ctx.dep_records());
                 if let Some(value) = f(&values) {
                     ctx.emit(value);
@@ -608,8 +614,9 @@ impl Graph {
         self.add(node, "derived", opts)
     }
 
-    /// Value-level sink sugar. A run's returned cleanup replaces the previous run's and
-    /// runs when the lifetime closes (R-lifetime@2).
+    /// Value-level sink sugar, with derived's gate: the callback runs once every
+    /// dependency has a value, then whenever one sends DATA. A run's returned cleanup
+    /// replaces the previous run's and runs when the lifetime closes (R-lifetime@2).
     pub fn effect<F: Fn(&Values<'_>) -> Option<Box<dyn FnOnce()>> + 'static>(
         &self,
         deps: Vec<Core>,
@@ -650,6 +657,9 @@ impl Graph {
             deps,
             node_opts,
             move |ctx| {
+                if !sugar_gate(ctx) {
+                    return;
+                }
                 let values = Values::new(ctx.dep_records());
                 ctx.state_set(EffectCleanup(RefCell::new(f(&values))));
             },
@@ -1557,6 +1567,22 @@ pub struct Explain {
     pub to: String,
 }
 
+/// The gate of `derived` and `effect` (sugar, not kernel: graphrefly:D797 (9), review
+/// Q1): the callback runs once every dependency has a value, and after that when a
+/// dependency sent DATA in this invocation. A dependency's latest value is kept while
+/// the gate waits, so the first callback sees every value. A node with no
+/// dependencies runs on its first run.
+fn sugar_gate(ctx: &Ctx) -> bool {
+    let mut fresh = ctx.dep_len() == 0;
+    for dep in ctx.deps() {
+        if !dep.has() {
+            return false;
+        }
+        fresh |= dep.raw_waves().iter().any(|wave| !wave.is_empty());
+    }
+    fresh
+}
+
 /// Read-only value-level view over a node fn's dependency snapshot (D27/R-primary-api-clean).
 ///
 /// `Values` exposes DATA-oriented dep state (`latest`, `prev`, `batch`, terminal state)
@@ -1580,6 +1606,15 @@ impl<'a> Values<'a> {
     /// Updates or reads `is_empty`.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Dep `i`'s latest value: the last DATA it delivered, in this run or before. Once
+    /// the gate has opened every dependency has one (`None` only if it is not a `T`).
+    pub fn value<T: 'static>(&self, i: usize) -> Option<Rc<T>> {
+        self.records
+            .get(i)
+            .and_then(|r| r.latest.clone())
+            .and_then(|a| a.downcast::<T>().ok())
     }
 
     /// Value-level derived helper: last committed DATA before dep `i`'s current batch.

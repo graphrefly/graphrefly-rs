@@ -1887,7 +1887,6 @@ fn runtime_projection<
 
 fn no_terminal_opts() -> crate::node::NodeOpts {
     crate::node::NodeOpts {
-        partial: true,
         complete: Policy::Manual,
         error: Policy::Manual,
         ..Default::default()

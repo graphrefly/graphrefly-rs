@@ -318,7 +318,6 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
             name: Some(format!("{base_name}.events")),
             meta: meta.clone(),
             node: NodeOpts {
-                partial: true,
                 ..NodeOpts::default()
             },
             ..GraphNodeOpts::default()
@@ -386,7 +385,6 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
             name: Some(format!("{base_name}.status")),
             meta: meta.clone(),
             node: NodeOpts {
-                partial: true,
                 ..NodeOpts::default()
             },
             ..GraphNodeOpts::default()
@@ -435,7 +433,6 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
             name: Some(format!("{base_name}.value")),
             meta,
             node: NodeOpts {
-                partial: true,
                 ..NodeOpts::default()
             },
             ..GraphNodeOpts::default()

@@ -195,12 +195,11 @@ pub fn distinct_until_changed<S: Clone + 'static>(
     })
 }
 
-/// merge: interleave DATA from any dep; first-run gate is partial.
+/// merge: interleave DATA from any dep.
 pub fn merge<T: Clone + 'static>() -> Operator<T> {
     Operator::with_opts(
         "merge",
         NodeOpts {
-            partial: true,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -540,7 +539,6 @@ pub fn valve<S: Clone + 'static>() -> Operator<S> {
     Operator::with_opts(
         "valve",
         NodeOpts {
-            partial: true,
             complete: Policy::Manual,
             ..NodeOpts::default()
         },
@@ -586,7 +584,6 @@ fn is_complete(terminal: Option<&DepTerminal>) -> bool {
 fn is_default_node_opts(opts: &NodeOpts) -> bool {
     opts.factory.is_none()
         && opts.pool == Default::default()
-        && !opts.partial
         && !opts.quiet
         && opts.complete == Policy::Auto
         && opts.error == Policy::Auto
@@ -605,9 +602,6 @@ fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
     }
     if caller.pool != default.pool {
         opts.pool = caller.pool;
-    }
-    if caller.partial {
-        opts.partial = true;
     }
     if caller.quiet {
         opts.quiet = true;

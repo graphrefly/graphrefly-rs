@@ -238,7 +238,6 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
             },
             GraphNodeOpts {
                 node: graphrefly::NodeOpts {
-                    partial: true,
                     ..graphrefly::NodeOpts::default()
                 },
                 ..GraphNodeOpts::named("F")

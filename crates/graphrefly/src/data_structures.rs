@@ -906,7 +906,6 @@ impl<T: Clone + 'static> ReactiveList<T> {
         let op = Operator::with_opts(
             "reactiveList.bindSource",
             NodeOpts {
-                partial: true,
                 ..NodeOpts::default()
             },
             move |ctx| {
@@ -1521,7 +1520,6 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         Node::derived_opts(
             vec![self.delta.erased()],
             NodeOpts {
-                partial: true,
                 factory: Some("reactiveLog.tail".to_owned()),
                 ..NodeOpts::default()
             },
@@ -1539,7 +1537,6 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         Node::derived_opts(
             vec![self.delta.erased()],
             NodeOpts {
-                partial: true,
                 factory: Some("reactiveLog.slice".to_owned()),
                 ..NodeOpts::default()
             },
@@ -1606,7 +1603,6 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         Node::derived_opts(
             vec![self.delta.erased()],
             NodeOpts {
-                partial: true,
                 factory: Some("reactiveLog.scan".to_owned()),
                 ..NodeOpts::default()
             },
@@ -1669,7 +1665,6 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         let op = Operator::with_opts(
             "reactiveLog.bindSource",
             NodeOpts {
-                partial: true,
                 ..NodeOpts::default()
             },
             move |ctx| {
@@ -1850,7 +1845,6 @@ pub fn merge_reactive_logs<T: Clone + 'static>(logs: Vec<ReactiveLog<T>>) -> Nod
     Node::derived_opts(
         deps,
         NodeOpts {
-            partial: true,
             factory: Some("mergeReactiveLogs".to_owned()),
             ..NodeOpts::default()
         },
@@ -1967,7 +1961,6 @@ fn make_snapshot_node<T: Clone + 'static>(
     let op = Operator::with_opts(
         "reactiveList.snapshot",
         NodeOpts {
-            partial: true,
             quiet: true,
             ..NodeOpts::default()
         },
@@ -2016,7 +2009,6 @@ fn make_log_snapshot_node<T: Clone + 'static>(
     let op = Operator::with_opts(
         "reactiveLog.snapshot",
         NodeOpts {
-            partial: true,
             quiet: true,
             ..NodeOpts::default()
         },
@@ -2069,7 +2061,6 @@ fn make_index_snapshot_node<
     let op = Operator::with_opts(
         "reactiveIndex.snapshot",
         NodeOpts {
-            partial: true,
             quiet: true,
             ..NodeOpts::default()
         },
@@ -2118,7 +2109,6 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
     let op = Operator::with_opts(
         "reactiveMap.snapshot",
         NodeOpts {
-            partial: true,
             quiet: true,
             ..NodeOpts::default()
         },
@@ -2349,7 +2339,6 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
     let delta_op = Operator::with_opts(
         factories.delta,
         NodeOpts {
-            partial: true,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -2388,7 +2377,6 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
     let snapshot_op = Operator::with_opts(
         factories.snapshot,
         NodeOpts {
-            partial: true,
             quiet: true,
             ..NodeOpts::default()
         },

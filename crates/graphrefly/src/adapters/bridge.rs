@@ -2319,7 +2319,6 @@ fn response_command_error<T>(command: &WireBridgeCommand<RemoteCallResponse<T>>)
 
 fn no_terminal_graph_opts(name: impl Into<String>) -> GraphNodeOpts {
     let mut opts = GraphNodeOpts::named(name);
-    opts.node.partial = true;
     opts.node.complete = Policy::Manual;
     opts.node.error = Policy::Manual;
     opts
@@ -2361,7 +2360,6 @@ where
     let event_opts = GraphNodeOpts {
         name: Some(format!("{name}/events")),
         node: NodeOpts {
-            partial: true,
             complete: Policy::Manual,
             error: Policy::Manual,
             ..NodeOpts::default()
@@ -3741,7 +3739,8 @@ mod tests {
             ));
         }
 
-        assert_eq!(*batch_sizes.borrow(), vec![1, 1]);
+        // The first run, on activation, sees no envelope yet (no kernel first-run gate).
+        assert_eq!(*batch_sizes.borrow(), vec![0, 1, 1]);
     }
 
     #[test]

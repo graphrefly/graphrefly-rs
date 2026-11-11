@@ -177,7 +177,6 @@ fn map_operator<TIn: Clone + 'static, TOut: 'static>(
     Operator::with_opts(
         factory,
         NodeOpts {
-            partial: true,
             error: Policy::Manual,
             complete: Policy::Manual,
             ..NodeOpts::default()

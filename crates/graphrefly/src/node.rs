@@ -136,10 +136,6 @@ pub struct NodeOpts {
     pub factory: Option<String>,
     /// The dispatch pool (default LocalSync, R-sync-core).
     pub pool: PoolKind,
-    /// First-run gate override: allow fn execution with SENTINEL deps. Default
-    /// false. The first-run gate is Rust sugar, not protocol (graphrefly:D797 (9)):
-    /// the kernel runs a function on whatever its dependencies have delivered.
-    pub partial: bool,
     /// A quiet node consumes its input waves without being marked pending or passing
     /// a mark on, and publishes its function's output as a later wave of its own
     /// (R-wave). Default false.
@@ -188,7 +184,6 @@ impl Default for NodeOpts {
         Self {
             factory: None,
             pool: PoolKind::default(),
-            partial: false,
             quiet: false,
             complete: Policy::Auto,
             error: Policy::Auto,
@@ -424,7 +419,6 @@ struct GraphCore {
     topology_slots: Vec<Option<NodeTopologySlot>>,
     call_slots: Vec<Option<NodeCallSlot>>,
     config_slots: Vec<Option<NodeConfigSlot>>,
-    run_slots: Vec<Option<NodeRunState>>,
     edge_slots: Vec<Option<DepEdges>>,
     version_slots: Vec<Option<NodeVersionState>>,
     aux_slots: Vec<Option<NodeAux>>,
@@ -486,7 +480,6 @@ type TakenNodeSlot = (
     NodeTopologySlot,
     NodeCallSlot,
     NodeConfigSlot,
-    NodeRunState,
     DepEdges,
     NodeVersionState,
     NodeAux,
@@ -499,7 +492,6 @@ impl GraphCore {
             topology_slots: Vec::new(),
             call_slots: Vec::new(),
             config_slots: Vec::new(),
-            run_slots: Vec::new(),
             edge_slots: Vec::new(),
             version_slots: Vec::new(),
             aux_slots: Vec::new(),
@@ -522,7 +514,6 @@ impl GraphCore {
     ) -> NodeId {
         let edges = DepEdges::new(topology.deps.len());
         let aux = NodeAux::new();
-        let run = NodeRunState::new();
         if let Some(id) = self.free.last().copied() {
             let next_generation = self.generations[id]
                 .checked_add(1)
@@ -532,7 +523,6 @@ impl GraphCore {
             self.topology_slots[id] = Some(topology);
             self.call_slots[id] = Some(call);
             self.config_slots[id] = Some(config);
-            self.run_slots[id] = Some(run);
             self.edge_slots[id] = Some(edges);
             self.version_slots[id] = Some(version);
             self.aux_slots[id] = Some(aux);
@@ -546,7 +536,6 @@ impl GraphCore {
             self.topology_slots.push(Some(topology));
             self.call_slots.push(Some(call));
             self.config_slots.push(Some(config));
-            self.run_slots.push(Some(run));
             self.edge_slots.push(Some(edges));
             self.version_slots.push(Some(version));
             self.aux_slots.push(Some(aux));
@@ -591,49 +580,6 @@ impl GraphCore {
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore edge slot");
         (n, e)
-    }
-
-    #[cfg(test)]
-    fn get_node_call_config_run_edges(
-        &self,
-        key: NodeKey,
-    ) -> (
-        &NodeTopologySlot,
-        &NodeCallSlot,
-        &NodeConfigSlot,
-        &NodeRunState,
-        &DepEdges,
-    ) {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        let n = self
-            .topology_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore topology slot");
-        let c = self
-            .call_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore call slot");
-        let cfg = self
-            .config_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore config slot");
-        let r = self
-            .run_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore run slot");
-        let e = self
-            .edge_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore edge slot");
-        (n, c, cfg, r, e)
     }
 
     fn get_call(&self, key: NodeKey) -> &NodeCallSlot {
@@ -717,14 +663,13 @@ impl GraphCore {
         (n, e, a)
     }
 
-    fn get_node_call_config_run_edges_mut(
+    fn get_node_call_config_edges_mut(
         &mut self,
         key: NodeKey,
     ) -> (
         &mut NodeTopologySlot,
         &mut NodeCallSlot,
         &mut NodeConfigSlot,
-        &mut NodeRunState,
         &mut DepEdges,
     ) {
         assert!(
@@ -734,7 +679,6 @@ impl GraphCore {
         let topology_slots = &mut self.topology_slots;
         let call_slots = &mut self.call_slots;
         let config_slots = &mut self.config_slots;
-        let run_slots = &mut self.run_slots;
         let edge_slots = &mut self.edge_slots;
         let n = topology_slots
             .get_mut(key.id.0)
@@ -748,25 +692,20 @@ impl GraphCore {
             .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore config slot");
-        let r = run_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore run slot");
         let e = edge_slots
             .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore edge slot");
-        (n, c, cfg, r, e)
+        (n, c, cfg, e)
     }
 
-    fn get_node_call_config_run_edges_aux_mut(
+    fn get_node_call_config_edges_aux_mut(
         &mut self,
         key: NodeKey,
     ) -> (
         &mut NodeTopologySlot,
         &mut NodeCallSlot,
         &mut NodeConfigSlot,
-        &mut NodeRunState,
         &mut DepEdges,
         &mut NodeAux,
     ) {
@@ -777,7 +716,6 @@ impl GraphCore {
         let topology_slots = &mut self.topology_slots;
         let call_slots = &mut self.call_slots;
         let config_slots = &mut self.config_slots;
-        let run_slots = &mut self.run_slots;
         let edge_slots = &mut self.edge_slots;
         let aux_slots = &mut self.aux_slots;
         let n = topology_slots
@@ -792,10 +730,6 @@ impl GraphCore {
             .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore config slot");
-        let r = run_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore run slot");
         let e = edge_slots
             .get_mut(key.id.0)
             .and_then(Option::as_mut)
@@ -804,7 +738,7 @@ impl GraphCore {
             .get_mut(key.id.0)
             .and_then(Option::as_mut)
             .expect("Core points at a live GraphCore aux slot");
-        (n, c, cfg, r, e, a)
+        (n, c, cfg, e, a)
     }
 
     fn get_aux(&self, key: NodeKey) -> &NodeAux {
@@ -824,7 +758,6 @@ impl GraphCore {
             debug_assert!(self.topology_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.call_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.config_slots.get(id.0).is_some_and(Option::is_some));
-            debug_assert!(self.run_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.edge_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.version_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.aux_slots.get(id.0).is_some_and(Option::is_some));
@@ -873,11 +806,10 @@ impl GraphCore {
         let topology = self.topology_slots.get_mut(key.id.0)?.take()?;
         let call = self.call_slots.get_mut(key.id.0)?.take()?;
         let config = self.config_slots.get_mut(key.id.0)?.take()?;
-        let run = self.run_slots.get_mut(key.id.0)?.take()?;
         let edges = self.edge_slots.get_mut(key.id.0)?.take()?;
         let version = self.version_slots.get_mut(key.id.0)?.take()?;
         let aux = self.aux_slots.get_mut(key.id.0)?.take()?;
-        Some((inner, topology, call, config, run, edges, version, aux))
+        Some((inner, topology, call, config, edges, version, aux))
     }
 }
 
@@ -1007,14 +939,6 @@ impl DepState {
         }
     }
 
-    /// The first-run gate (Rust sugar, graphrefly:D797 (9)): every dependency has a
-    /// value, or has ended when its terminal is the function's input.
-    fn all_settled(&self, terminal_is_input: bool) -> bool {
-        self.inputs
-            .iter()
-            .all(|input| input.has || (terminal_is_input && input.ended.is_some()))
-    }
-
     fn has_frames(&self) -> bool {
         self.inputs.iter().any(|input| !input.frames.is_empty())
     }
@@ -1118,7 +1042,6 @@ struct NodeCallSlot {
 /// Construction/configuration state for one node. This is side-table owned so the
 /// public `Core` handle can keep thinning toward a graph/id/generation token.
 struct NodeConfigSlot {
-    partial: bool,
     quiet: bool,
     complete: Policy,
     error: Policy,
@@ -1131,7 +1054,6 @@ struct NodeConfigSlot {
 impl NodeConfigSlot {
     fn from_opts(opts: &NodeOpts) -> Self {
         Self {
-            partial: opts.partial,
             quiet: opts.quiet,
             complete: opts.complete,
             error: opts.error,
@@ -1140,15 +1062,6 @@ impl NodeConfigSlot {
             setup: opts.setup.clone(),
             recipe: opts.recipe.clone(),
         }
-    }
-
-    /// Whether a dependency's terminal is the function's input under some policy.
-    fn terminal_is_input(&self) -> bool {
-        self.complete == Policy::Manual || self.error == Policy::Manual
-    }
-
-    fn all_deps_settled(&self, dep: &DepState) -> bool {
-        dep.all_settled(self.terminal_is_input())
     }
 }
 
@@ -1163,21 +1076,6 @@ impl NodeVersionState {
         let value = create_node_version(&policy, initial)
             .unwrap_or_else(|err| panic!("node versioning: {err}"));
         Self { policy, value }
-    }
-}
-
-/// Lifecycle/run mutable state. Transient wave flags stay in [`NodeWaveState`];
-/// this side table holds state that persists across waves but resets on lifecycle
-/// teardown.
-struct NodeRunState {
-    has_called_fn_once: bool,
-}
-
-impl NodeRunState {
-    fn new() -> Self {
-        Self {
-            has_called_fn_once: false,
-        }
     }
 }
 
@@ -1441,29 +1339,18 @@ impl Core {
         f(n, e)
     }
 
-    #[cfg(test)]
-    fn with_node_state<R>(
-        &self,
-        f: impl FnOnce(&NodeTopologySlot, &NodeCallSlot, &NodeConfigSlot, &NodeRunState, &DepEdges) -> R,
-    ) -> R {
-        let g = self.graph.borrow();
-        let (n, c, cfg, r, e) = g.get_node_call_config_run_edges(self.key());
-        f(n, c, cfg, r, e)
-    }
-
     fn with_node_state_mut<R>(
         &self,
         f: impl FnOnce(
             &mut NodeTopologySlot,
             &mut NodeCallSlot,
             &mut NodeConfigSlot,
-            &mut NodeRunState,
             &mut DepEdges,
         ) -> R,
     ) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, c, cfg, r, e) = g.get_node_call_config_run_edges_mut(self.key());
-        f(n, c, cfg, r, e)
+        let (n, c, cfg, e) = g.get_node_call_config_edges_mut(self.key());
+        f(n, c, cfg, e)
     }
 
     fn with_node_state_aux_mut<R>(
@@ -1472,14 +1359,13 @@ impl Core {
             &mut NodeTopologySlot,
             &mut NodeCallSlot,
             &mut NodeConfigSlot,
-            &mut NodeRunState,
             &mut DepEdges,
             &mut NodeAux,
         ) -> R,
     ) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, c, cfg, r, e, a) = g.get_node_call_config_run_edges_aux_mut(self.key());
-        f(n, c, cfg, r, e, a)
+        let (n, c, cfg, e, a) = g.get_node_call_config_edges_aux_mut(self.key());
+        f(n, c, cfg, e, a)
     }
 
     fn with_call<R>(&self, f: impl FnOnce(&NodeCallSlot) -> R) -> R {
@@ -1558,7 +1444,7 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
     if refs.get() != 0 {
         return;
     }
-    let (mut inner, _topology, mut call, _config, _run, mut edges, _version, mut aux) = {
+    let (mut inner, _topology, mut call, _config, mut edges, _version, mut aux) = {
         let mut graph = graph_ref.borrow_mut();
         if graph.pin_count(key) != 0 {
             return;
@@ -2336,7 +2222,7 @@ impl Core {
     }
 
     pub(crate) fn set_topology_deps_changed_observer(&self, observer: TopologyDepsChangedObserver) {
-        self.with_node_state_mut(|n, _c, _cfg, _r, _e| {
+        self.with_node_state_mut(|n, _c, _cfg, _e| {
             n.topology_deps_changed = Some(observer);
         });
     }
@@ -2456,7 +2342,7 @@ impl Core {
             armed: true,
         };
         unregister_backend_state_contributor(self);
-        let (mut inner, _topology, mut call, _config, _run, mut edges, _version, mut aux) = slot;
+        let (mut inner, _topology, mut call, _config, mut edges, _version, mut aux) = slot;
         inner.cleanup_before_free(&mut call, &mut edges, &mut aux, graph_reporter(&self.graph));
         free_slot.armed = false;
         self.graph.borrow_mut().free.push(key.id.0);
@@ -2533,7 +2419,7 @@ impl Core {
     /// runs once, on only the dependencies that no longer hold what it had received,
     /// and otherwise does not run; a run that sends nothing keeps the saved value.
     fn activate_seeded(&self, seed: NodeSeedRuntime) {
-        let deps = self.with_node_state_aux_mut(|n, _c, _cfg, r, e, a| {
+        let deps = self.with_node_state_aux_mut(|n, _c, _cfg, e, a| {
             if let Some(lifetime_deps) = seed.lifetime_deps {
                 n.deps = lifetime_deps;
             }
@@ -2541,7 +2427,6 @@ impl Core {
             a.lifetime = Some(crate::lifetime::Lifetime::open());
             a.state = seed.private_state;
             a.seed_note = seed.note;
-            r.has_called_fn_once = true;
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
             e.idx_boxes = (0..n.deps.len())
                 .map(|_| Rc::new(Cell::new(-1i64)))
@@ -2754,7 +2639,7 @@ impl Core {
             self.activate_seeded(seed);
             return;
         }
-        let deps = self.with_node_state_aux_mut(|n, _c, _cfg, _r, e, a| {
+        let deps = self.with_node_state_aux_mut(|n, _c, _cfg, e, a| {
             a.activated = true;
             a.lifetime = Some(crate::lifetime::Lifetime::open());
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
@@ -2814,7 +2699,7 @@ impl Core {
     }
 
     fn deactivate(&self) {
-        let (unsubs, lifetime, restored) = self.with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
+        let (unsubs, lifetime, restored) = self.with_node_state_aux_mut(|n, c, _cfg, e, a| {
             a.activated = false;
             let lifetime = a.lifetime.take();
             if let Some(lt) = &lifetime {
@@ -2832,7 +2717,6 @@ impl Core {
             e.state = DepState::new(n.deps.len());
             e.wave.pending = false;
             e.wave.run_out.clear();
-            r.has_called_fn_once = false;
             (unsubs, lifetime, restored)
         });
         self.finish_close(unsubs, lifetime);
@@ -2927,7 +2811,7 @@ impl Core {
     ) {
         let active = self.with_aux(|a| a.activated);
         let (old_unsubs, old_lifetime, old_state, old_deps) =
-            self.with_node_state_aux_mut(|n, _c, cfg, r, e, a| {
+            self.with_node_state_aux_mut(|n, _c, cfg, e, a| {
                 let lifetime = a.lifetime.take();
                 if let Some(lt) = &lifetime {
                     lt.signal.abort();
@@ -2947,7 +2831,6 @@ impl Core {
                 e.value = NodeValueState::new();
                 e.wave = NodeWaveState::new();
                 e.state = DepState::new(deps.len());
-                r.has_called_fn_once = false;
                 (unsubs, lifetime, a.state.take(), old_deps)
             });
         self.swap_fn_preserving_pool(fn_);
@@ -3019,7 +2902,7 @@ impl Core {
 
     /// Sets the instance's recipe unless it already has one.
     pub(crate) fn set_recipe_if_absent(&self, recipe: serde_json::Value) {
-        self.with_node_state_mut(|_n, _c, cfg, _r, _e| {
+        self.with_node_state_mut(|_n, _c, cfg, _e| {
             cfg.recipe.get_or_insert(recipe);
         });
     }
@@ -3133,7 +3016,7 @@ impl Core {
     /// (R-wave): a dependency's auto ERROR ends it, an INVALIDATE is applied under the
     /// auto policy, and the function runs at most once on everything the wave brought.
     fn settle(&self) {
-        let plan = self.with_node_state_aux_mut(|n, c, cfg, r, e, _a| {
+        let plan = self.with_node_state_aux_mut(|n, c, cfg, e, _a| {
             if e.value.terminal
                 || e.state.pending != 0
                 || e.wave.in_dep_mutation
@@ -3185,11 +3068,7 @@ impl Core {
                 })
             });
             let invalidate_input = invalidated && cfg.invalidate == Policy::Manual;
-            let gate_open = r.has_called_fn_once
-                || cfg.partial
-                || cfg.all_deps_settled(&e.state)
-                || c.handle.is_none();
-            let runs = (values || terminal_input || invalidate_input) && gate_open;
+            let runs = values || terminal_input || invalidate_input;
             let all_ended =
                 !n.deps.is_empty() && e.state.inputs.iter().all(|input| input.ended.is_some());
             Some(SettlePlan::Run {
@@ -3277,8 +3156,9 @@ impl Core {
         }
     }
 
-    /// A lifetime's first run, on the dependencies' snapshots (R-lifetime). Waiting for
-    /// every dependency to have a value is the Rust first-run gate (sugar).
+    /// A lifetime's first run, on the dependencies' snapshots (R-lifetime@2). The kernel
+    /// has no first-run gate: waiting for every dependency to have a value is
+    /// derived and effect sugar (graphrefly:D797 (9), review Q1).
     fn first_run(&self) {
         let all = self.first_run_frames();
         if !all.is_empty() {
@@ -3288,7 +3168,7 @@ impl Core {
 
     /// What the first run of a lifetime outputs, before it is published.
     fn first_run_frames(&self) -> Vec<Wave<AnyValue>> {
-        let plan = self.with_node_state_aux_mut(|n, c, cfg, r, e, _a| {
+        let plan = self.with_node_state_aux_mut(|n, c, cfg, e, _a| {
             if e.value.terminal {
                 return None;
             }
@@ -3298,11 +3178,9 @@ impl Core {
             });
             let all_ended =
                 !n.deps.is_empty() && e.state.inputs.iter().all(|input| input.ended.is_some());
-            let restored_producer = n.deps.is_empty() && r.has_called_fn_once;
-            let gate_open = cfg.partial || cfg.all_deps_settled(&e.state);
             Some((
                 dep_error.filter(|_| cfg.error == Policy::Auto),
-                c.handle.is_some() && gate_open && !restored_producer,
+                c.handle.is_some(),
                 c.handle.is_none() && !n.deps.is_empty(),
                 cfg.complete == Policy::Auto && all_ended,
             ))
@@ -3509,7 +3387,7 @@ impl Core {
             .map(|h| disp.pool_kind(h.pool_id))
             .unwrap_or(PoolKind::Sync);
         let new_handle = register_with(&disp, kind, fn_);
-        self.with_node_state_mut(|_n, call, _cfg, _r, _e| {
+        self.with_node_state_mut(|_n, call, _cfg, _e| {
             call.handle = Some(new_handle);
         });
         if let Some(oh) = old_handle {
@@ -3543,69 +3421,67 @@ impl Core {
         );
         // Build ctx + call snapshot under one short arena borrow, then invoke
         // borrow-free through the dispatcher (R-dispatch-all / R-sync-core).
-        let (handle, dispatcher, ctx, setup) =
-            self.with_node_state_aux_mut(|n, c, cfg, r, e, a| {
-                let invalidate_manual = cfg.invalidate == Policy::Manual;
-                let dep_records: Vec<DepRecord> = e
-                    .state
-                    .inputs
-                    .iter()
-                    .zip(&n.deps)
-                    .map(|(input, dep)| DepRecord {
-                        dep: NodeIdentity::from_core(dep),
-                        wave_data: input
-                            .frames
-                            .iter()
-                            .filter(|f| f.iter().any(InMsg::is_value))
-                            .map(|f| {
-                                f.iter()
-                                    .filter_map(|m| match m {
-                                        InMsg::Data(v) => Some(v.clone()),
-                                        _ => None,
-                                    })
-                                    .collect()
-                            })
-                            .collect(),
-                        prev_data: if input.frames.is_empty() {
-                            input.value.clone()
-                        } else {
-                            input.value_before_wave.clone()
-                        },
-                        latest: input.value.clone(),
-                        terminal: input.frames.iter().flatten().find_map(InMsg::terminal),
-                        invalidated: input.invalidated && invalidate_manual,
-                    })
-                    .collect();
-                r.has_called_fn_once = true;
-                e.wave.inside_run_wave = true;
-                e.wave.run_out.clear();
-                e.wave.emit_open = false;
-                // A run belongs to the open lifetime; the setup runs before the
-                // lifetime's first run (R-lifetime@2).
-                let lifetime = a
-                    .lifetime
-                    .get_or_insert_with(crate::lifetime::Lifetime::open);
-                let setup = if lifetime.setup_done {
-                    None
-                } else {
-                    lifetime.setup_done = true;
-                    cfg.setup.clone()
-                };
-                let mut ctx = Ctx::new(
-                    self.borrowed_view(),
-                    dep_records,
-                    lifetime.id,
-                    lifetime.signal.clone(),
-                );
-                // Only the seeded instance's first run receives the note.
-                ctx.seed = a.seed_note.take();
-                (
-                    c.handle.expect("invoke ⇒ handle present"),
-                    c.dispatcher.clone(),
-                    ctx,
-                    setup,
-                )
-            });
+        let (handle, dispatcher, ctx, setup) = self.with_node_state_aux_mut(|n, c, cfg, e, a| {
+            let invalidate_manual = cfg.invalidate == Policy::Manual;
+            let dep_records: Vec<DepRecord> = e
+                .state
+                .inputs
+                .iter()
+                .zip(&n.deps)
+                .map(|(input, dep)| DepRecord {
+                    dep: NodeIdentity::from_core(dep),
+                    wave_data: input
+                        .frames
+                        .iter()
+                        .filter(|f| f.iter().any(InMsg::is_value))
+                        .map(|f| {
+                            f.iter()
+                                .filter_map(|m| match m {
+                                    InMsg::Data(v) => Some(v.clone()),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                    prev_data: if input.frames.is_empty() {
+                        input.value.clone()
+                    } else {
+                        input.value_before_wave.clone()
+                    },
+                    latest: input.value.clone(),
+                    terminal: input.frames.iter().flatten().find_map(InMsg::terminal),
+                    invalidated: input.invalidated && invalidate_manual,
+                })
+                .collect();
+            e.wave.inside_run_wave = true;
+            e.wave.run_out.clear();
+            e.wave.emit_open = false;
+            // A run belongs to the open lifetime; the setup runs before the
+            // lifetime's first run (R-lifetime@2).
+            let lifetime = a
+                .lifetime
+                .get_or_insert_with(crate::lifetime::Lifetime::open);
+            let setup = if lifetime.setup_done {
+                None
+            } else {
+                lifetime.setup_done = true;
+                cfg.setup.clone()
+            };
+            let mut ctx = Ctx::new(
+                self.borrowed_view(),
+                dep_records,
+                lifetime.id,
+                lifetime.signal.clone(),
+            );
+            // Only the seeded instance's first run receives the note.
+            ctx.seed = a.seed_note.take();
+            (
+                c.handle.expect("invoke ⇒ handle present"),
+                c.dispatcher.clone(),
+                ctx,
+                setup,
+            )
+        });
         // D30: this is the innermost node whose fn runs.
         wave_set_blamed(self);
         let guard = WaveGuard(DeferredNodeAction::from_core(self));
@@ -4152,15 +4028,15 @@ impl<T: 'static> Node<T> {
             core: Core::new_in_arena(arena, vec![], Some(handle), dispatcher, None, opts.clone()),
             _t: PhantomData,
         };
-        node.core.with_node_state_mut(|_n, call, _cfg, _r, _e| {
+        node.core.with_node_state_mut(|_n, call, _cfg, _e| {
             call.factory = factory;
         });
         node
     }
 
     /// A derived node over erased deps. The fn reads deps positionally via
-    /// `ctx.dep(i).value::<U>()` and emits via `ctx.emit`. The first-run gate holds the fn
-    /// until every dep has settled (R-first-run-gate). A fn that returns WITHOUT
+    /// `ctx.dep(i).value::<U>()` and emits via `ctx.emit`. The kernel has no first-run
+    /// gate: the fn runs on activation whatever its deps hold. A fn that returns WITHOUT
     /// emitting (filter-reject) makes the substrate synthesize an undirty RESOLVED
     /// (D49 / R-resolved-undirty).
     pub fn derived<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, f: F) -> Node<T> {
@@ -4226,8 +4102,7 @@ impl<T: 'static> Node<T> {
         {
             // Thread the dep-terminal propagation policy (R-deps-terminal) into the inner —
             // `Core::new` defaults to the plain derived behavior (auto-cascade, not an input).
-            node.core.with_node_state_mut(|_n, call, cfg, _r, _e| {
-                cfg.partial = opts.partial;
+            node.core.with_node_state_mut(|_n, call, cfg, _e| {
                 cfg.complete = opts.complete;
                 cfg.error = opts.error;
                 cfg.invalidate = opts.invalidate;
@@ -4684,9 +4559,7 @@ mod tests {
             &arena,
             vec![source.erased()],
             NodeOpts::default(),
-            |ctx| {
-                let _ = ctx.dep(0).value::<i32>().unwrap();
-            },
+            |_ctx| {},
         );
         let _u = derived.subscribe(
             move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
@@ -4754,39 +4627,37 @@ mod tests {
     }
 
     #[test]
-    fn derived_first_run_gate_then_recompute() {
+    fn a_kernel_node_has_no_first_run_gate() {
+        // The kernel runs a function on whatever its dependencies delivered; waiting
+        // for every dependency to have a value is derived and effect sugar
+        // (graphrefly:D797 (9), review Q1).
         let a = Node::<i32>::state_empty();
         let b = Node::<i32>::state_empty();
         let runs = Rc::new(Cell::new(0usize));
         let r2 = runs.clone();
         let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
             r2.set(r2.get() + 1);
-            let x = *ctx.dep(0).value::<i32>().unwrap();
-            let y = *ctx.dep(1).value::<i32>().unwrap();
-            ctx.emit(x + y);
+            if let (Some(x), Some(y)) = (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>()) {
+                ctx.emit(*x + *y);
+            }
         });
         let (log, sink) = recorder();
         let _u = sum.subscribe(sink);
-        // first-run gate: neither dep has settled → fn has not fired.
-        assert_eq!(runs.get(), 0);
+        // The first run happens on activation, though neither dependency has a value.
+        assert_eq!(runs.get(), 1);
         assert_eq!(*log.borrow(), vec!["START"]);
 
-        a.set(3); // only one dep settled → gate still holds
-        assert_eq!(runs.get(), 0);
+        a.set(3);
+        assert_eq!(runs.get(), 2);
+        assert_eq!(sum.cache(), None);
 
-        b.set(4); // both settled → first run, sum = 7
-        assert_eq!(runs.get(), 1);
+        b.set(4);
+        assert_eq!(runs.get(), 3);
         assert_eq!(sum.cache(), Some(7));
-        // The first write marked `sum` pending while the gate (Rust sugar) held, so the
-        // kernel settled it with RESOLVED (R-wave).
         assert_eq!(
             *log.borrow(),
             vec!["START", "PENDING", "RESOLVED", "PENDING", "DATA"]
         );
-
-        a.set(10); // recompute (gate already passed), sum = 14
-        assert_eq!(runs.get(), 2);
-        assert_eq!(sum.cache(), Some(14));
     }
 
     #[test]
@@ -4794,16 +4665,23 @@ mod tests {
         // A → B, A → C, B → D, C → D. D must join once per A update, glitch-free.
         let a = Node::<i32>::state_empty();
         let b: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1)
+            if let Some(v) = ctx.dep(0).value::<i32>() {
+                ctx.emit(*v + 1)
+            }
         });
         let c: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() * 10)
+            if let Some(v) = ctx.dep(0).value::<i32>() {
+                ctx.emit(*v * 10)
+            }
         });
         let d_runs = Rc::new(Cell::new(0usize));
         let dr = d_runs.clone();
         let d: Node<i32> = Node::derived(vec![b.erased(), c.erased()], move |ctx| {
+            let (Some(x), Some(y)) = (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>()) else {
+                return;
+            };
             dr.set(dr.get() + 1);
-            ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + *ctx.dep(1).value::<i32>().unwrap());
+            ctx.emit(*x + *y);
         });
         let (log, sink) = recorder();
         let _u = d.subscribe(sink);
@@ -5067,10 +4945,13 @@ mod tests {
             let observed_refs = observed_refs.clone();
             let refs_slot = refs_slot.clone();
             move |ctx| {
+                let Some(v) = ctx.dep(0).value::<i32>() else {
+                    return;
+                };
                 if let Some(refs) = refs_slot.borrow().as_ref() {
                     observed_refs.set(refs.get());
                 }
-                ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
+                ctx.emit(*v);
             }
         });
         *refs_slot.borrow_mut() = Some(derived.core.refs.clone());
@@ -5123,8 +5004,11 @@ mod tests {
         let derived: Node<i32> = Node::derived(vec![source.erased()], {
             let runs = runs.clone();
             move |ctx| {
+                let Some(v) = ctx.dep(0).value::<i32>() else {
+                    return;
+                };
                 runs.set(runs.get() + 1);
-                ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
+                ctx.emit(*v);
             }
         });
         let _u = derived.subscribe(|_| {});
@@ -5179,8 +5063,10 @@ mod tests {
         let runs = Rc::new(Cell::new(0usize));
         let d: Node<i32> = Node::derived(vec![source.erased()], {
             let runs = runs.clone();
-            move |_ctx| {
-                runs.set(runs.get() + 1);
+            move |ctx| {
+                if ctx.dep(0).has() {
+                    runs.set(runs.get() + 1);
+                }
             }
         });
         let _d_sub = d.subscribe(|_| {});
@@ -5512,10 +5398,9 @@ mod tests {
     }
 
     #[test]
-    fn run_state_slot_resets_on_deactivation_while_call_slot_persists() {
-        // DR-8/B54 next slice: first-run lifecycle state lives in GraphCore run_slots,
-        // while the dispatcher handle lives in call_slots. Deactivation must re-arm the
-        // producer without unregistering/re-registering its callable.
+    fn a_producer_reruns_on_reactivation_while_its_call_slot_persists() {
+        // Deactivation closes the lifetime and the next activation is a new first run,
+        // without unregistering and re-registering the producer's callable.
         let runs = Rc::new(Cell::new(0usize));
         let p = Node::<i32>::producer({
             let runs = runs.clone();
@@ -5526,21 +5411,9 @@ mod tests {
         });
         let handle_before = p.core.handle().expect("producer registered a call slot");
 
-        let u = {
-            let u = p.subscribe(|_| {});
-            assert_eq!(runs.get(), 1);
-            assert!(p
-                .core
-                .with_node_state(|_n, _c, _cfg, r, _e| r.has_called_fn_once));
-            u
-        };
+        let u = p.subscribe(|_| {});
+        assert_eq!(runs.get(), 1);
         u();
-
-        assert!(
-            !p.core
-                .with_node_state(|_n, _c, _cfg, r, _e| r.has_called_fn_once),
-            "deactivation resets run_slots.has_called_fn_once"
-        );
         assert_eq!(
             p.core.handle(),
             Some(handle_before),
@@ -5548,11 +5421,7 @@ mod tests {
         );
 
         let _u2 = p.subscribe(|_| {});
-        assert_eq!(
-            runs.get(),
-            2,
-            "run state reset re-arms the depless producer on the next activation"
-        );
+        assert_eq!(runs.get(), 2, "the next activation is a new first run");
         assert_eq!(p.cache(), Some(2));
     }
 

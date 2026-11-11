@@ -137,7 +137,6 @@ fn new_session(name: &str) -> String {
 
 fn manual_opts(name: &str, invalidate_manual: bool) -> GraphNodeOpts {
     GraphNodeOpts::named(name).with_node(NodeOpts {
-        partial: true,
         complete: Policy::Manual,
         error: Policy::Manual,
         invalidate: if invalidate_manual {

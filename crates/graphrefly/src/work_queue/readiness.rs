@@ -357,14 +357,10 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
                 );
             }
         },
-        {
-            let mut node_opts = node_opts(
-                format!("{name}/runtime"),
-                "workQueueScheduledReadinessProjector",
-            );
-            node_opts.node.partial = true;
-            node_opts
-        },
+        node_opts(
+            format!("{name}/runtime"),
+            "workQueueScheduledReadinessProjector",
+        ),
     );
     WorkQueueScheduledReadinessBundle {
         readiness_schedules: project_fact(
@@ -471,14 +467,10 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
                 );
             }
         },
-        {
-            let mut node_opts = node_opts(
-                format!("{name}/runtime"),
-                "workQueueReadinessHandoffProjector",
-            );
-            node_opts.node.partial = true;
-            node_opts
-        },
+        node_opts(
+            format!("{name}/runtime"),
+            "workQueueReadinessHandoffProjector",
+        ),
     );
     WorkQueueReadinessHandoffBundle {
         candidates: project_fact(

@@ -202,6 +202,14 @@ fn c12c_function_sending_resolved_ends_with_error() {
 // ── Phase 2: waves and arrays ──────────────────────────────────────────────
 
 /// A sink recording each array it receives, as message kinds.
+/// A kernel node's function that forwards its one dependency's value, once it has one
+/// (the kernel has no first-run gate, review Q1).
+fn forward_i32(ctx: &graphrefly::Ctx) {
+    if let Some(v) = ctx.dep(0).value::<i32>() {
+        ctx.emit(*v);
+    }
+}
+
 fn record_arrays<T: 'static>(node: &Node<T>) -> (Rc<RefCell<Vec<Vec<String>>>>, Unsub) {
     let log: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
     let sink = log.clone();
@@ -268,7 +276,6 @@ fn c12_occurrences_stay_data_and_kernel_resolved_settles_silence() {
     let dependent = Node::<i32>::derived_opts(
         vec![silent.erased()],
         graphrefly::NodeOpts {
-            partial: true,
             ..graphrefly::NodeOpts::default()
         },
         move |_ctx| runs.set(runs.get() + 1),
@@ -307,7 +314,6 @@ fn c16_quiet_node_absorbs_waves_and_publishes_later() {
         vec![a.erased()],
         graphrefly::NodeOpts {
             quiet: true,
-            partial: true,
             ..graphrefly::NodeOpts::default()
         },
         move |ctx| {
@@ -326,7 +332,6 @@ fn c16_quiet_node_absorbs_waves_and_publishes_later() {
     let e = Node::<i32>::derived_opts(
         vec![q.erased()],
         graphrefly::NodeOpts {
-            partial: true,
             ..graphrefly::NodeOpts::default()
         },
         move |_ctx| runs.set(runs.get() + 1),
@@ -396,7 +401,6 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
         Node::<i32>::derived_opts(
             vec![a.erased(), b.erased()],
             graphrefly::NodeOpts {
-                partial: true,
                 error: graphrefly::Policy::Manual,
                 complete: graphrefly::Policy::Manual,
                 ..graphrefly::NodeOpts::default()
@@ -459,7 +463,6 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
         Node::<i32>::derived_opts(
             vec![silent.erased()],
             graphrefly::NodeOpts {
-                partial: true,
                 ..graphrefly::NodeOpts::default()
             },
             move |ctx| {
@@ -489,7 +492,6 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
         Node::<i32>::derived_opts(
             vec![opt.erased(), list.erased()],
             graphrefly::NodeOpts {
-                partial: true,
                 ..graphrefly::NodeOpts::default()
             },
             move |ctx| {
@@ -585,7 +587,6 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
     let a = Node::<i32>::derived_opts(
         vec![trigger.erased()],
         graphrefly::NodeOpts {
-            partial: true,
             ..graphrefly::NodeOpts::default()
         },
         |ctx| {
@@ -598,20 +599,15 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
             }
         },
     );
-    let b = Node::<i32>::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
-    });
-    let c = Node::<i32>::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
-    });
+    let b = Node::<i32>::derived(vec![a.erased()], forward_i32);
+    let c = Node::<i32>::derived(vec![a.erased()], forward_i32);
     let d_runs = Rc::new(RefCell::new(Vec::<(i32, i32)>::new()));
     let d = {
         let runs = d_runs.clone();
         Node::<i32>::derived(vec![b.erased(), c.erased()], move |ctx| {
-            runs.borrow_mut().push((
-                *ctx.dep(0).value::<i32>().unwrap(),
-                *ctx.dep(1).value::<i32>().unwrap(),
-            ));
+            if let (Some(x), Some(y)) = (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>()) {
+                runs.borrow_mut().push((*x, *y));
+            }
         })
     };
     let (s1, _u1) = record_arrays(&a);
@@ -731,7 +727,6 @@ fn c44_kernel_adds_only_the_settling_resolved_and_quiet_nodes_hold_no_wave() {
         Node::<i32>::derived_opts(
             vec![a.erased(), q.erased()],
             graphrefly::NodeOpts {
-                partial: true,
                 ..graphrefly::NodeOpts::default()
             },
             move |ctx| {
@@ -796,7 +791,6 @@ fn opts(
     invalidate: graphrefly::Policy,
 ) -> graphrefly::NodeOpts {
     graphrefly::NodeOpts {
-        partial: true,
         complete,
         error,
         invalidate,
@@ -1619,7 +1613,6 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
             &g,
             vec![p.erased()],
             graphrefly::NodeOpts {
-                partial: true,
                 ..graphrefly::NodeOpts::default()
             }
             .with_setup(move |ctx| {
@@ -1751,7 +1744,9 @@ fn named(name: &str) -> graphrefly::GraphNodeOpts {
 fn c6_write_to_own_upstream_is_a_later_request() {
     let s = Node::<i32>::state_empty();
     let d = Node::<i32>::derived(vec![s.erased()], |ctx| {
-        ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1)
+        if let Some(v) = ctx.dep(0).value::<i32>() {
+            ctx.emit(*v + 1)
+        }
     });
     let running = Rc::new(Cell::new(false));
     let reentered = Rc::new(Cell::new(false));
@@ -1759,9 +1754,11 @@ fn c6_write_to_own_upstream_is_a_later_request() {
         let s = s.clone();
         let (running, reentered) = (running.clone(), reentered.clone());
         Node::<()>::derived(vec![d.erased()], move |ctx| {
+            let Some(v) = ctx.dep(0).value::<i32>().map(|v| *v) else {
+                return;
+            };
             reentered.set(reentered.get() || running.get());
             running.set(true);
-            let v = *ctx.dep(0).value::<i32>().unwrap();
             if v < 3 {
                 s.set(v);
             }
@@ -1772,9 +1769,11 @@ fn c6_write_to_own_upstream_is_a_later_request() {
     let scan = {
         let scan_runs = scan_runs.clone();
         Node::<i32>::derived(vec![s.erased()], move |ctx| {
+            let Some(v) = ctx.dep(0).value::<i32>() else {
+                return;
+            };
             scan_runs.set(scan_runs.get() + 1);
-            let total =
-                ctx.state_get::<i32>().map_or(0, |t| *t) + *ctx.dep(0).value::<i32>().unwrap();
+            let total = ctx.state_get::<i32>().map_or(0, |t| *t) + *v;
             ctx.state_set(total);
             ctx.emit(total);
         })
@@ -1859,7 +1858,6 @@ fn c11_a_node_rewires_itself_for_its_lifetime() {
             },
             graphrefly::GraphNodeOpts {
                 node: graphrefly::NodeOpts {
-                    partial: true,
                     ..graphrefly::NodeOpts::default()
                 },
                 ..named("op")
@@ -1947,7 +1945,6 @@ fn c35_rewire_keeps_the_instance_and_runs_between_waves() {
             },
             graphrefly::GraphNodeOpts {
                 node: graphrefly::NodeOpts {
-                    partial: true,
                     ..graphrefly::NodeOpts::default()
                 },
                 ..named("d")
@@ -3543,4 +3540,74 @@ fn restored_values_are_json_whatever_the_saved_type() {
         Some(serde_json::json!(41))
     );
     assert_eq!(node.as_node::<i32>().cache(), None, "not the saved type");
+}
+
+/// Review Q1 (graphrefly:D797 (9)) — the kernel has no first-run gate: a node's first
+/// run happens on activation whatever its dependencies hold.
+#[test]
+fn a_kernel_node_runs_first_without_waiting_for_values() {
+    let g = graphrefly::graph();
+    let a = g.state_empty::<i32>();
+    let b = g.state(2i32);
+    let seen = Rc::new(RefCell::new(Vec::<(Option<i32>, Option<i32>)>::new()));
+    let n = {
+        let seen = seen.clone();
+        g.node::<i32, _>(vec![a.erased(), b.erased()], move |ctx| {
+            seen.borrow_mut().push((
+                ctx.dep(0).value::<i32>().map(|v| *v),
+                ctx.dep(1).value::<i32>().map(|v| *v),
+            ));
+        })
+    };
+    let _u = n.subscribe(|_| {});
+    assert_eq!(
+        *seen.borrow(),
+        vec![(None, Some(2))],
+        "the first run sees B alone"
+    );
+    a.set(1);
+    assert_eq!(*seen.borrow(), vec![(None, Some(2)), (Some(1), Some(2))]);
+}
+
+/// Review Q1 — derived and effect are the sugar that waits: the callback runs once
+/// every dependency has a value, and the value a dependency sent while it waited is
+/// kept for that run.
+#[test]
+fn derived_and_effect_wait_until_every_dependency_has_a_value() {
+    let g = graphrefly::graph();
+    let a = g.state_empty::<i32>();
+    let b = g.state_empty::<i32>();
+    let runs = Rc::new(Cell::new(0usize));
+    let sum = {
+        let runs = runs.clone();
+        g.derived::<i32, _>(vec![a.erased(), b.erased()], move |values| {
+            runs.set(runs.get() + 1);
+            Some(*values.value::<i32>(0)? + *values.value::<i32>(1)?)
+        })
+    };
+    let effects = Rc::new(RefCell::new(Vec::<i32>::new()));
+    let effect = {
+        let effects = effects.clone();
+        g.effect(vec![sum.erased()], move |values| {
+            effects.borrow_mut().push(*values.value::<i32>(0).unwrap());
+            None
+        })
+    };
+    let _ue = effect.subscribe(|_| {});
+    let _us = sum.subscribe(|_| {});
+    assert_eq!(runs.get(), 0, "no dependency has a value yet");
+    a.set(1);
+    assert_eq!(runs.get(), 0, "B has no value yet");
+    assert!(effects.borrow().is_empty());
+    b.set(2);
+    assert_eq!(runs.get(), 1);
+    assert_eq!(
+        sum.cache(),
+        Some(3),
+        "A's value was kept while the gate waited"
+    );
+    assert_eq!(*effects.borrow(), vec![3]);
+    a.set(5);
+    assert_eq!(sum.cache(), Some(7));
+    assert_eq!(*effects.borrow(), vec![3, 7]);
 }

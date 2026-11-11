@@ -296,14 +296,7 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
             }
             ctx.state_set(state);
         },
-        {
-            // Every delivery is folded as it arrives, before any status exists: the
-            // node runs without the first-run gate (Rust sugar), since a gated run's
-            // input is not kept for a later wave (R-invocation).
-            let mut node_opts = GraphNodeOpts::named(opts.name);
-            node_opts.node.partial = true;
-            node_opts
-        },
+        GraphNodeOpts::named(opts.name),
     )
 }
 

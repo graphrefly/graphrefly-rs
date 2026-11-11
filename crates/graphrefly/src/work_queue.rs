@@ -1503,11 +1503,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                 }
             }
         },
-        {
-            let mut opts = node_opts(format!("{name}/admissionPages"), "workQueueAdmissionPages");
-            opts.node.partial = true;
-            opts
-        },
+        node_opts(format!("{name}/admissionPages"), "workQueueAdmissionPages"),
     );
     let runtime_state = state.clone();
     let runtime_opts = RuntimeOptions {
@@ -1548,11 +1544,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                 }
             }
         },
-        {
-            let mut opts = node_opts(format!("{name}/runtime"), "workQueueRuntime");
-            opts.node.partial = true;
-            opts
-        },
+        node_opts(format!("{name}/runtime"), "workQueueRuntime"),
     );
     let records = graph.node_opts::<WorkQueueRecord<T>, _>(
         vec![runtime.erased()],
@@ -3371,7 +3363,6 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
 /// below it, and a page it sends is a later wave of its own.
 fn request_node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
     let mut opts = node_opts(name, factory);
-    opts.node.partial = true;
     opts.node.quiet = true;
     opts
 }

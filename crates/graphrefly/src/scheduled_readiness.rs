@@ -322,11 +322,7 @@ pub fn scheduled_readiness_projector(
                 );
             }
         },
-        {
-            let mut node_opts = node_opts(format!("{name}/runtime"), "scheduledReadinessProjector");
-            node_opts.node.partial = true;
-            node_opts
-        },
+        node_opts(format!("{name}/runtime"), "scheduledReadinessProjector"),
     );
     ScheduledReadinessBundle {
         pending: project_fact(

@@ -23,7 +23,6 @@ fn delayed_value<S: Clone + 'static>(ctx: &Ctx, value: S, ms: u64) -> Node<S> {
         Operator::with_opts(
             "delayedValue",
             crate::node::NodeOpts {
-                partial: true,
                 error: Policy::Manual,
                 complete: Policy::Manual,
                 ..crate::node::NodeOpts::default()
@@ -109,7 +108,6 @@ fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> 
     Operator::with_opts(
         factory,
         crate::node::NodeOpts {
-            partial: true,
             error: Policy::Manual,
             complete: Policy::Manual,
             ..crate::node::NodeOpts::default()
@@ -225,7 +223,6 @@ fn audit_with_ctx<S: Clone + 'static>(
     Operator::with_opts(
         factory,
         crate::node::NodeOpts {
-            partial: true,
             error: Policy::Manual,
             complete: Policy::Manual,
             ..crate::node::NodeOpts::default()
@@ -517,7 +514,6 @@ fn scoped_time_source(anchor: &Core, op: Operator<u64>) -> Node<u64> {
 
 fn time_helper_opts() -> NodeOpts {
     NodeOpts {
-        partial: true,
         complete: Policy::Manual,
         error: Policy::Manual,
         ..NodeOpts::default()

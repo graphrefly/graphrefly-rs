@@ -204,7 +204,6 @@ where
     Operator::with_opts(
         "stratifyBranch",
         NodeOpts {
-            partial: true,
             complete: Policy::Manual,
             error: Policy::Manual,
             ..NodeOpts::default()

@@ -2496,7 +2496,6 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
 /// below it, and a page it sends is a later wave of its own.
 fn request_node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
     let mut opts = node_opts(name, factory);
-    opts.node.partial = true;
     opts.node.quiet = true;
     opts
 }

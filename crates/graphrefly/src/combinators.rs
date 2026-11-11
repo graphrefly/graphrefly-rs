@@ -17,7 +17,6 @@ pub fn combine<T: Clone + 'static>() -> Operator<Vec<T>> {
     Operator::with_opts(
         "combine",
         NodeOpts {
-            partial: true,
             ..NodeOpts::default()
         },
         move |ctx| {
@@ -75,7 +74,6 @@ pub fn zip<T: Clone + 'static>() -> Operator<Vec<T>> {
     Operator::with_opts(
         "zip",
         NodeOpts {
-            partial: true,
             complete: Policy::Manual,
             ..NodeOpts::default()
         },
@@ -140,7 +138,6 @@ pub fn concat<T: Clone + 'static>() -> Operator<T> {
     Operator::with_opts(
         "concat",
         NodeOpts {
-            partial: true,
             complete: Policy::Manual,
             ..NodeOpts::default()
         },
@@ -195,7 +192,6 @@ pub fn race<T: Clone + 'static>() -> Operator<T> {
     Operator::with_opts(
         "race",
         NodeOpts {
-            partial: true,
             error: Policy::Manual,
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -262,7 +258,6 @@ pub fn buffer<T: Clone + 'static>() -> Operator<Vec<T>> {
     Operator::with_opts(
         "buffer",
         NodeOpts {
-            partial: true,
             complete: Policy::Manual,
             ..NodeOpts::default()
         },
@@ -336,7 +331,6 @@ pub fn sample<T: Clone + 'static>() -> Operator<T> {
     Operator::with_opts(
         "sample",
         NodeOpts {
-            partial: true,
             error: Policy::Manual,
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -384,7 +378,6 @@ pub fn take_until<T: Clone + 'static>() -> Operator<T> {
     Operator::with_opts(
         "takeUntil",
         NodeOpts {
-            partial: true,
             complete: Policy::Manual,
             ..NodeOpts::default()
         },
