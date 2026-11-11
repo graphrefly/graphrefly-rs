@@ -2,11 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use graphrefly::{
-    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,
+    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_cause,
     decode_wire_bridge_protobuf_bytes, encode_canonical_wire_bridge_envelope,
-    encode_canonical_wire_edge_frame, encode_wire_bridge_protobuf_bytes,
+    encode_canonical_wire_edge_cause, encode_wire_bridge_protobuf_bytes,
     CanonicalProtobufErrorCategory, CanonicalWireBridgeDataBody, CanonicalWireBridgeEnvelope,
-    CanonicalWireBridgeMetadata, CanonicalWireBridgePayload, CanonicalWireEdgeKind,
+    CanonicalWireBridgeMetadata, CanonicalWireBridgePayload, CanonicalWireMessage,
     WireBridgeProtobufDataBody, WireBridgeProtobufPayload, WireBridgeProtobufStatusKind,
     WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE,
 };
@@ -22,6 +22,8 @@ struct VectorRecord {
     canonical: bool,
     #[serde(rename = "errorCategory")]
     error_category: Option<String>,
+    #[serde(default)]
+    expect: Option<serde_json::Value>,
 }
 
 fn fixture_path() -> PathBuf {
@@ -29,7 +31,7 @@ fn fixture_path() -> PathBuf {
 }
 
 fn wire_edge_fixture_path() -> PathBuf {
-    spec_root().join("fixtures/protobuf/wire_edge_frame.v1.jsonl")
+    spec_root().join("fixtures/protobuf/wire_edge_cause.v1.jsonl")
 }
 
 fn spec_root() -> PathBuf {
@@ -118,23 +120,25 @@ fn positive_vectors_decode_validate_and_reencode_byte_equal() {
             .unwrap_or_else(|err| panic!("{} unexpectedly failed to encode: {err}", record.id));
         assert_eq!(to_hex(&encoded), record.hex, "{}", record.id);
 
-        if record.id == "positive.data.wire_edge_dirty" {
-            match &decoded.payload {
-                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(frame)) => {
-                    assert_eq!(frame.kind, CanonicalWireEdgeKind::Pending);
-                    assert!(frame.value.is_none());
+        // The vector's expectation hint names the payload case.
+        if let Some(payload) = record
+            .expect
+            .as_ref()
+            .and_then(|e| e.get("payload"))
+            .and_then(|p| p.as_str())
+        {
+            let case = match &decoded.payload {
+                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::Value(_)) => {
+                    "data.value"
                 }
-                _ => panic!("{} decoded to the wrong payload", record.id),
-            }
-        }
-        if record.id == "positive.data.wire_edge_data" {
-            match &decoded.payload {
-                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(frame)) => {
-                    assert_eq!(frame.kind, CanonicalWireEdgeKind::Data);
-                    assert!(frame.value.is_some());
+                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::EdgeCause(_)) => {
+                    "data.edge_cause"
                 }
-                _ => panic!("{} decoded to the wrong payload", record.id),
-            }
+                CanonicalWireBridgePayload::Ack => "ack",
+                CanonicalWireBridgePayload::Nack { .. } => "nack",
+                _ => "other",
+            };
+            assert_eq!(case, payload, "{}", record.id);
         }
     }
 }
@@ -230,18 +234,24 @@ fn focused_byte_helper_accepts_empty_data_values() {
         _ => panic!("empty DATA value decoded to wrong payload"),
     }
 
-    let empty_wire_edge_value = records
+    let empty_edge_value = records
         .iter()
-        .find(|record| record.id == "positive.data.wire_edge_data_empty_value")
+        .find(|record| record.id == "positive.data.edge_cause_empty_value")
         .expect("empty wire-edge DATA value fixture exists");
-    let decoded = decode_wire_bridge_protobuf_bytes(&from_hex(&empty_wire_edge_value.hex));
+    let decoded = decode_wire_bridge_protobuf_bytes(&from_hex(&empty_edge_value.hex));
     let envelope = decoded
         .envelope
         .expect("empty wire-edge DATA value decodes");
     match envelope.payload {
-        WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::WireEdge(frame)) => {
-            assert_eq!(frame.kind, CanonicalWireEdgeKind::Data);
-            assert_eq!(frame.value, Some(Vec::new()));
+        WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::EdgeCause(cause)) => {
+            let messages: Vec<&CanonicalWireMessage> = cause
+                .edges
+                .iter()
+                .flat_map(|e| e.arrays.iter().flatten())
+                .collect();
+            assert!(messages
+                .iter()
+                .any(|m| **m == CanonicalWireMessage::Data(Vec::new())));
         }
         _ => panic!("empty wire-edge DATA value decoded to wrong payload"),
     }
@@ -271,34 +281,42 @@ fn focused_byte_helper_shape_stays_adapter_local() {
 
 #[test]
 fn standalone_wire_edge_vectors_decode_validate_and_reencode_byte_equal() {
-    for record in vectors(wire_edge_fixture_path(), "WireEdgeFrame")
+    for record in vectors(wire_edge_fixture_path(), "WireEdgeCause")
         .into_iter()
         .filter(|record| record.canonical)
     {
         let bytes = from_hex(&record.hex);
-        let decoded = decode_canonical_wire_edge_frame(&bytes)
+        let decoded = decode_canonical_wire_edge_cause(&bytes)
             .unwrap_or_else(|err| panic!("{} unexpectedly failed: {err}", record.id));
-        let encoded = encode_canonical_wire_edge_frame(&decoded)
+        let encoded = encode_canonical_wire_edge_cause(&decoded)
             .unwrap_or_else(|err| panic!("{} unexpectedly failed to encode: {err}", record.id));
         assert_eq!(to_hex(&encoded), record.hex, "{}", record.id);
+        if let Some(edges) = record
+            .expect
+            .as_ref()
+            .and_then(|e| e.get("edges"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            assert_eq!(decoded.edges.len() as u64, edges, "{}", record.id);
+        }
     }
 }
 
 #[test]
 fn standalone_wire_edge_negative_vectors_fail_by_semantic_category() {
-    for record in vectors(wire_edge_fixture_path(), "WireEdgeFrame")
+    for record in vectors(wire_edge_fixture_path(), "WireEdgeCause")
         .into_iter()
         .filter(|record| !record.canonical)
     {
         let bytes = from_hex(&record.hex);
-        let err = match decode_canonical_wire_edge_frame(&bytes) {
+        let err = match decode_canonical_wire_edge_cause(&bytes) {
             Ok(_) => panic!("{} unexpectedly decoded", record.id),
             Err(err) => err,
         };
         assert_eq!(
             err.category.as_str(),
             record.error_category.as_deref().unwrap(),
-            "{}",
+            "{}: {err}",
             record.id
         );
     }

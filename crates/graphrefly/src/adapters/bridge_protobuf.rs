@@ -1,4 +1,5 @@
-//! D497 canonical protobuf profile for D134/D496 wire bridge envelopes.
+//! D497 canonical protobuf profile for D134/D496 wire bridge envelopes and the wire
+//! edge group's `WireEdgeCause` frame (R-bridge@1, graphrefly:D803).
 //!
 //! This module is schema-specific on purpose: it validates the locked
 //! `protocol.proto` bridge envelope subset without introducing a protobuf
@@ -99,31 +100,50 @@ pub struct CanonicalWireBridgeMetadata {
 pub enum CanonicalWireBridgeDataBody {
     /// `Value` variant.
     Value(Vec<u8>),
-    /// `WireEdge` variant.
-    WireEdge(CanonicalWireEdgeFrame),
+    /// A wire edge group's cause (field 3; field 2 is reserved).
+    EdgeCause(CanonicalWireEdgeCause),
 }
 
+/// One frame of a wire edge group: one sender wave (R-bridge@1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// `CanonicalWireEdgeFrame` data container.
-pub struct CanonicalWireEdgeFrame {
-    /// `kind` field for kind.
-    pub kind: CanonicalWireEdgeKind,
-    /// `edge_id` field for edge id.
-    pub edge_id: String,
-    /// `cause_id` field for cause id.
-    pub cause_id: String,
-    /// `value` field for value.
-    pub value: Option<Vec<u8>>,
+pub struct CanonicalWireEdgeCause {
+    /// The group's name.
+    pub group: String,
+    /// The session: one lifetime of the group's outbound node.
+    pub session: String,
+    /// The cause number, from 1 within the session.
+    pub cause: u64,
+    /// The edges that brought input, each with what it brought.
+    pub edges: Vec<CanonicalWireEdgeArrays>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// `CanonicalWireEdgeKind` variants.
-pub enum CanonicalWireEdgeKind {
-    /// `Pending` variant (`WIRE_EDGE_KIND_PENDING = 1`, formerly DIRTY; the
-    /// number is unchanged, graphrefly:D798).
-    Pending,
-    /// `Data` variant.
-    Data,
+/// One edge of a cause: its id and the arrays it brought, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalWireEdgeArrays {
+    /// The edge id, declared on both sides.
+    pub edge_id: String,
+    /// The arrays: an INVALIDATE, then the arrays that carried DATA, then a terminal.
+    pub arrays: Vec<Vec<CanonicalWireMessage>>,
+}
+
+/// A message that crosses a wire edge: PENDING, RESOLVED and START are each kernel's
+/// own and never cross (R-bridge@1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalWireMessage {
+    /// DATA with the application's value bytes.
+    Data(Vec<u8>),
+    /// INVALIDATE.
+    Invalidate,
+    /// COMPLETE.
+    Complete,
+    /// ERROR with the application's payload bytes.
+    Error(Vec<u8>),
+}
+
+impl CanonicalWireMessage {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Complete | Self::Error(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,8 +218,8 @@ pub const WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE: WireBridgeProtobufHelperShape =
 pub enum WireBridgeProtobufDataBody {
     /// `Value` variant.
     Value(Vec<u8>),
-    /// `WireEdge` variant.
-    WireEdge(CanonicalWireEdgeFrame),
+    /// A wire edge group's cause.
+    EdgeCause(CanonicalWireEdgeCause),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,28 +366,28 @@ pub fn decode_canonical_wire_bridge_envelope(
     Ok(envelope)
 }
 
-/// Creates or computes `encode_canonical_wire_edge_frame`.
-pub fn encode_canonical_wire_edge_frame(
-    frame: &CanonicalWireEdgeFrame,
+/// Encodes a wire edge group's cause as canonical protobuf bytes.
+pub fn encode_canonical_wire_edge_cause(
+    cause: &CanonicalWireEdgeCause,
 ) -> Result<Vec<u8>, CanonicalProtobufError> {
-    validate_wire_edge_frame(frame)?;
-    Ok(encode_wire_edge_frame(frame))
+    validate_wire_edge_cause(cause)?;
+    Ok(encode_wire_edge_cause(cause))
 }
 
-/// Creates or computes `decode_canonical_wire_edge_frame`.
-pub fn decode_canonical_wire_edge_frame(
+/// Decodes canonical `WireEdgeCause` bytes; a frame a gate would refuse whole is an
+/// `invalid_wire_edge` error.
+pub fn decode_canonical_wire_edge_cause(
     bytes: &[u8],
-) -> Result<CanonicalWireEdgeFrame, CanonicalProtobufError> {
-    let frame = parse_wire_edge_frame(bytes)?;
-    validate_wire_edge_frame(&frame)?;
-    let canonical = encode_wire_edge_frame(&frame);
-    if canonical != bytes {
+) -> Result<CanonicalWireEdgeCause, CanonicalProtobufError> {
+    let cause = parse_wire_edge_cause(bytes)?;
+    validate_wire_edge_cause(&cause)?;
+    if encode_wire_edge_cause(&cause) != bytes {
         return Err(CanonicalProtobufError::new(
             CanonicalProtobufErrorCategory::NoncanonicalBytes,
-            "WireEdgeFrame bytes are not canonical deterministic protobuf",
+            "WireEdgeCause bytes are not canonical deterministic protobuf",
         ));
     }
-    Ok(frame)
+    Ok(cause)
 }
 
 #[must_use]
@@ -436,8 +456,8 @@ fn canonical_to_protobuf_envelope(
             CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::Value(value)) => {
                 WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::Value(value))
             }
-            CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(frame)) => {
-                WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::WireEdge(frame))
+            CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::EdgeCause(cause)) => {
+                WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::EdgeCause(cause))
             }
             CanonicalWireBridgePayload::Ack => WireBridgeProtobufPayload::Ack,
             CanonicalWireBridgePayload::Nack { error } => WireBridgeProtobufPayload::Nack { error },
@@ -474,9 +494,9 @@ fn protobuf_to_canonical_envelope(
             WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::Value(value)) => {
                 CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::Value(value.clone()))
             }
-            WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::WireEdge(frame)) => {
-                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(
-                    frame.clone(),
+            WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::EdgeCause(cause)) => {
+                CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::EdgeCause(
+                    cause.clone(),
                 ))
             }
             WireBridgeProtobufPayload::Ack => CanonicalWireBridgePayload::Ack,
@@ -631,17 +651,18 @@ fn parse_metadata(bytes: &[u8]) -> Result<CanonicalWireBridgeMetadata, Canonical
 }
 
 fn parse_data_payload(bytes: &[u8]) -> Result<CanonicalWireBridgeDataBody, CanonicalProtobufError> {
-    let fields = read_fields(bytes, &[(1, 2), (2, 2)], "WireBridgeDataPayload")?;
+    // Field 2 carried the per-edge WireEdgeFrame until D803 and is reserved.
+    let fields = read_fields(bytes, &[(1, 2), (3, 2)], "WireBridgeDataPayload")?;
     let value = bytes_field(&fields, 1);
-    let wire_edge = bytes_field(&fields, 2);
-    match (value, wire_edge) {
+    let edge_cause = bytes_field(&fields, 3);
+    match (value, edge_cause) {
         (Some(_), Some(_)) => Err(CanonicalProtobufError::new(
             CanonicalProtobufErrorCategory::InvalidOneof,
             "WireBridgeDataPayload body has multiple cases",
         )),
         (Some(value), None) => Ok(CanonicalWireBridgeDataBody::Value(value.to_vec())),
-        (None, Some(wire_edge)) => Ok(CanonicalWireBridgeDataBody::WireEdge(
-            parse_wire_edge_frame(wire_edge)?,
+        (None, Some(edge_cause)) => Ok(CanonicalWireBridgeDataBody::EdgeCause(
+            parse_wire_edge_cause(edge_cause)?,
         )),
         (None, None) => Err(CanonicalProtobufError::new(
             CanonicalProtobufErrorCategory::MissingRequired,
@@ -650,54 +671,132 @@ fn parse_data_payload(bytes: &[u8]) -> Result<CanonicalWireBridgeDataBody, Canon
     }
 }
 
-fn parse_wire_edge_frame(bytes: &[u8]) -> Result<CanonicalWireEdgeFrame, CanonicalProtobufError> {
-    let fields = read_fields(bytes, &[(1, 0), (2, 2), (3, 2), (4, 2)], "WireEdgeFrame")?;
-    let kind = uint_field(&fields, 1);
-    let edge = bytes_field(&fields, 2);
-    let cause = bytes_field(&fields, 3);
-    let value = bytes_field(&fields, 4);
-    if kind.is_none() || edge.is_none() || cause.is_none() {
-        return Err(CanonicalProtobufError::new(
-            CanonicalProtobufErrorCategory::MissingRequired,
-            "WireEdgeFrame missing required fields",
-        ));
-    }
-    let edge_id = utf8_string(edge.unwrap(), "edge_id")?;
-    let cause_id = utf8_string(cause.unwrap(), "cause_id")?;
-    match kind.unwrap() {
-        1 => {
-            if value.is_some() {
-                return Err(CanonicalProtobufError::new(
-                    CanonicalProtobufErrorCategory::InvalidWireEdge,
-                    "PENDING WireEdgeFrame must not carry value",
-                ));
-            }
-            Ok(CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Pending,
-                edge_id,
-                cause_id,
-                value: None,
-            })
-        }
-        2 => {
-            let value = value.ok_or_else(|| {
-                CanonicalProtobufError::new(
-                    CanonicalProtobufErrorCategory::InvalidWireEdge,
-                    "DATA WireEdgeFrame requires value",
-                )
-            })?;
-            Ok(CanonicalWireEdgeFrame {
-                kind: CanonicalWireEdgeKind::Data,
-                edge_id,
-                cause_id,
-                value: Some(value.to_vec()),
-            })
-        }
-        _ => Err(CanonicalProtobufError::new(
-            CanonicalProtobufErrorCategory::InvalidWireEdge,
-            "WireEdgeFrame kind is invalid",
+fn invalid_edge(message: impl Into<String>) -> CanonicalProtobufError {
+    CanonicalProtobufError::new(CanonicalProtobufErrorCategory::InvalidWireEdge, message)
+}
+
+fn parse_wire_edge_cause(bytes: &[u8]) -> Result<CanonicalWireEdgeCause, CanonicalProtobufError> {
+    let fields = read_fields_with_repeated(
+        bytes,
+        &[(1, 2), (2, 2), (3, 0), (4, 2)],
+        &[4],
+        "WireEdgeCause",
+    )?;
+    let group = bytes_field(&fields, 1).ok_or_else(|| missing("WireEdgeCause group"))?;
+    let session = bytes_field(&fields, 2).ok_or_else(|| missing("WireEdgeCause session"))?;
+    let cause = uint_field(&fields, 3).ok_or_else(|| missing("WireEdgeCause cause"))?;
+    let edges = fields
+        .iter()
+        .filter(|f| f.no == 4)
+        .map(|f| parse_wire_edge_arrays(f.as_bytes()?))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CanonicalWireEdgeCause {
+        group: utf8_string(group, "group")?,
+        session: utf8_string(session, "session")?,
+        cause,
+        edges,
+    })
+}
+
+fn parse_wire_edge_arrays(bytes: &[u8]) -> Result<CanonicalWireEdgeArrays, CanonicalProtobufError> {
+    let fields = read_fields_with_repeated(bytes, &[(1, 2), (2, 2)], &[2], "WireEdgeArrays")?;
+    let edge_id = bytes_field(&fields, 1).ok_or_else(|| missing("WireEdgeArrays edge_id"))?;
+    let arrays = fields
+        .iter()
+        .filter(|f| f.no == 2)
+        .map(|f| parse_wave(f.as_bytes()?))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CanonicalWireEdgeArrays {
+        edge_id: utf8_string(edge_id, "edge_id")?,
+        arrays,
+    })
+}
+
+fn parse_wave(bytes: &[u8]) -> Result<Vec<CanonicalWireMessage>, CanonicalProtobufError> {
+    let fields = read_fields_with_repeated(bytes, &[(1, 2)], &[1], "Wave")?;
+    fields
+        .iter()
+        .map(|f| parse_wire_message(f.as_bytes()?))
+        .collect()
+}
+
+fn parse_wire_message(bytes: &[u8]) -> Result<CanonicalWireMessage, CanonicalProtobufError> {
+    let fields = read_fields(bytes, &[(1, 0), (2, 2)], "Message")?;
+    let data = bytes_field(&fields, 2).map(<[u8]>::to_vec);
+    match (uint_field(&fields, 1).unwrap_or(0), data) {
+        (3, Some(value)) => Ok(CanonicalWireMessage::Data(value)),
+        (3, None) => Err(invalid_edge("DATA requires a value")),
+        (5, None) => Ok(CanonicalWireMessage::Invalidate),
+        (6, None) => Ok(CanonicalWireMessage::Complete),
+        (5 | 6, Some(_)) => Err(invalid_edge("INVALIDATE and COMPLETE carry no data")),
+        (7, Some(payload)) => Ok(CanonicalWireMessage::Error(payload)),
+        (7, None) => Err(invalid_edge("ERROR requires a payload")),
+        (1 | 2 | 4, _) => Err(invalid_edge(
+            "START, PENDING and RESOLVED are each kernel's own",
         )),
+        (0, _) => Err(invalid_edge("message type is unspecified")),
+        _ => Err(invalid_edge("message type does not cross a wire edge")),
     }
+}
+
+fn missing(what: &str) -> CanonicalProtobufError {
+    CanonicalProtobufError::new(
+        CanonicalProtobufErrorCategory::MissingRequired,
+        format!("{what} is missing"),
+    )
+}
+
+/// A frame a receiver's gate refuses whole is `invalid_wire_edge` (R-bridge@1).
+fn validate_wire_edge_cause(cause: &CanonicalWireEdgeCause) -> Result<(), CanonicalProtobufError> {
+    if cause.group.is_empty() || cause.session.is_empty() {
+        return Err(missing("WireEdgeCause group or session"));
+    }
+    if cause.cause == 0 {
+        return Err(missing("WireEdgeCause cause"));
+    }
+    if cause.edges.is_empty() {
+        return Err(invalid_edge("a cause carries at least one edge"));
+    }
+    let mut seen = HashSet::new();
+    for edge in &cause.edges {
+        if edge.edge_id.is_empty() {
+            return Err(missing("WireEdgeArrays edge_id"));
+        }
+        if !seen.insert(edge.edge_id.as_str()) {
+            return Err(invalid_edge(format!("edge {} twice", edge.edge_id)));
+        }
+        if edge.arrays.is_empty() {
+            return Err(invalid_edge(format!(
+                "edge {} carries no array",
+                edge.edge_id
+            )));
+        }
+        let mut ended = false;
+        for array in &edge.arrays {
+            if array.is_empty() {
+                return Err(invalid_edge(format!(
+                    "edge {}: an empty array",
+                    edge.edge_id
+                )));
+            }
+            if ended {
+                return Err(invalid_edge(format!(
+                    "edge {}: an array after its terminal",
+                    edge.edge_id
+                )));
+            }
+            if let Some(i) = array.iter().position(CanonicalWireMessage::is_terminal) {
+                if i != array.len() - 1 {
+                    return Err(invalid_edge(format!(
+                        "edge {}: a terminal not last",
+                        edge.edge_id
+                    )));
+                }
+                ended = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_wire_bridge_envelope(
@@ -733,10 +832,10 @@ fn validate_wire_bridge_envelope(
             "optional metadata default value was emitted",
         ));
     }
-    if let CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::WireEdge(frame)) =
+    if let CanonicalWireBridgePayload::Data(CanonicalWireBridgeDataBody::EdgeCause(cause)) =
         &envelope.payload
     {
-        validate_wire_edge_frame(frame)?;
+        validate_wire_edge_cause(cause)?;
     }
     match &envelope.payload {
         CanonicalWireBridgePayload::Nack { error } if error.as_deref() == Some(&[]) => {
@@ -768,28 +867,6 @@ fn validate_wire_bridge_envelope(
     Ok(())
 }
 
-fn validate_wire_edge_frame(frame: &CanonicalWireEdgeFrame) -> Result<(), CanonicalProtobufError> {
-    if frame.edge_id.is_empty() || frame.cause_id.is_empty() {
-        return Err(CanonicalProtobufError::new(
-            CanonicalProtobufErrorCategory::MissingRequired,
-            "WireEdgeFrame edge_id/cause_id must be non-empty",
-        ));
-    }
-    match frame.kind {
-        CanonicalWireEdgeKind::Pending if frame.value.is_some() => {
-            Err(CanonicalProtobufError::new(
-                CanonicalProtobufErrorCategory::InvalidWireEdge,
-                "PENDING WireEdgeFrame must not carry value",
-            ))
-        }
-        CanonicalWireEdgeKind::Data if frame.value.is_none() => Err(CanonicalProtobufError::new(
-            CanonicalProtobufErrorCategory::InvalidWireEdge,
-            "DATA WireEdgeFrame requires value",
-        )),
-        _ => Ok(()),
-    }
-}
-
 fn encode_metadata(metadata: &CanonicalWireBridgeMetadata) -> Vec<u8> {
     let mut out = Writer::default();
     out.varint_field(1, metadata.seq);
@@ -815,26 +892,40 @@ fn encode_data_payload(
     let mut out = Writer::default();
     match body {
         CanonicalWireBridgeDataBody::Value(value) => out.bytes_field(1, value),
-        CanonicalWireBridgeDataBody::WireEdge(frame) => {
-            out.message_field(2, &encode_canonical_wire_edge_frame(frame)?);
+        CanonicalWireBridgeDataBody::EdgeCause(cause) => {
+            out.message_field(3, &encode_canonical_wire_edge_cause(cause)?);
         }
     }
     Ok(out.finish())
 }
 
-fn encode_wire_edge_frame(frame: &CanonicalWireEdgeFrame) -> Vec<u8> {
+fn encode_wire_edge_cause(cause: &CanonicalWireEdgeCause) -> Vec<u8> {
     let mut out = Writer::default();
-    out.varint_field(
-        1,
-        match frame.kind {
-            CanonicalWireEdgeKind::Pending => 1,
-            CanonicalWireEdgeKind::Data => 2,
-        },
-    );
-    out.string_field(2, &frame.edge_id);
-    out.string_field(3, &frame.cause_id);
-    if let Some(value) = &frame.value {
-        out.bytes_field(4, value);
+    out.string_field(1, &cause.group);
+    out.string_field(2, &cause.session);
+    out.varint_field(3, cause.cause);
+    for edge in &cause.edges {
+        let mut arrays = Writer::default();
+        arrays.string_field(1, &edge.edge_id);
+        for array in &edge.arrays {
+            let mut wave = Writer::default();
+            for message in array {
+                let mut m = Writer::default();
+                let (kind, data) = match message {
+                    CanonicalWireMessage::Data(value) => (3, Some(value)),
+                    CanonicalWireMessage::Invalidate => (5, None),
+                    CanonicalWireMessage::Complete => (6, None),
+                    CanonicalWireMessage::Error(payload) => (7, Some(payload)),
+                };
+                m.varint_field(1, kind);
+                if let Some(data) = data {
+                    m.bytes_field(2, data);
+                }
+                wave.message_field(1, &m.finish());
+            }
+            arrays.message_field(2, &wave.finish());
+        }
+        out.message_field(4, &arrays.finish());
     }
     out.finish()
 }
@@ -938,6 +1029,16 @@ fn read_fields(
     allowed: &[(u32, u8)],
     message_name: &str,
 ) -> Result<Vec<Field>, CanonicalProtobufError> {
+    read_fields_with_repeated(bytes, allowed, &[], message_name)
+}
+
+/// [`read_fields`] where the fields in `repeated` may occur more than once.
+fn read_fields_with_repeated(
+    bytes: &[u8],
+    allowed: &[(u32, u8)],
+    repeated: &[u32],
+    message_name: &str,
+) -> Result<Vec<Field>, CanonicalProtobufError> {
     let mut reader = Reader::new(bytes);
     let mut fields = Vec::new();
     let mut seen = HashSet::new();
@@ -965,7 +1066,7 @@ fn read_fields(
                 format!("{message_name} field {field_no} has wrong wire type"),
             ));
         }
-        if !seen.insert(field_no) {
+        if !repeated.contains(&field_no) && !seen.insert(field_no) {
             return Err(CanonicalProtobufError::new(
                 CanonicalProtobufErrorCategory::DuplicateSingular,
                 format!("{message_name} field {field_no} is duplicated"),

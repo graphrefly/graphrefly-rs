@@ -6,3 +6,4 @@ pub mod bridge_protobuf;
 pub mod environment;
 pub mod observe_storage;
 pub mod reactive_collection_storage;
+pub mod wire_edge_group;

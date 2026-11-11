@@ -1,669 +1,465 @@
+//! C-1 and C-1b — wire edge groups (R-bridge@1, graphrefly:D803): each sender wave is
+//! one cause and one receiver wave; a gate releases a session's causes whole, in order
+//! and at most once. The tests carry each group's frames by hand, through the
+//! canonical protobuf codec for C-1.
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use graphrefly::{
-    decode_wire_bridge_protobuf_bytes, encode_wire_bridge_protobuf_bytes, graph, wire_bridge,
-    wire_edge_group, CanonicalWireEdgeKind, GraphNodeOpts, Message, WireBridgeEnvelopeType,
-    WireBridgeInbound, WireBridgeOptions, WireBridgePayload, WireBridgeProtobufDataBody,
-    WireBridgeProtobufEnvelope, WireBridgeProtobufPayload, WireBridgeProtobufStatusKind,
-    WireEdgeGroupEdge, WireEdgeGroupOptions,
+    decode_canonical_wire_edge_cause, encode_canonical_wire_edge_cause, frame_sink, frame_source,
+    graph, wire_edge_group_in, wire_edge_group_out, AnyValue, CanonicalWireEdgeArrays,
+    CanonicalWireMessage, FrameDeliver, Graph, GraphNodeOpts, Message, Node, WireEdgeCause,
+    WireEdgeIssue,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TraceRow {
-    phase: &'static str,
-    direction: &'static str,
-    pump_step: usize,
-    queue_index: usize,
-    bytes_len: usize,
-    session_id: Option<String>,
-    seq: Option<u64>,
-    cursor: Option<u64>,
-    attempt: Option<u32>,
-    envelope_type: Option<&'static str>,
-    data_body_kind: Option<&'static str>,
-    edge_id: Option<String>,
-    cause_id: Option<String>,
-    wire_edge_kind: Option<&'static str>,
-    value_hex_prefix: Option<String>,
-    decode_error: Option<String>,
+type Queue = Rc<RefCell<VecDeque<WireEdgeCause>>>;
+type Slot = Rc<RefCell<Option<FrameDeliver>>>;
+type Runs = Rc<RefCell<Vec<(Option<u8>, Option<u8>)>>>;
+
+/// A frame sink that queues each frame, as encoded and decoded canonical bytes.
+fn queue_sink(queue: &Queue) -> impl Fn(&[Message<AnyValue>]) + 'static {
+    let queue = queue.clone();
+    frame_sink(move |frame| {
+        let bytes = encode_canonical_wire_edge_cause(&frame).expect("a sent frame encodes");
+        let frame = decode_canonical_wire_edge_cause(&bytes).expect("and decodes");
+        queue.borrow_mut().push_back(frame);
+    })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplayClass {
-    NoOldCauseReplayObserved,
-    OutboundCauseGeneration,
-    InboundWireEdgeGroupGate,
-    WarmupActivationDrainBoundary,
+/// A frame source whose receiving end the test drives through `slot`.
+fn hand_source(g: &Graph, name: &str, slot: &Slot) -> Node<WireEdgeCause> {
+    let slot = slot.clone();
+    frame_source(g, name, move |deliver| {
+        *slot.borrow_mut() = Some(deliver);
+        let slot = slot.clone();
+        Box::new(move || {
+            slot.borrow_mut().take();
+        })
+    })
 }
 
-fn wire_edge_cause_id(group_id: &str, seq: u64) -> String {
-    format!(
-        "wire-edge-group-cause:{}",
-        serde_json::to_string(&[group_id, &seq.to_string()]).expect("tuple key encodes")
+fn deliver_all(queue: &Queue, slot: &Slot) -> usize {
+    let mut n = 0;
+    loop {
+        let next = queue.borrow_mut().pop_front();
+        let Some(frame) = next else { break };
+        let deliver = slot.borrow().clone().expect("receiving end open");
+        deliver(frame);
+        n += 1;
+    }
+    n
+}
+
+fn byte(v: &[u8]) -> u8 {
+    v[0]
+}
+
+fn bytes_node(g: &Graph, name: &str, deps: Vec<graphrefly::Core>, add: u8) -> Node<Vec<u8>> {
+    g.node_opts::<Vec<u8>, _>(
+        deps,
+        move |ctx| {
+            if let Some(v) = ctx.data::<Vec<u8>>(0) {
+                ctx.emit(vec![byte(&v) + add]);
+            }
+        },
+        GraphNodeOpts::named(name),
     )
 }
 
-fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
-        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
-            if let Message::Data(value) = msg {
-                if let Some(value) = value.downcast_ref::<T>() {
-                    seen_sink.borrow_mut().push(value.clone());
-                }
-            }
-        };
-        for msg in msgs {
-            handle(msg);
-        }
-    });
-    seen
-}
-
-fn hex_prefix(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn payload_envelope_type(payload: &WireBridgeProtobufPayload) -> WireBridgeEnvelopeType {
-    match payload {
-        WireBridgeProtobufPayload::Start => WireBridgeEnvelopeType::Start,
-        WireBridgeProtobufPayload::Data(_) => WireBridgeEnvelopeType::Data,
-        WireBridgeProtobufPayload::Ack => WireBridgeEnvelopeType::Ack,
-        WireBridgeProtobufPayload::Nack { .. } => WireBridgeEnvelopeType::Nack,
-        WireBridgeProtobufPayload::Status { .. } => WireBridgeEnvelopeType::Status,
-        WireBridgeProtobufPayload::Error { .. } => WireBridgeEnvelopeType::Error,
-        WireBridgeProtobufPayload::Close { .. } => WireBridgeEnvelopeType::Close,
-    }
-}
-
-fn envelope_type_label(envelope_type: WireBridgeEnvelopeType) -> &'static str {
-    match envelope_type {
-        WireBridgeEnvelopeType::Start => "start",
-        WireBridgeEnvelopeType::Data => "data",
-        WireBridgeEnvelopeType::Ack => "ack",
-        WireBridgeEnvelopeType::Nack => "nack",
-        WireBridgeEnvelopeType::Status => "status",
-        WireBridgeEnvelopeType::Error => "error",
-        WireBridgeEnvelopeType::Close => "close",
-    }
-}
-
-fn semantic_to_protobuf_envelope(
-    envelope: &graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody>,
-) -> WireBridgeProtobufEnvelope {
-    let payload = match envelope.envelope_type {
-        WireBridgeEnvelopeType::Start => WireBridgeProtobufPayload::Start,
-        WireBridgeEnvelopeType::Data => match &envelope.payload {
-            Some(WireBridgePayload::Data(body)) => WireBridgeProtobufPayload::Data(body.clone()),
-            _ => panic!("DATA envelope must carry protobuf DATA payload"),
-        },
-        WireBridgeEnvelopeType::Ack => WireBridgeProtobufPayload::Ack,
-        WireBridgeEnvelopeType::Nack => match &envelope.payload {
-            Some(WireBridgePayload::Error(error)) => WireBridgeProtobufPayload::Nack {
-                error: Some(error.as_bytes().to_vec()),
-            },
-            _ => panic!("NACK envelope must carry error payload"),
-        },
-        WireBridgeEnvelopeType::Status => match &envelope.payload {
-            Some(WireBridgePayload::Status(status)) => WireBridgeProtobufPayload::Status {
-                status: status.as_bytes().to_vec(),
-            },
-            _ => panic!("STATUS envelope must carry status payload"),
-        },
-        WireBridgeEnvelopeType::Error => match &envelope.payload {
-            Some(WireBridgePayload::Error(error)) => WireBridgeProtobufPayload::Error {
-                error: error.as_bytes().to_vec(),
-            },
-            _ => panic!("ERROR envelope must carry error payload"),
-        },
-        WireBridgeEnvelopeType::Close => match &envelope.payload {
-            Some(WireBridgePayload::Close { reason }) => WireBridgeProtobufPayload::Close {
-                reason: reason.as_ref().map(|value| value.as_bytes().to_vec()),
-            },
-            _ => panic!("CLOSE envelope must carry close payload"),
-        },
-    };
-    WireBridgeProtobufEnvelope {
-        session_id: envelope.session_id.clone(),
-        metadata: envelope.metadata.clone(),
-        payload,
-    }
-}
-
-fn protobuf_to_semantic_envelope(
-    envelope: WireBridgeProtobufEnvelope,
-) -> graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody> {
-    let envelope_type = payload_envelope_type(&envelope.payload);
-    let payload = match envelope.payload {
-        WireBridgeProtobufPayload::Start | WireBridgeProtobufPayload::Ack => None,
-        WireBridgeProtobufPayload::Data(body) => Some(WireBridgePayload::Data(body)),
-        WireBridgeProtobufPayload::Nack { error } => Some(WireBridgePayload::Error(
-            String::from_utf8_lossy(error.as_deref().unwrap_or_default()).into_owned(),
-        )),
-        WireBridgeProtobufPayload::Status { status } => Some(WireBridgePayload::Status(
-            String::from_utf8_lossy(&status).into_owned(),
-        )),
-        WireBridgeProtobufPayload::Error { error } => Some(WireBridgePayload::Error(
-            String::from_utf8_lossy(&error).into_owned(),
-        )),
-        WireBridgeProtobufPayload::Close { reason } => Some(WireBridgePayload::Close {
-            reason: reason.map(|value| String::from_utf8_lossy(&value).into_owned()),
-        }),
-    };
-    graphrefly::WireBridgeEnvelope {
-        session_id: envelope.session_id,
-        envelope_type,
-        payload,
-        metadata: envelope.metadata,
-    }
-}
-
-fn capture_outbound_bytes(
-    node: &graphrefly::Node<graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody>>,
-) -> Rc<RefCell<VecDeque<Vec<u8>>>> {
-    let queue = Rc::new(RefCell::new(VecDeque::new()));
-    let queue_sink = queue.clone();
-    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
-        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
-            if let Message::Data(value) = msg {
-                if let Some(envelope) = value
-                    .downcast_ref::<graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody>>()
-                {
-                    let encoded =
-                        encode_wire_bridge_protobuf_bytes(&semantic_to_protobuf_envelope(envelope));
-                    assert_eq!(encoded.status.kind, WireBridgeProtobufStatusKind::Valid);
-                    assert!(encoded.issues.is_empty());
-                    queue_sink
-                        .borrow_mut()
-                        .push_back(encoded.bytes.expect("valid encode yields bytes"));
-                }
-            }
-        };
-        for msg in msgs {
-            handle(msg);
-        }
-    });
-    queue
-}
-
-fn decode_trace_row(
-    raw: &[u8],
-    phase: &'static str,
-    direction: &'static str,
-    pump_step: usize,
-    queue_index: usize,
-) -> TraceRow {
-    let mut row = TraceRow {
-        phase,
-        direction,
-        pump_step,
-        queue_index,
-        bytes_len: raw.len(),
-        session_id: None,
-        seq: None,
-        cursor: None,
-        attempt: None,
-        envelope_type: None,
-        data_body_kind: None,
-        edge_id: None,
-        cause_id: None,
-        wire_edge_kind: None,
-        value_hex_prefix: None,
-        decode_error: None,
-    };
-    let decoded = decode_wire_bridge_protobuf_bytes(raw);
-    if decoded.status.kind != WireBridgeProtobufStatusKind::Valid {
-        row.decode_error = decoded.issues.first().map(|issue| issue.message.clone());
-        return row;
-    }
-    let Some(envelope) = decoded.envelope else {
-        row.decode_error = Some("valid decode without envelope".to_owned());
-        return row;
-    };
-    row.session_id = Some(envelope.session_id.clone());
-    row.seq = Some(envelope.metadata.seq);
-    row.cursor = Some(envelope.metadata.cursor);
-    row.attempt = Some(envelope.metadata.attempt);
-    row.envelope_type = Some(envelope_type_label(payload_envelope_type(
-        &envelope.payload,
-    )));
-    match &envelope.payload {
-        WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::Value(value)) => {
-            row.data_body_kind = Some("value");
-            row.value_hex_prefix = Some(hex_prefix(value));
-        }
-        WireBridgeProtobufPayload::Data(WireBridgeProtobufDataBody::WireEdge(frame)) => {
-            row.data_body_kind = Some("wire_edge");
-            row.edge_id = Some(frame.edge_id.clone());
-            row.cause_id = Some(frame.cause_id.clone());
-            row.wire_edge_kind = Some(match frame.kind {
-                CanonicalWireEdgeKind::Pending => "pending",
-                CanonicalWireEdgeKind::Data => "data",
-            });
-            row.value_hex_prefix = frame.value.as_deref().map(hex_prefix);
-        }
-        _ => {}
-    }
-    row
-}
-
-fn pump_fifo(
-    queue: &Rc<RefCell<VecDeque<Vec<u8>>>>,
-    target: &WireBridgeInbound<WireBridgeProtobufDataBody>,
-    trace: &mut Vec<TraceRow>,
-    phase: &'static str,
-    direction: &'static str,
-    limit: Option<usize>,
-) -> usize {
-    let mut pumped = 0;
-    while limit.is_none_or(|limit| pumped < limit) {
-        let Some(raw) = queue.borrow_mut().pop_front() else {
-            break;
-        };
-        let row = decode_trace_row(&raw, phase, direction, pumped, 0);
-        assert!(
-            row.decode_error.is_none(),
-            "C-1 host pump only transports canonical protobuf bytes: {row:?}"
-        );
-        let decoded = decode_wire_bridge_protobuf_bytes(&raw);
-        let envelope = decoded.envelope.expect("valid decode yields envelope");
-        let reencoded = encode_wire_bridge_protobuf_bytes(&envelope);
-        assert_eq!(reencoded.status.kind, WireBridgeProtobufStatusKind::Valid);
-        assert_eq!(
-            reencoded.bytes.as_deref(),
-            Some(raw.as_slice()),
-            "C-1 host pump preserves FIFO byte material unchanged"
-        );
-        trace.push(row);
-        target.set(protobuf_to_semantic_envelope(envelope));
-        pumped += 1;
-    }
-    pumped
-}
-
-fn classify_replay_source(trace: &[TraceRow]) -> ReplayClass {
-    if trace.iter().any(|row| {
-        row.phase == "stimulus"
-            && row.direction == "g1_to_g2"
-            && row.wire_edge_kind == Some("data")
-            && matches!(
-                row.value_hex_prefix.as_deref(),
-                Some("422d696e3a6130" | "432d696e3a6130")
-            )
-    }) {
-        return ReplayClass::OutboundCauseGeneration;
-    }
-    if trace.iter().any(|row| {
-        row.phase == "stimulus"
-            && row.direction == "g2_to_g1"
-            && row.wire_edge_kind == Some("data")
-            && row
-                .value_hex_prefix
-                .as_deref()
-                .is_some_and(|value| value.contains("6130"))
-    }) {
-        return ReplayClass::InboundWireEdgeGroupGate;
-    }
-    if trace.iter().any(|row| {
-        row.phase == "stimulus"
-            && matches!(row.direction, "g1_to_g2" | "g2_to_g1")
-            && row
-                .cause_id
-                .as_deref()
-                .is_some_and(|cause_id| cause_id == wire_edge_cause_id("group", 1))
-    }) {
-        return ReplayClass::WarmupActivationDrainBoundary;
-    }
-    ReplayClass::NoOldCauseReplayObserved
-}
-
-fn trace_data_values(
-    trace: &[TraceRow],
-    phase: &'static str,
-    direction: &'static str,
-) -> Vec<String> {
-    trace
-        .iter()
-        .filter(|row| {
-            row.phase == phase
-                && row.direction == direction
-                && row.envelope_type == Some("data")
-                && row.wire_edge_kind == Some("data")
-        })
-        .filter_map(|row| row.value_hex_prefix.clone())
-        .collect()
-}
-
-fn trace_wire_edge_steps(
-    trace: &[TraceRow],
-    phase: &'static str,
-    direction: &'static str,
-) -> Vec<(String, String)> {
-    trace
-        .iter()
-        .filter(|row| {
-            row.phase == phase
-                && row.direction == direction
-                && row.envelope_type == Some("data")
-                && row.data_body_kind == Some("wire_edge")
-        })
-        .map(|row| {
-            (
-                row.edge_id.clone().expect("wire edge trace has edge_id"),
-                row.wire_edge_kind
-                    .expect("wire edge trace has kind")
-                    .to_owned(),
-            )
-        })
-        .collect()
-}
-
-fn c1_bridge_options(session_id: &str, name: &str) -> WireBridgeOptions {
-    let mut opts = WireBridgeOptions::named(session_id, name);
-    opts.now_ms = Some(Rc::new(|| 1_u64));
-    opts
-}
-
+/// C-1 — a cross-graph diamond runs its fan-in once: each sender wave is one cause and
+/// one receiver wave.
 #[test]
-fn c1_rust_two_graph_mixed_locality_bridge_diamond_is_coherent() {
+fn c1_cross_graph_diamond_runs_its_fan_in_once() {
     let g1 = graph();
     let g2 = graph();
-
-    let g1_to_g2_bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
-        &g1,
-        c1_bridge_options("g1-g2", "g1_to_g2/bridge"),
-    );
-    let g2_from_g1_bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
+    let a = g1.state_opts(vec![1u8], GraphNodeOpts::named("A"));
+    // ga carries a from g1 to g2; gbc carries b and c from g2 to g1.
+    let (qa, qbc): (Queue, Queue) = (Rc::default(), Rc::default());
+    let (slot_a, slot_bc): (Slot, Slot) = (Rc::default(), Rc::default());
+    let ga_out = wire_edge_group_out(&g1, "ga/out", "ga", vec![("a".into(), a.erased())]);
+    let ga_src = hand_source(&g2, "ga/frames", &slot_a);
+    let ga_in = wire_edge_group_in(&g2, "ga", "ga", &ga_src, &["a"]);
+    let b = bytes_node(&g2, "B", vec![ga_in.inbound["a"].erased()], 10);
+    let c = bytes_node(&g2, "C", vec![ga_in.inbound["a"].erased()], 20);
+    let gbc_out = wire_edge_group_out(
         &g2,
-        c1_bridge_options("g1-g2", "g2_from_g1/bridge"),
+        "gbc/out",
+        "gbc",
+        vec![("b".into(), b.erased()), ("c".into(), c.erased())],
     );
-    let g2_to_g1_bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
-        &g2,
-        c1_bridge_options("g2-g1", "g2_to_g1/bridge"),
-    );
-    let g1_from_g2_bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
-        &g1,
-        c1_bridge_options("g2-g1", "g1_from_g2/bridge"),
-    );
+    let gbc_src = hand_source(&g1, "gbc/frames", &slot_bc);
+    let gbc_in = wire_edge_group_in(&g1, "gbc", "gbc", &gbc_src, &["b", "c"]);
+    let d_runs: Rc<RefCell<Vec<(u8, u8)>>> = Rc::default();
+    let d = {
+        let d_runs = d_runs.clone();
+        g1.node_opts::<Vec<u8>, _>(
+            vec![gbc_in.inbound["b"].erased(), gbc_in.inbound["c"].erased()],
+            move |ctx| {
+                if let (Some(b), Some(c)) = (ctx.data::<Vec<u8>>(0), ctx.data::<Vec<u8>>(1)) {
+                    d_runs.borrow_mut().push((byte(&b), byte(&c)));
+                    ctx.emit(vec![byte(&b), byte(&c)]);
+                }
+            },
+            GraphNodeOpts::named("D"),
+        )
+    };
+    let d_arrays: Rc<RefCell<Vec<Vec<Vec<u8>>>>> = Rc::default();
+    let _ud = {
+        let d_arrays = d_arrays.clone();
+        d.subscribe(move |msgs: &[Message<AnyValue>]| {
+            let data: Vec<Vec<u8>> = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Data(v) => v.downcast_ref::<Vec<u8>>().cloned(),
+                    _ => None,
+                })
+                .collect();
+            if !data.is_empty() {
+                d_arrays.borrow_mut().push(data);
+            }
+        })
+    };
+    // The transport's sinks open both sessions.
+    let _sa = ga_out.subscribe(queue_sink(&qa));
+    let _sbc = gbc_out.subscribe(queue_sink(&qbc));
 
-    let source = g1.state_opts(b"a0".to_vec(), GraphNodeOpts::named("A"));
-    let a_to_b = g1.node_opts::<Vec<u8>, _>(
-        vec![source.erased()],
-        |ctx| {
-            let value = ctx.data::<Vec<u8>>(0).expect("A has data");
-            let mut out = b"B-in:".to_vec();
-            out.extend_from_slice(value.as_slice());
-            ctx.emit(out);
-        },
-        GraphNodeOpts::named("A_to_B_payload"),
-    );
-    let a_to_c = g1.node_opts::<Vec<u8>, _>(
-        vec![source.erased()],
-        |ctx| {
-            let value = ctx.data::<Vec<u8>>(0).expect("A has data");
-            let mut out = b"C-in:".to_vec();
-            out.extend_from_slice(value.as_slice());
-            ctx.emit(out);
-        },
-        GraphNodeOpts::named("A_to_C_payload"),
-    );
-    let _g1_split = wire_edge_group(
-        &g1,
-        &g1_to_g2_bridge,
-        WireEdgeGroupOptions::named(
-            "g1_split",
-            vec![
-                WireEdgeGroupEdge::outbound("a-to-b", a_to_b),
-                WireEdgeGroupEdge::outbound("a-to-c", a_to_c),
-            ],
-        ),
-    );
+    // First causes: D starts on B's and C's values over A.
+    deliver_all(&qa, &slot_a);
+    deliver_all(&qbc, &slot_bc);
+    assert_eq!(d_runs.borrow().last(), Some(&(11, 21)));
 
-    let g2_split_in = wire_edge_group(
-        &g2,
-        &g2_from_g1_bridge,
-        WireEdgeGroupOptions::named(
-            "g2_split_in",
-            vec![
-                WireEdgeGroupEdge::inbound("a-to-b"),
-                WireEdgeGroupEdge::inbound("a-to-c"),
-            ],
-        ),
-    );
-    let b_in = g2_split_in
-        .inbound
-        .get("a-to-b")
-        .expect("a-to-b inbound edge");
-    let c_in = g2_split_in
-        .inbound
-        .get("a-to-c")
-        .expect("a-to-c inbound edge");
-    let b_leg = g2.node_opts::<Vec<u8>, _>(
-        vec![b_in.erased()],
-        |ctx| {
-            let value = ctx.data::<Vec<u8>>(0).expect("B input has data");
-            let mut out = b"B-out:".to_vec();
-            out.extend_from_slice(value.as_slice());
-            ctx.emit(out);
-        },
-        GraphNodeOpts::named("B"),
-    );
-    let c_leg = g2.node_opts::<Vec<u8>, _>(
-        vec![c_in.erased()],
-        |ctx| {
-            let value = ctx.data::<Vec<u8>>(0).expect("C input has data");
-            let mut out = b"C-out:".to_vec();
-            out.extend_from_slice(value.as_slice());
-            ctx.emit(out);
-        },
-        GraphNodeOpts::named("C"),
-    );
-    let _g2_join_out = wire_edge_group(
-        &g2,
-        &g2_to_g1_bridge,
-        WireEdgeGroupOptions::named(
-            "g2_join_out",
-            vec![
-                WireEdgeGroupEdge::outbound("b-to-d", b_leg),
-                WireEdgeGroupEdge::outbound("c-to-d", c_leg),
-            ],
-        ),
-    );
-
-    let g1_join_in = wire_edge_group(
-        &g1,
-        &g1_from_g2_bridge,
-        WireEdgeGroupOptions::named(
-            "g1_join_in",
-            vec![
-                WireEdgeGroupEdge::inbound("b-to-d"),
-                WireEdgeGroupEdge::inbound("c-to-d"),
-            ],
-        ),
-    );
-    let b_to_d = g1_join_in
-        .inbound
-        .get("b-to-d")
-        .expect("b-to-d inbound edge");
-    let c_to_d = g1_join_in
-        .inbound
-        .get("c-to-d")
-        .expect("c-to-d inbound edge");
-    let runs = Rc::new(RefCell::new(Vec::<(Vec<u8>, Vec<u8>)>::new()));
-    let runs_sink = runs.clone();
-    let join = g1.node_opts::<Vec<u8>, _>(
-        vec![b_to_d.erased(), c_to_d.erased()],
-        move |ctx| {
-            let b_value = ctx.data::<Vec<u8>>(0).expect("B leg has data");
-            let c_value = ctx.data::<Vec<u8>>(1).expect("C leg has data");
-            runs_sink
-                .borrow_mut()
-                .push(((*b_value).clone(), (*c_value).clone()));
-            let mut out = b_value.as_ref().clone();
-            out.push(b'|');
-            out.extend_from_slice(c_value.as_slice());
-            ctx.emit(out);
-        },
-        GraphNodeOpts::named("D"),
-    );
-    let joined = collect_data(&join);
-    let g1_to_g2_queue = capture_outbound_bytes(&g1_to_g2_bridge.outbound);
-    let g2_to_g1_queue = capture_outbound_bytes(&g2_to_g1_bridge.outbound);
-    let mut trace = Vec::new();
-
+    // One write of A: one ga cause, one g2 wave with B and C once each, one gbc cause
+    // carrying both, one g1 wave with D once.
+    d_runs.borrow_mut().clear();
+    d_arrays.borrow_mut().clear();
+    a.set(vec![2]);
+    assert_eq!(qa.borrow().len(), 1, "one g1 wave, one cause");
+    deliver_all(&qa, &slot_a);
+    assert_eq!(qbc.borrow().len(), 1, "B and C ran once, in one cause");
+    let edges: Vec<String> = qbc.borrow()[0]
+        .edges
+        .iter()
+        .map(|e| e.edge_id.clone())
+        .collect();
+    assert_eq!(edges, vec!["b", "c"]);
+    deliver_all(&qbc, &slot_bc);
+    assert_eq!(*d_runs.borrow(), vec![(12, 22)], "D ran once, on one A");
     assert_eq!(
-        pump_fifo(
-            &g1_to_g2_queue,
-            &g2_from_g1_bridge.inbound,
-            &mut trace,
-            "warmup",
-            "g1_to_g2",
-            None,
-        ),
-        4
+        *d_arrays.borrow(),
+        vec![vec![vec![12, 22]]],
+        "its sinks got one array"
     );
-    assert_eq!(
-        pump_fifo(
-            &g2_to_g1_queue,
-            &g1_from_g2_bridge.inbound,
-            &mut trace,
-            "warmup",
-            "g2_to_g1",
-            None,
-        ),
-        4
-    );
-    assert_eq!(
-        joined.borrow().as_slice(),
-        &[b"B-out:B-in:a0|C-out:C-in:a0".to_vec()]
-    );
-    joined.borrow_mut().clear();
-    runs.borrow_mut().clear();
 
-    source.set(b"a1".to_vec());
-    assert_eq!(
-        pump_fifo(
-            &g1_to_g2_queue,
-            &g2_from_g1_bridge.inbound,
-            &mut trace,
-            "stimulus",
-            "g1_to_g2",
-            Some(2),
-        ),
-        2,
-        "partial inbound progress must not settle g2's split"
-    );
+    // Two writes held back on gbc: two g1 waves, in order, each consistent.
+    d_runs.borrow_mut().clear();
+    a.set(vec![3]);
+    a.set(vec![4]);
+    deliver_all(&qa, &slot_a);
+    assert_eq!(deliver_all(&qbc, &slot_bc), 2);
+    assert_eq!(*d_runs.borrow(), vec![(13, 23), (14, 24)]);
     assert!(
-        g2_to_g1_queue.borrow().is_empty(),
-        "partial g1->g2 cause must not produce return-leg fan-in"
+        d_runs.borrow().iter().all(|(b, c)| b + 10 == *c),
+        "D never runs on one new and one old leg"
     );
-    assert!(joined.borrow().is_empty());
-    assert!(runs.borrow().is_empty());
-    assert_eq!(
-        pump_fifo(
-            &g1_to_g2_queue,
-            &g2_from_g1_bridge.inbound,
-            &mut trace,
-            "stimulus",
-            "g1_to_g2",
-            None,
-        ),
-        2
-    );
-    assert_eq!(
-        pump_fifo(
-            &g2_to_g1_queue,
-            &g1_from_g2_bridge.inbound,
-            &mut trace,
-            "stimulus",
-            "g2_to_g1",
-            Some(2),
-        ),
-        2,
-        "partial return cause must not settle D with cached old values"
-    );
-    assert!(joined.borrow().is_empty());
-    assert!(runs.borrow().is_empty());
-    assert_eq!(
-        pump_fifo(
-            &g2_to_g1_queue,
-            &g1_from_g2_bridge.inbound,
-            &mut trace,
-            "stimulus",
-            "g2_to_g1",
-            None,
-        ),
-        2
-    );
+}
 
-    let classification = classify_replay_source(&trace);
-    assert_eq!(
-        joined.borrow().as_slice(),
-        &[b"B-out:B-in:a1|C-out:C-in:a1".to_vec()],
-        "C-1 replay source classification: {classification:?}; trace={trace:?}"
-    );
-    assert_eq!(
-        runs.borrow().as_slice(),
-        &[(b"B-out:B-in:a1".to_vec(), b"C-out:C-in:a1".to_vec())],
-        "C-1 replay source classification: {classification:?}; trace={trace:?}"
-    );
-    assert_eq!(classification, ReplayClass::NoOldCauseReplayObserved);
-    assert!(
-        g1_to_g2_queue.borrow().is_empty() && g2_to_g1_queue.borrow().is_empty(),
-        "C-1 FIFO host pump leaves no outbound frames queued in this scenario"
-    );
-    assert_eq!(
-        trace_data_values(&trace, "stimulus", "g1_to_g2"),
-        vec!["422d696e3a6131".to_owned(), "432d696e3a6131".to_owned()],
-        "stimulus frames must be fresh outbound cause material, not a0 replay"
-    );
-    assert_eq!(
-        trace_wire_edge_steps(&trace, "stimulus", "g1_to_g2"),
-        vec![
-            ("a-to-b".to_owned(), "pending".to_owned()),
-            ("a-to-c".to_owned(), "pending".to_owned()),
-            ("a-to-b".to_owned(), "data".to_owned()),
-            ("a-to-c".to_owned(), "data".to_owned()),
-        ],
-        "g1->g2 stimulus must preserve WireEdgeGroup two-phase ordering"
-    );
-    assert_eq!(
-        trace_data_values(&trace, "stimulus", "g2_to_g1"),
-        vec![
-            "422d6f75743a422d696e3a6131".to_owned(),
-            "432d6f75743a432d696e3a6131".to_owned(),
-        ],
-        "return frames must carry coherent B(a1), C(a1)"
-    );
-    assert_eq!(
-        trace_wire_edge_steps(&trace, "stimulus", "g2_to_g1"),
-        vec![
-            ("b-to-d".to_owned(), "pending".to_owned()),
-            ("c-to-d".to_owned(), "pending".to_owned()),
-            ("b-to-d".to_owned(), "data".to_owned()),
-            ("c-to-d".to_owned(), "data".to_owned()),
-        ],
-        "g2->g1 stimulus must preserve WireEdgeGroup two-phase ordering"
-    );
-    assert!(trace.iter().all(|row| row.queue_index == 0));
-    assert!(trace.iter().all(|row| row.bytes_len > 0));
-    for direction in ["g1_to_g2", "g2_to_g1"] {
-        let stimulus_steps = trace
-            .iter()
-            .filter(|row| row.phase == "stimulus" && row.direction == direction)
-            .map(|row| row.pump_step)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            stimulus_steps,
-            vec![0, 1, 0, 1],
-            "pump records strict pop-front order for {direction}"
-        );
+fn frame(
+    group: &str,
+    session: &str,
+    cause: u64,
+    edges: Vec<(&str, Vec<Vec<CanonicalWireMessage>>)>,
+) -> WireEdgeCause {
+    WireEdgeCause {
+        group: group.into(),
+        session: session.into(),
+        cause,
+        edges: edges
+            .into_iter()
+            .map(|(edge, arrays)| CanonicalWireEdgeArrays {
+                edge_id: edge.into(),
+                arrays,
+            })
+            .collect(),
     }
+}
+
+fn data(v: u8) -> CanonicalWireMessage {
+    CanonicalWireMessage::Data(vec![v])
+}
+
+/// C-1b — a wire edge group releases each cause whole, in order and at most once per
+/// session. (Rust frames are typed: a frame with PENDING or RESOLVED in an array
+/// cannot be built, and the codec refuses such bytes as `invalid_wire_edge`.)
+#[test]
+fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
+    let s = graph();
+    let r = graph();
+    let tx = s.state_opts(vec![1u8], GraphNodeOpts::named("tx"));
+    // x sends two arrays in one wave for the value 99.
+    let x = s.node_opts::<Vec<u8>, _>(
+        vec![tx.erased()],
+        |ctx| {
+            if let Some(v) = ctx.data::<Vec<u8>>(0) {
+                if v[0] == 99 {
+                    ctx.down(vec![Message::Data(Rc::new(vec![99u8]) as AnyValue)]);
+                    ctx.down(vec![Message::Data(Rc::new(vec![100u8]) as AnyValue)]);
+                } else {
+                    ctx.emit((*v).clone());
+                }
+            }
+        },
+        GraphNodeOpts::named("x"),
+    );
+    let y = s.state_opts(vec![2u8], GraphNodeOpts::named("y"));
+    let out = wire_edge_group_out(
+        &s,
+        "g/out",
+        "g",
+        vec![("x".into(), x.erased()), ("y".into(), y.erased())],
+    );
+    let q: Queue = Rc::default();
+    let slot: Slot = Rc::default();
+    let src = hand_source(&r, "g/frames", &slot);
+    let gin = wire_edge_group_in(&r, "g", "g", &src, &["x", "y"]);
+    let f_runs: Runs = Rc::default();
+    let f = {
+        let f_runs = f_runs.clone();
+        r.node_opts::<(), _>(
+            vec![gin.inbound["x"].erased(), gin.inbound["y"].erased()],
+            move |ctx| {
+                f_runs.borrow_mut().push((
+                    ctx.data::<Vec<u8>>(0).map(|v| v[0]),
+                    ctx.data::<Vec<u8>>(1).map(|v| v[0]),
+                ));
+            },
+            GraphNodeOpts {
+                node: graphrefly::NodeOpts {
+                    partial: true,
+                    ..graphrefly::NodeOpts::default()
+                },
+                ..GraphNodeOpts::named("F")
+            },
+        )
+    };
+    let _uf = f.subscribe(|_| {});
+    let x_arrays: Rc<RefCell<Vec<Vec<String>>>> = Rc::default();
+    let _ux = {
+        let x_arrays = x_arrays.clone();
+        gin.inbound["x"].subscribe(move |msgs: &[Message<AnyValue>]| {
+            x_arrays
+                .borrow_mut()
+                .push(msgs.iter().map(|m| format!("{m:?}")).collect());
+        })
+    };
+    let issues: Rc<RefCell<Vec<WireEdgeIssue>>> = Rc::default();
+    let _ui = {
+        let issues = issues.clone();
+        gin.issues.subscribe(move |msgs: &[Message<AnyValue>]| {
+            for m in msgs {
+                if let Message::Data(v) = m {
+                    if let Some(i) = v.downcast_ref::<WireEdgeIssue>() {
+                        issues.borrow_mut().push(i.clone());
+                    }
+                }
+            }
+        })
+    };
+    let u_out = out.subscribe(queue_sink(&q));
+
+    // The first cause carries x's and y's snapshots.
+    let first = q.borrow()[0].clone();
+    assert_eq!(first.cause, 1);
+    assert_eq!(first.edges.len(), 2);
+    deliver_all(&q, &slot);
+    assert_eq!(f_runs.borrow().last(), Some(&(Some(1), Some(2))));
+
+    // Each sender wave in which an edge sent is one cause carrying only those edges.
+    let runs = f_runs.borrow().len();
+    tx.set(vec![3]);
+    assert_eq!(q.borrow().len(), 1);
+    assert_eq!(q.borrow()[0].edges.len(), 1, "only x");
+    tx.set(vec![4]);
+    y.set(vec![5]);
+    assert_eq!(q.borrow().len(), 3, "separate waves, separate causes");
+    s.batch(|_| {
+        tx.set(vec![6]);
+        y.set(vec![7]);
+    });
+    assert_eq!(q.borrow().len(), 4);
+    assert_eq!(
+        q.borrow()[3].edges.len(),
+        2,
+        "one batch, one cause with both"
+    );
+    tx.set(vec![99]);
+    assert_eq!(
+        q.borrow()[4].edges[0].arrays.len(),
+        2,
+        "two arrays stay two"
+    );
+    let delivered = deliver_all(&q, &slot);
+    assert_eq!(delivered, 5);
+    assert_eq!(
+        f_runs.borrow().len(),
+        runs + 5,
+        "each delivery: F runs once"
+    );
+    assert_eq!(f_runs.borrow().last(), Some(&(Some(100), Some(7))));
+
+    // After a cause that carried only x, a new sink on inbound y gets y's last value.
+    let y_seen: Rc<RefCell<Vec<u8>>> = Rc::default();
+    let _uy = {
+        let y_seen = y_seen.clone();
+        gin.inbound["y"].subscribe(move |msgs: &[Message<AnyValue>]| {
+            for m in msgs {
+                if let Message::Data(v) = m {
+                    y_seen
+                        .borrow_mut()
+                        .push(v.downcast_ref::<Vec<u8>>().unwrap()[0]);
+                }
+            }
+        })
+    };
+    assert_eq!(*y_seen.borrow(), vec![7]);
+
+    // INVALIDATE and COMPLETE arrive as the inbound nodes' own.
+    x_arrays.borrow_mut().clear();
+    tx.invalidate();
+    y.complete();
+    deliver_all(&q, &slot);
+    assert!(x_arrays
+        .borrow()
+        .iter()
+        .flatten()
+        .any(|k| k == "INVALIDATE"));
+    assert_eq!(
+        gin.inbound["y"].status().output,
+        graphrefly::OutputStatus::Completed
+    );
+
+    // A new session starts the count at 1 and carries an INVALIDATE for x.
+    u_out();
+    let _u_out2 = out.subscribe(queue_sink(&q));
+    let fresh = q.borrow().back().cloned().unwrap();
+    assert_eq!(fresh.cause, 1);
+    assert!(fresh
+        .edges
+        .iter()
+        .any(|e| e.edge_id == "x" && e.arrays == vec![vec![CanonicalWireMessage::Invalidate]]));
+    let session = fresh.session.clone();
+    assert_ne!(session, first.session);
+    deliver_all(&q, &slot);
+
+    // Frames handed to the receiver: duplicate, older, two past, refused, other group.
+    let deliver = slot.borrow().clone().unwrap();
+    issues.borrow_mut().clear();
+    let runs = f_runs.borrow().len();
+    deliver(frame("g", &session, 1, vec![("x", vec![vec![data(8)]])]));
+    deliver(frame("g", &session, 3, vec![("x", vec![vec![data(9)]])]));
+    deliver(frame("g", &session, 2, vec![("x", vec![vec![data(10)]])]));
+    deliver(frame("g", &session, 4, vec![("z", vec![vec![data(1)]])]));
+    deliver(frame(
+        "g",
+        &session,
+        5,
+        vec![(
+            "x",
+            vec![vec![CanonicalWireMessage::Complete], vec![data(1)]],
+        )],
+    ));
+    deliver(frame(
+        "other",
+        &session,
+        6,
+        vec![("x", vec![vec![data(1)]])],
+    ));
+    let got = issues.borrow().clone();
+    assert!(
+        matches!(
+            got[0],
+            WireEdgeIssue::Stale {
+                cause: 1,
+                last: 1,
+                ..
+            }
+        ),
+        "{got:?}"
+    );
+    assert!(
+        matches!(got[1], WireEdgeIssue::Gap { from: 2, to: 2, .. }),
+        "{got:?}"
+    );
+    assert!(
+        matches!(
+            got[2],
+            WireEdgeIssue::Stale {
+                cause: 2,
+                last: 3,
+                ..
+            }
+        ),
+        "{got:?}"
+    );
+    assert!(
+        matches!(&got[3], WireEdgeIssue::Refused { cause: 4, reason, .. } if reason.contains("undeclared"))
+    );
+    assert!(
+        matches!(&got[4], WireEdgeIssue::Refused { cause: 5, reason, .. } if reason.contains("after its terminal"))
+    );
+    assert_eq!(got.len(), 5, "another group's frame is ignored");
+    // F may run on the waves that release nothing (its inputs send RESOLVED, which is
+    // input, R-invocation@2), but only the cause two past brings it a value.
+    let seen_x: Vec<Option<u8>> = f_runs.borrow()[runs..].iter().map(|r| r.0).collect();
+    assert!(seen_x.contains(&Some(9)), "{seen_x:?}");
+    assert!(
+        !seen_x.iter().any(|x| matches!(x, Some(8 | 10 | 1))),
+        "dropped and refused frames bring nothing: {seen_x:?}"
+    );
+    assert_eq!(f_runs.borrow().last().unwrap().0, Some(9));
+    assert_eq!(
+        gin.inbound["x"].status().output,
+        graphrefly::OutputStatus::Open
+    );
+
+    // An edge value that is not bytes is a throw, so an ERROR, of the outbound node.
+    let n = s.state_opts(1i32, GraphNodeOpts::named("n"));
+    let bad = wire_edge_group_out(&s, "bad/out", "bad", vec![("n".into(), n.erased())]);
+    let _ub = bad.subscribe(|_| {});
+    assert_eq!(bad.status().output, graphrefly::OutputStatus::Errored);
+}
+
+/// R-bridge@1: an inbound node's snapshot is what its edge last brought, whichever
+/// frames carried it — also for an inbound node first activated after the causes
+/// were released.
+#[test]
+fn inbound_activated_late_starts_from_what_its_edge_last_brought() {
+    let r = graph();
+    let slot: Slot = Rc::default();
+    let src = hand_source(&r, "g/frames", &slot);
+    let gin = wire_edge_group_in(&r, "g", "g", &src, &["x", "y"]);
+    // Only the issues node is active, so the gate takes frames; inbound x is not.
+    let _ui = gin.issues.subscribe(|_| {});
+    let deliver = slot.borrow().clone().unwrap();
+    deliver(frame(
+        "g",
+        "s1",
+        1,
+        vec![("x", vec![vec![data(1)]]), ("y", vec![vec![data(2)]])],
+    ));
+    deliver(frame("g", "s1", 2, vec![("y", vec![vec![data(3)]])]));
+    let seen: Rc<RefCell<Vec<u8>>> = Rc::default();
+    let _ux = {
+        let seen = seen.clone();
+        gin.inbound["x"].subscribe(move |msgs: &[Message<AnyValue>]| {
+            for m in msgs {
+                if let Message::Data(v) = m {
+                    seen.borrow_mut()
+                        .push(v.downcast_ref::<Vec<u8>>().unwrap()[0]);
+                }
+            }
+        })
+    };
+    assert_eq!(*seen.borrow(), vec![1], "x's last value, from cause 1");
 }

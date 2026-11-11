@@ -1402,7 +1402,7 @@ fn derived_values_expose_prev_and_wave_batches_without_raw_ctx_or_sampling_helpe
     assert_eq!(*seen_wave_batches.borrow(), vec![vec![vec![1]]]);
     assert_eq!(*seen_prev.borrow(), vec![None]);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         source.set(2i32);
         source.set(3i32);
     });

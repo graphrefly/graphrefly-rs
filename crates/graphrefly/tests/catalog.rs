@@ -2790,7 +2790,7 @@ fn audit_same_wave_notifier_close_uses_pre_wave_latest() {
     let data = collect_data(&audited);
 
     src.set(1);
-    batch(|_| {
+    g.batch(|_| {
         notifier.set(());
         src.set(2);
     });
@@ -3922,7 +3922,7 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("buffer_same_wave"),
     );
     let buffer_seen = collect_data(&buffered);
-    batch(|_| {
+    g.batch(|_| {
         source.set(2);
         notifier.set(());
     });
@@ -3936,9 +3936,9 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("buffer_multi_notifier_wave"),
     );
     let buffer_seen = collect_data(&buffered);
-    batch(|_| {
+    g.batch(|_| {
         source.set(4);
-        graphrefly::batch(|_| {
+        g.batch(|_| {
             notifier.set(());
             notifier.set(());
         });
@@ -3957,7 +3957,7 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("sample_same_wave"),
     );
     let sample_seen = collect_data(&sampled);
-    batch(|_| {
+    g.batch(|_| {
         source.set(6);
         notifier.set(());
     });
@@ -3971,7 +3971,7 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("take_until_same_wave"),
     );
     let until_seen = collect_shapes::<i32>(&until);
-    batch(|_| {
+    g.batch(|_| {
         source.set(8);
         notifier.set(());
     });
@@ -3985,7 +3985,7 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("take_until_notifier_first"),
     );
     let until_seen = collect_shapes::<i32>(&until);
-    batch(|_| {
+    g.batch(|_| {
         notifier.set(());
         source.set(21);
     });
@@ -3999,11 +3999,11 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("valve_same_wave"),
     );
     let gated_seen = collect_data(&gated);
-    batch(|_| {
+    g.batch(|_| {
         control.set(true);
         source.set(11);
     });
-    batch(|_| {
+    g.batch(|_| {
         control.set(false);
         source.set(12);
     });

@@ -113,28 +113,26 @@ pub use adapters::agentic_memory_storage::{
 };
 pub use adapters::bridge::{
     remote_call, remote_call_with_options, remote_responder, remote_responder_handler, wire_bridge,
-    wire_bridge_envelope, wire_bridge_idempotency_key, wire_edge_group, RemoteCallBundle,
-    RemoteCallError, RemoteCallOptions, RemoteCallRequest, RemoteCallResponse, RemoteCallResult,
-    RemoteCallStatus, RemoteCallStatusState, RemoteCallTimeout, RemoteResponderBundle,
-    RemoteResponderEvent, RemoteResponderHandlerDefinition, RemoteResponderOptions,
-    RemoteResponderStatus, RemoteResponderStatusState, WireBridgeAck, WireBridgeAttempt,
-    WireBridgeBundle, WireBridgeCommand, WireBridgeEnvelope, WireBridgeEnvelopeError,
-    WireBridgeEnvelopeInput, WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeInbound,
-    WireBridgeIngress, WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload,
-    WireBridgeReceipt, WireBridgeStatus, WireBridgeStatusState, WireEdgeGroupBundle,
-    WireEdgeGroupEdge, WireEdgeGroupIssue, WireEdgeGroupIssueCode, WireEdgeGroupOptions,
-    WireEdgeGroupStatus, WireEdgeGroupStatusState,
+    wire_bridge_envelope, wire_bridge_idempotency_key, RemoteCallBundle, RemoteCallError,
+    RemoteCallOptions, RemoteCallRequest, RemoteCallResponse, RemoteCallResult, RemoteCallStatus,
+    RemoteCallStatusState, RemoteCallTimeout, RemoteResponderBundle, RemoteResponderEvent,
+    RemoteResponderHandlerDefinition, RemoteResponderOptions, RemoteResponderStatus,
+    RemoteResponderStatusState, WireBridgeAck, WireBridgeAttempt, WireBridgeBundle,
+    WireBridgeCommand, WireBridgeEnvelope, WireBridgeEnvelopeError, WireBridgeEnvelopeInput,
+    WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeInbound, WireBridgeIngress,
+    WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload, WireBridgeReceipt,
+    WireBridgeStatus, WireBridgeStatusState,
 };
 pub use adapters::bridge_protobuf::{
-    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_frame,
+    decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_cause,
     decode_wire_bridge_protobuf_bytes, encode_canonical_wire_bridge_envelope,
-    encode_canonical_wire_edge_frame, encode_wire_bridge_protobuf_bytes, CanonicalProtobufError,
+    encode_canonical_wire_edge_cause, encode_wire_bridge_protobuf_bytes, CanonicalProtobufError,
     CanonicalProtobufErrorCategory, CanonicalWireBridgeDataBody, CanonicalWireBridgeEnvelope,
-    CanonicalWireBridgeMetadata, CanonicalWireBridgePayload, CanonicalWireEdgeFrame,
-    CanonicalWireEdgeKind, WireBridgeProtobufDataBody, WireBridgeProtobufDecode,
-    WireBridgeProtobufEncode, WireBridgeProtobufEnvelope, WireBridgeProtobufHelperShape,
-    WireBridgeProtobufIssue, WireBridgeProtobufPayload, WireBridgeProtobufStatus,
-    WireBridgeProtobufStatusKind, WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE,
+    CanonicalWireBridgeMetadata, CanonicalWireBridgePayload, CanonicalWireEdgeArrays,
+    CanonicalWireEdgeCause, CanonicalWireMessage, WireBridgeProtobufDataBody,
+    WireBridgeProtobufDecode, WireBridgeProtobufEncode, WireBridgeProtobufEnvelope,
+    WireBridgeProtobufHelperShape, WireBridgeProtobufIssue, WireBridgeProtobufPayload,
+    WireBridgeProtobufStatus, WireBridgeProtobufStatusKind, WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE,
 };
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
@@ -154,6 +152,10 @@ pub use adapters::reactive_collection_storage::{
     ReactiveCollectionPersistence, ReactiveCollectionPersistenceCursor,
     ReactiveCollectionPersistenceErrorFact, ReactiveCollectionPersistenceStatus,
     ReactiveCollectionPersistenceStatusFact,
+};
+pub use adapters::wire_edge_group::{
+    frame_sink, frame_source, wire_edge_group_in, wire_edge_group_out, FrameDeliver, WireEdgeCause,
+    WireEdgeGateValue, WireEdgeGroupIn, WireEdgeIssue, WireEdgeView,
 };
 #[cfg(feature = "tokio")]
 pub use async_driver::TokioLocalDriver;

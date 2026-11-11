@@ -2242,7 +2242,7 @@ fn c29_batch_delivers_nothing_before_commit() {
     s_log.borrow_mut().clear();
     let t_log: Rc<RefCell<Vec<Vec<i32>>>> = Rc::new(RefCell::new(Vec::new()));
     let t_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
-    let read = graphrefly::batch(|_| {
+    let read = g.batch(|_| {
         a.set(2);
         let t_log = t_log.clone();
         *t_unsub.borrow_mut() = Some(b.subscribe(move |msgs: &[Message<AnyValue>]| {
@@ -2290,7 +2290,7 @@ fn c29_batch_delivers_nothing_before_commit() {
     // A throwing body delivers nothing and drops its sets and requests.
     s_log.borrow_mut().clear();
     let thrown = catch_unwind(AssertUnwindSafe(|| {
-        graphrefly::batch(|_| {
+        g.batch(|_| {
             a.set(9);
             panic!("body boom");
         })
@@ -2301,9 +2301,9 @@ fn c29_batch_delivers_nothing_before_commit() {
 
     // A nested batch joins the outer one and returns its value.
     s_log.borrow_mut().clear();
-    let inner = graphrefly::batch(|_| {
+    let inner = g.batch(|_| {
         a.set(3);
-        graphrefly::batch(|_| {
+        g.batch(|_| {
             a.set(4);
             7
         })
@@ -2320,7 +2320,7 @@ fn c29_batch_delivers_nothing_before_commit() {
             next
         })
     };
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         a.set(record_and(Some(20)));
         a.set(30);
         a.set(record_and(Some(40)));
@@ -2332,7 +2332,7 @@ fn c29_batch_delivers_nothing_before_commit() {
 
     // A throwing function commits nothing, not even the set of B's input.
     let thrown = catch_unwind(AssertUnwindSafe(|| {
-        graphrefly::batch(|_| {
+        g.batch(|_| {
             c.set(101);
             a.set(graphrefly::StateWrite::from_fn(
                 |_: Option<&i32>| -> Option<i32> { panic!("write boom") },
@@ -2364,7 +2364,7 @@ fn c29_batch_delivers_nothing_before_commit() {
             }
             order.borrow_mut().push("cb".into());
             if first.replace(false) {
-                let r = graphrefly::batch(|_| {
+                let r = g.batch(|_| {
                     let seen = a.cache().unwrap_or(-1);
                     a.set(60);
                     seen
@@ -2447,7 +2447,7 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
     let (sp, slot) = driven_in(&g);
     let (log, _u) = record_arrays(&sp);
     log.borrow_mut().clear();
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         send(&slot, vec![data(7)]);
         let resolved = catch_unwind(AssertUnwindSafe(|| send(&slot, vec![Message::Resolved])));
         assert!(resolved.is_err(), "RESOLVED is the kernel's");
@@ -2464,7 +2464,7 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
             panic!("sink boom");
         }
     });
-    graphrefly::batch(|_| t.set(3));
+    g.batch(|_| t.set(3));
     assert_eq!(t.cache(), Some(3));
     assert!(reports.borrow().iter().any(|r| r.error == "sink boom"));
 }
@@ -2788,10 +2788,11 @@ fn c38_capture_and_restore() {
     assert_eq!(again.nodes, checkpoint.nodes);
 
     // Capture is refused inside a wave and inside a batch body.
-    let in_batch = graphrefly::batch(|_| g.checkpoint().map(|_| ()));
+    let in_batch = g.batch(|_| g.checkpoint().map(|_| ()));
     assert!(in_batch.is_err());
     let in_wave: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
-    let trigger = Node::<i32>::state_empty();
+    // The trigger is in g: a capture of g during g's own wave is refused.
+    let trigger = g.state_empty::<i32>();
     let _ut = {
         let (g, in_wave) = (g.clone(), in_wave.clone());
         trigger.subscribe(move |msgs: &[Message<AnyValue>]| {
@@ -3114,4 +3115,99 @@ fn host_reporter_is_the_graph_option() {
     assert_eq!(lone.cache(), Some(1));
     assert_eq!(reports_a.borrow().len(), 1);
     assert_eq!(reports_b.borrow().len(), 1);
+}
+
+/// C-47 — graphs on one thread share no wave, request queue or batch
+/// (R-graph-domain@3).
+#[test]
+fn c47_graphs_on_one_thread_share_no_wave_queue_or_batch() {
+    use serde_json::{json, Value};
+    let g1 = graphrefly::graph();
+    let g2 = graphrefly::graph();
+    let a = g1.state_opts(json!(0), graphrefly::GraphNodeOpts::named("a"));
+    let c = g1.state_opts(json!(0), graphrefly::GraphNodeOpts::named("c"));
+    let b = g2.state_opts(json!(0), graphrefly::GraphNodeOpts::named("b"));
+    let order: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let captures: Rc<RefCell<Option<(bool, bool)>>> = Rc::new(RefCell::new(None));
+    let first = Rc::new(Cell::new(true));
+    let _s1 = {
+        let (b, g1, g2, order, captures, first) = (
+            b.clone(),
+            g1.clone(),
+            g2.clone(),
+            order.clone(),
+            captures.clone(),
+            first.clone(),
+        );
+        a.subscribe(move |msgs: &[Message<AnyValue>]| {
+            let is_one = msgs.iter().any(
+                |m| matches!(m, Message::Data(v) if v.downcast_ref::<Value>() == Some(&json!(1))),
+            );
+            if !is_one || !first.replace(false) {
+                return;
+            }
+            order.borrow_mut().push("s1 writes b".into());
+            b.set(json!(1));
+            order
+                .borrow_mut()
+                .push(format!("s1 after write, b={}", b.cache().unwrap()));
+            *captures.borrow_mut() = Some((g1.checkpoint().is_ok(), g2.checkpoint().is_ok()));
+            order.borrow_mut().push("a's wave ends".into());
+        })
+    };
+    let _s2 = {
+        let (c, order) = (c.clone(), order.clone());
+        b.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if let Some(Message::Data(v)) = msgs.iter().find(|m| matches!(m, Message::Data(_))) {
+                let v = v.downcast_ref::<Value>().cloned().unwrap();
+                if v == json!(1) {
+                    order.borrow_mut().push(format!("s2 sees b={v}"));
+                    c.set(json!(9));
+                    order.borrow_mut().push("s2 after write of c".into());
+                }
+            }
+        })
+    };
+    let _sc = {
+        let order = order.clone();
+        c.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(
+                |m| matches!(m, Message::Data(v) if v.downcast_ref::<Value>() == Some(&json!(9))),
+            ) {
+                order.borrow_mut().push("c's wave".into());
+            }
+        })
+    };
+    order.borrow_mut().clear();
+    a.set(json!(1));
+    assert_eq!(
+        *order.borrow(),
+        vec![
+            "s1 writes b",
+            "s2 sees b=1",
+            "s2 after write of c",
+            "s1 after write, b=1",
+            "a's wave ends",
+            "c's wave",
+        ],
+        "b's wave runs at once; the write of c waits for g1's wave"
+    );
+    assert_eq!(
+        *captures.borrow(),
+        Some((false, true)),
+        "g1 is in its wave, g2 is idle"
+    );
+
+    // In a g1 batch body, the write of b is g2's own request and runs at once.
+    let (a_log, _ua) = record_arrays(&a);
+    a_log.borrow_mut().clear();
+    let read = g1.batch(|_| {
+        a.set(json!(2));
+        b.set(json!(5));
+        let read = b.cache();
+        assert!(arrays(&a_log).is_empty(), "a's write waits for the commit");
+        read
+    });
+    assert_eq!(read, Some(json!(5)), "the read sees b's new value");
+    assert_eq!(arrays(&a_log), vec![shape(&["PENDING", "DATA"])]);
 }

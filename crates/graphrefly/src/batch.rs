@@ -25,7 +25,7 @@ use std::rc::Rc;
 
 use crate::node::{
     boundary_root_for, clear_deferred_boundary_root, commit_batched_waves,
-    drain_committed_boundary_root, BatchTarget, BoundaryRoot, Core,
+    drain_committed_boundary_root, BatchTarget, BoundaryRoot, Core, Domain, DomainRef,
 };
 use crate::protocol::{AnyValue, Message, Wave};
 
@@ -70,7 +70,7 @@ fn ends_with_terminal(items: &[Staged]) -> bool {
         .is_some_and(|msgs| msgs.last().is_some_and(Message::is_terminal))
 }
 
-struct ActiveBatch {
+pub(crate) struct ActiveBatch {
     targets: Vec<BatchTarget>,
     order: Vec<usize>,
     deferred: Vec<Option<StagedItems>>,
@@ -94,32 +94,40 @@ impl ActiveBatch {
     }
 }
 
-thread_local! {
-    static ACTIVE_BATCH: RefCell<Option<ActiveBatch>> = const { RefCell::new(None) };
+/// A graph's open batch frame: each graph (its domain) has its own
+/// (R-graph-domain@3).
+pub(crate) type BatchCell = RefCell<Option<ActiveBatch>>;
+
+fn with_batch<R>(d: &Domain, f: impl FnOnce(&BatchCell) -> R) -> R {
+    f(&d.batch)
 }
 
 /// True while a batch frame is open. Boundary drains are blocked for the whole frame,
 /// including the commit loop, so queued topology applies only after the committed view.
-pub(crate) fn boundary_drains_blocked() -> bool {
-    ACTIVE_BATCH.with(|b| b.borrow().is_some())
+pub(crate) fn boundary_drains_blocked(d: &Domain) -> bool {
+    with_batch(d, |b| b.borrow().is_some())
 }
 
-pub(crate) fn collecting_batch() -> bool {
-    ACTIVE_BATCH.with(|b| b.borrow().as_ref().is_some_and(|batch| batch.collecting))
+pub(crate) fn collecting_batch(d: &Domain) -> bool {
+    with_batch(d, |b| {
+        b.borrow().as_ref().is_some_and(|batch| batch.collecting)
+    })
 }
 
 /// Return the active batch's commit token for boundary tasks caused while the
 /// batch frame is open. The token flips only after commit succeeds; rollback or
 /// commit failure leaves it false so cleanup can drop only uncommitted tasks.
-pub(crate) fn active_batch_committed_token() -> Option<Rc<Cell<bool>>> {
-    ACTIVE_BATCH.with(|b| b.borrow().as_ref().map(|batch| batch.committed.clone()))
+pub(crate) fn active_batch_committed_token(d: &Domain) -> Option<Rc<Cell<bool>>> {
+    with_batch(d, |b| {
+        b.borrow().as_ref().map(|batch| batch.committed.clone())
+    })
 }
 
 /// Remember that a graph-local committed-boundary task was queued during this batch.
 /// Some tasks do not also create a tier>=3 batched wave, so they need their graph root
 /// included in the post-commit drain/rollback cleanup set (R-rewire-batch-boundary).
 pub(crate) fn register_boundary_root(target: &Core) {
-    ACTIVE_BATCH.with(|b| {
+    with_batch(&target.domain(), |b| {
         let mut active = b.borrow_mut();
         let Some(batch) = active.as_mut() else {
             return;
@@ -173,7 +181,7 @@ pub(crate) fn stage_write(target: &Core, write: StagedWrite) -> bool {
 }
 
 fn stage(target: &Core, push: impl FnOnce(&mut StagedItems)) -> bool {
-    ACTIVE_BATCH.with(|b| {
+    with_batch(&target.domain(), |b| {
         let mut active = b.borrow_mut();
         let Some(batch) = active.as_mut() else {
             return false;
@@ -206,7 +214,7 @@ pub(crate) fn assert_stageable(target: &Core, wave: &[Message<AnyValue>]) {
     if wave.is_empty() {
         return;
     }
-    ACTIVE_BATCH.with(|b| {
+    with_batch(&target.domain(), |b| {
         let active = b.borrow();
         let Some(batch) = active.as_ref().filter(|batch| batch.collecting) else {
             return;
@@ -236,8 +244,8 @@ struct BatchFinish {
     explicit_rollback: bool,
 }
 
-fn take_for_finish() -> BatchFinish {
-    ACTIVE_BATCH.with(|b| {
+fn take_for_finish(d: &Domain) -> BatchFinish {
+    with_batch(d, |b| {
         let mut active = b.borrow_mut();
         let batch = active.as_mut().expect("batch frame installed");
         batch.collecting = false;
@@ -252,8 +260,8 @@ fn take_for_finish() -> BatchFinish {
     })
 }
 
-fn clear_active() {
-    ACTIVE_BATCH.with(|b| {
+fn clear_active(d: &Domain) {
+    with_batch(d, |b| {
         *b.borrow_mut() = None;
     });
 }
@@ -341,8 +349,8 @@ fn boundary_graph_roots(
     roots
 }
 
-fn take_late_boundary_roots() -> Vec<BoundaryRoot> {
-    ACTIVE_BATCH.with(|b| {
+fn take_late_boundary_roots(d: &Domain) -> Vec<BoundaryRoot> {
+    with_batch(d, |b| {
         let mut active = b.borrow_mut();
         active
             .as_mut()
@@ -406,6 +414,7 @@ fn remember_first_boundary_panic(
 }
 
 fn rollback_and_cleanup(
+    d: &Domain,
     targets: Vec<BatchTarget>,
     order: Vec<usize>,
     mut task_roots: Vec<BoundaryRoot>,
@@ -413,35 +422,43 @@ fn rollback_and_cleanup(
     // Nothing was delivered before the commit, so a rollback only drops what was
     // staged (R-request-order): there is nothing to undo or balance.
     let core_roots = boundary_graph_roots(&targets, &order, &[]);
-    let late_roots = take_late_boundary_roots();
+    let late_roots = take_late_boundary_roots(d);
     append_boundary_roots(&mut task_roots, &core_roots, late_roots);
-    clear_active();
+    clear_active(d);
     clear_boundary_for_roots(&core_roots, &task_roots);
     Ok(())
 }
 
-/// Run `f` as a declarative batch (D12): success commits, panic/rollback discards.
+/// Run `f` as a batch of the default domain, the one nodes built outside any Graph
+/// live in (R-graph-domain@3): success commits, panic/rollback discards. A graph's
+/// batch is [`crate::Graph::batch`]; a write to another domain inside the body is that
+/// domain's own request, not part of this commit.
 ///
 /// Nested batches join the outer frame; the outermost frame owns commit/rollback.
 pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
-    if let Some(rolled_back) =
-        ACTIVE_BATCH.with(|b| b.borrow().as_ref().map(|batch| batch.rolled_back.clone()))
-    {
+    batch_in(&crate::node::default_domain(), f)
+}
+
+/// A batch of domain `d` (R-request-order@2, R-graph-domain@3).
+pub(crate) fn batch_in<R>(d: &DomainRef, f: impl FnOnce(&BatchCtx) -> R) -> R {
+    if let Some(rolled_back) = with_batch(d, |b| {
+        b.borrow().as_ref().map(|batch| batch.rolled_back.clone())
+    }) {
         return f(&BatchCtx { rolled_back });
     }
 
     let committed = Rc::new(Cell::new(false));
     let rolled_back = Rc::new(Cell::new(false));
-    ACTIVE_BATCH.with(|b| {
+    with_batch(d, |b| {
         *b.borrow_mut() = Some(ActiveBatch::new(committed.clone(), rolled_back.clone()));
     });
 
     let ctx = BatchCtx {
         rolled_back: rolled_back.clone(),
     };
-    let request_mark = crate::node::request_mark();
+    let request_mark = crate::node::request_mark(d);
     let result = catch_unwind(AssertUnwindSafe(|| f(&ctx)));
-    let finish = take_for_finish();
+    let finish = take_for_finish(d);
     let boundary_core_roots =
         boundary_graph_roots(&finish.targets, &finish.order, &finish.deferred);
     let mut boundary_task_roots = Vec::new();
@@ -454,16 +471,16 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
     match result {
         Ok(value) => {
             if finish.explicit_rollback {
-                crate::node::drop_requests_after(request_mark);
+                crate::node::drop_requests_after(d, request_mark);
                 if let Err(payload) =
-                    rollback_and_cleanup(finish.targets, finish.order, boundary_task_roots)
+                    rollback_and_cleanup(d, finish.targets, finish.order, boundary_task_roots)
                 {
                     resume_unwind(payload);
                 }
-            } else if crate::node::in_wave() {
+            } else if crate::node::in_wave(d) {
                 // The commit is a request: during a wave it runs after the wave, and
                 // the body's topology requests run after it (R-request-order@2).
-                clear_active();
+                clear_active(d);
                 let BatchFinish {
                     targets,
                     deferred,
@@ -472,13 +489,13 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
                 } = finish;
                 // The body's own requests run right after its commit, before any
                 // request the commit wave makes.
-                let body_requests = crate::node::take_requests_after(request_mark);
+                let body_requests = crate::node::take_requests_after(d, request_mark);
                 // A commit spanning domains reports to its first target's.
                 let reporter = targets
                     .first()
                     .and_then(BatchTarget::borrowed_core)
                     .and_then(|core| core.reporter());
-                crate::node::request_reporting(reporter, move || {
+                crate::node::request_reporting(d, reporter, move || {
                     committed.set(true);
                     let failed = match resolve(&targets, deferred) {
                         Ok(resolved) => {
@@ -503,34 +520,34 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
                         // A failed write function commits nothing; the body's topology
                         // requests still run, then the failure reaches the caller.
                         finish.committed.set(true);
-                        clear_active();
+                        clear_active(d);
                         drain_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
-                        crate::node::drain_requests();
+                        crate::node::drain_requests(d);
                         resume_unwind(payload);
                     }
                 };
                 let commit_result =
                     catch_unwind(AssertUnwindSafe(|| commit(&finish.targets, resolved)));
-                let late_roots = take_late_boundary_roots();
+                let late_roots = take_late_boundary_roots(d);
                 append_boundary_roots(&mut boundary_task_roots, &boundary_core_roots, late_roots);
                 if let Err(payload) = commit_result {
-                    clear_active();
+                    clear_active(d);
                     clear_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
-                    crate::node::drain_requests();
+                    crate::node::drain_requests(d);
                     resume_unwind(payload);
                 }
                 finish.committed.set(true);
-                clear_active();
+                clear_active(d);
                 drain_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
                 // Requests made during the commit's waves run after it.
-                crate::node::drain_requests();
+                crate::node::drain_requests(d);
             }
             value
         }
         Err(payload) => {
-            crate::node::drop_requests_after(request_mark);
+            crate::node::drop_requests_after(d, request_mark);
             if let Err(rollback_payload) =
-                rollback_and_cleanup(finish.targets, finish.order, boundary_task_roots)
+                rollback_and_cleanup(d, finish.targets, finish.order, boundary_task_roots)
             {
                 resume_unwind(rollback_payload);
             }

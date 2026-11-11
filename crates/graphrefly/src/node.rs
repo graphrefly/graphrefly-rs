@@ -397,6 +397,11 @@ impl GraphArena {
         DEFAULT_GRAPH_CORE.with(|graph| Self(graph.clone()))
     }
 
+    /// The arena's concurrency domain.
+    pub(crate) fn domain(&self) -> DomainRef {
+        graph_domain(&self.0)
+    }
+
     /// A new arena whose failures go to `reporter` (a Graph's `report` option).
     pub(crate) fn with_reporter(reporter: Option<crate::report::HostReporter>) -> Self {
         let arena = Self::new();
@@ -420,8 +425,53 @@ struct GraphCore {
     free: Vec<usize>,
     deferred_boundary: VecDeque<BoundaryTask>,
     draining_boundary: bool,
-    /// The domain's host reporter (R-failure@3, R-graph-domain@2).
+    /// The domain's host reporter (R-failure@3, R-graph-domain@3).
     reporter: Option<crate::report::HostReporter>,
+    /// The graph's wave, request queue and batch (R-graph-domain@3).
+    domain: DomainRef,
+}
+
+/// A graph's concurrency domain (R-graph-domain@3): its own wave scope, delivery
+/// scope, request queue and batch frame. Graphs on one thread share none of them: a
+/// request to one graph is never held by another graph's wave or batch. Nodes built
+/// outside any Graph live in the default arena, whose domain is one per thread.
+pub(crate) struct Domain {
+    wave: RefCell<Option<WaveScope>>,
+    delivery_depth: Cell<usize>,
+    current_delivery_id: Cell<u64>,
+    deferred_delivery: RefCell<Vec<DeferredDeliveryAction>>,
+    requests: RefCell<VecDeque<QueuedRequest>>,
+    draining: Cell<bool>,
+    pub(crate) batch: crate::batch::BatchCell,
+}
+
+pub(crate) type DomainRef = Rc<Domain>;
+
+impl Domain {
+    fn new() -> DomainRef {
+        Rc::new(Self {
+            wave: RefCell::new(None),
+            delivery_depth: Cell::new(0),
+            current_delivery_id: Cell::new(0),
+            deferred_delivery: RefCell::new(Vec::new()),
+            requests: RefCell::new(VecDeque::new()),
+            draining: Cell::new(false),
+            batch: RefCell::new(None),
+        })
+    }
+}
+
+fn graph_domain(graph: &RefCell<GraphCore>) -> DomainRef {
+    graph.borrow().domain.clone()
+}
+
+/// The domain of nodes built outside any Graph: the default arena's.
+pub(crate) fn default_domain() -> DomainRef {
+    DEFAULT_GRAPH_CORE.with(|graph| graph_domain(graph))
+}
+
+fn with_wave<R>(d: &Domain, f: impl FnOnce(&RefCell<Option<WaveScope>>) -> R) -> R {
+    f(&d.wave)
 }
 
 type TakenNodeSlot = (
@@ -453,6 +503,7 @@ impl GraphCore {
             deferred_boundary: VecDeque::new(),
             draining_boundary: false,
             reporter: None,
+            domain: Domain::new(),
         }
     }
 
@@ -1729,10 +1780,11 @@ impl CoreWeak {
     fn receive_from_dep(&self, idx: usize, msgs: &[Msg]) {
         // DR-8/B54 receive policy: during a wave, pin through the wave's touched set and
         // run through a borrowed arena view; outside a wave, pin first.
-        if wave_in_flight() {
-            let Some(graph) = self.graph.upgrade() else {
-                return;
-            };
+        let Some(graph) = self.graph.upgrade() else {
+            return;
+        };
+        let d = graph_domain(&graph);
+        if wave_in_flight(&d) {
             let Some(refs) = self.refs.upgrade() else {
                 return;
             };
@@ -1740,7 +1792,7 @@ impl CoreWeak {
                 graph: Rc::as_ptr(&graph) as usize,
                 node: self.key,
             };
-            let registered = WAVE.with(|w| {
+            let registered = with_wave(&d, |w| {
                 let mut wave = w.borrow_mut();
                 let Some(scope) = wave.as_mut() else {
                     return false;
@@ -2060,22 +2112,14 @@ impl WaveScope {
 }
 
 thread_local! {
-    /// The current wave's scope, if a wave is in flight (single-thread, D22 ⇒
-    /// thread-local, like the default dispatcher D26). `Some` ⇔ inside a wave.
-    static WAVE: RefCell<Option<WaveScope>> = const { RefCell::new(None) };
+    // Id counters only: the wave and delivery state itself is the domain's.
     static NEXT_WAVE_SCOPE_ID: Cell<u64> = const { Cell::new(1) };
-    /// Downstream delivery depth for one `down(msgs)` wave. A dep may receive
-    /// multiple DATA messages before its dirty contribution is cleared; the fn
-    /// must see the full batch once, not run once per DATA occurrence.
-    static DELIVERY_DEPTH: Cell<usize> = const { Cell::new(0) };
     static NEXT_DELIVERY_ID: Cell<u64> = const { Cell::new(1) };
-    static CURRENT_DELIVERY_ID: Cell<u64> = const { Cell::new(0) };
-    static DEFERRED_DELIVERY_ACTIONS: RefCell<Vec<DeferredDeliveryAction>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `true` while a wave is in flight on this thread (a scope is installed).
-fn wave_in_flight() -> bool {
-    WAVE.with(|w| w.borrow().is_some())
+/// `true` while a wave of domain `d` is in flight (a scope is installed).
+fn wave_in_flight(d: &Domain) -> bool {
+    d.wave.borrow().is_some()
 }
 
 fn next_wave_scope_id() -> u64 {
@@ -2089,7 +2133,7 @@ fn next_wave_scope_id() -> u64 {
 /// Register a node as a wave participant (for the B25 touched-set reset). No-op if
 /// no wave is in flight (e.g. a `cache` read outside any wave).
 fn wave_register(core: &Core) {
-    WAVE.with(|w| {
+    with_wave(&core.domain(), |w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
             let _ = scope.pin_once(core.arena_node_key(), &core.graph, &core.refs);
         }
@@ -2097,7 +2141,7 @@ fn wave_register(core: &Core) {
 }
 
 fn wave_register_boundary_root(core: &Core) {
-    WAVE.with(|w| {
+    with_wave(&core.domain(), |w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
             if scope.owner_graph_id == Rc::as_ptr(&core.graph) as usize
                 || scope.boundary_roots.iter().any(|r| r.same_graph(core))
@@ -2109,51 +2153,53 @@ fn wave_register_boundary_root(core: &Core) {
     });
 }
 
-fn delivery_in_flight() -> bool {
-    DELIVERY_DEPTH.with(|depth| depth.get() > 0)
+/// Downstream delivery depth of domain `d`. A dep may receive multiple DATA messages
+/// before its pending mark is cleared; the fn must see the full batch once, not run
+/// once per DATA occurrence.
+fn delivery_in_flight(d: &Domain) -> bool {
+    d.delivery_depth.get() > 0
 }
 
 fn defer_settle_until_delivery_boundary(core: &Core) {
-    DEFERRED_DELIVERY_ACTIONS.with(|actions| {
-        let mut actions = actions.borrow_mut();
-        if !actions.iter().any(|action| action.matches(core)) {
-            actions.push(DeferredDeliveryAction::from_core(core));
-        }
-    });
+    let d = core.domain();
+    let mut actions = d.deferred_delivery.borrow_mut();
+    if !actions.iter().any(|action| action.matches(core)) {
+        actions.push(DeferredDeliveryAction::from_core(core));
+    }
 }
 
 struct DeliveryGuard {
     active: bool,
     prev_id: u64,
+    domain: DomainRef,
 }
 
 impl DeliveryGuard {
-    fn enter() -> Self {
-        let prev_id = CURRENT_DELIVERY_ID.with(Cell::get);
+    fn enter(domain: &DomainRef) -> Self {
+        let prev_id = domain.current_delivery_id.get();
         let id = NEXT_DELIVERY_ID.with(|next| {
             let id = next.get();
             next.set(id.wrapping_add(1).max(1));
             id
         });
-        CURRENT_DELIVERY_ID.with(|current| current.set(id));
-        DELIVERY_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        domain.current_delivery_id.set(id);
+        domain.delivery_depth.set(domain.delivery_depth.get() + 1);
         Self {
             active: true,
             prev_id,
+            domain: domain.clone(),
         }
     }
 
     fn finish(mut self) {
         self.active = false;
-        CURRENT_DELIVERY_ID.with(|current| current.set(self.prev_id));
-        let outer = DELIVERY_DEPTH.with(|depth| {
-            let current = depth.get();
-            debug_assert!(current > 0);
-            depth.set(current - 1);
-            current == 1
-        });
-        if outer {
-            drain_deferred_runs();
+        let d = &self.domain;
+        d.current_delivery_id.set(self.prev_id);
+        let current = d.delivery_depth.get();
+        debug_assert!(current > 0);
+        d.delivery_depth.set(current - 1);
+        if current == 1 {
+            drain_deferred_runs(d);
         }
     }
 }
@@ -2161,29 +2207,28 @@ impl DeliveryGuard {
 impl Drop for DeliveryGuard {
     fn drop(&mut self) {
         if self.active {
-            CURRENT_DELIVERY_ID.with(|current| current.set(self.prev_id));
-            DELIVERY_DEPTH.with(|depth| {
-                let current = depth.get();
-                if current > 0 {
-                    depth.set(current - 1);
-                }
-            });
-            if !std::thread::panicking() && !delivery_in_flight() {
-                drain_deferred_runs();
+            let d = &self.domain;
+            d.current_delivery_id.set(self.prev_id);
+            let current = d.delivery_depth.get();
+            if current > 0 {
+                d.delivery_depth.set(current - 1);
+            }
+            if !std::thread::panicking() && !delivery_in_flight(d) {
+                drain_deferred_runs(d);
             }
         }
     }
 }
 
-fn with_delivery_scope(body: impl FnOnce()) {
-    let guard = DeliveryGuard::enter();
+fn with_delivery_scope(domain: &DomainRef, body: impl FnOnce()) {
+    let guard = DeliveryGuard::enter(domain);
     body();
     guard.finish();
 }
 
-fn drain_deferred_runs() {
+fn drain_deferred_runs(d: &Domain) {
     loop {
-        let actions = DEFERRED_DELIVERY_ACTIONS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        let actions = std::mem::take(&mut *d.deferred_delivery.borrow_mut());
         if actions.is_empty() {
             break;
         }
@@ -2193,13 +2238,13 @@ fn drain_deferred_runs() {
     }
 }
 
-fn clear_deferred_delivery_actions() {
-    DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
+fn clear_deferred_delivery_actions(d: &Domain) {
+    d.deferred_delivery.borrow_mut().clear();
 }
 
 /// Record the node whose fn is about to run — the ERROR-bearing node on a panic.
 fn wave_set_blamed(core: &Core) {
-    WAVE.with(|w| {
+    with_wave(&core.domain(), |w| {
         if let Some(scope) = w.borrow_mut().as_mut() {
             scope.blamed = Some(core.arena_node_key());
         }
@@ -2216,16 +2261,9 @@ fn panic_to_error(payload: Box<dyn std::any::Any + Send>) -> GraphError {
     msg.into()
 }
 
-thread_local! {
-    /// Requests made while a wave is delivered, in the order they were made
-    /// (R-request-order@2). The outermost wave owner runs them after its wave ends.
-    static REQUESTS: RefCell<VecDeque<QueuedRequest>> = const { RefCell::new(VecDeque::new()) };
-    static DRAINING_REQUESTS: Cell<bool> = const { Cell::new(false) };
-}
-
-/// True while a wave is being delivered on this thread.
-pub(crate) fn in_wave() -> bool {
-    wave_in_flight()
+/// True while a wave of domain `d` is being delivered.
+pub(crate) fn in_wave(d: &Domain) -> bool {
+    wave_in_flight(d)
 }
 
 /// Subscribes `sink` to `core` now, under a wave owner.
@@ -2252,9 +2290,9 @@ fn requested_unsubscribe(domain: &Core, unsub: Unsub) -> Unsub {
     // Only the domain's reporter is needed: a weak arena handle, so the handle holds
     // no counted node reference.
     let domain = Rc::downgrade(&domain.graph);
-    Box::new(move || {
-        let reporter = domain.upgrade().and_then(|graph| graph_reporter(&graph));
-        request_reporting(reporter, unsub);
+    Box::new(move || match domain.upgrade() {
+        Some(graph) => request_reporting(&graph_domain(&graph), graph_reporter(&graph), unsub),
+        None => unsub(),
     })
 }
 
@@ -2272,17 +2310,22 @@ pub(crate) type QueuedRequest = (Option<crate::report::HostReporter>, Box<dyn Fn
 /// wave ends (R-request-order@2). Each queued request runs as its own wave, in order;
 /// its panic goes to its domain's reporter.
 pub(crate) fn request(domain: &Core, request: impl FnOnce() + 'static) {
-    request_reporting(domain.reporter(), request);
+    request_reporting(&domain.domain(), domain.reporter(), request);
 }
 
 /// [`request`] with the reporter given directly (a batch commit's first target's).
 pub(crate) fn request_reporting(
+    d: &Domain,
     reporter: Option<crate::report::HostReporter>,
     request: impl FnOnce() + 'static,
 ) {
-    // Inside a batch body a request waits for the commit (R-request-order@2).
-    if wave_in_flight() || crate::batch::collecting_batch() {
-        REQUESTS.with(|q| q.borrow_mut().push_back((reporter, Box::new(request))));
+    // Inside the domain's batch body a request waits for the commit
+    // (R-request-order@2); another domain's wave or batch never holds it
+    // (R-graph-domain@3).
+    if wave_in_flight(d) || crate::batch::collecting_batch(d) {
+        d.requests
+            .borrow_mut()
+            .push_back((reporter, Box::new(request)));
     } else {
         request();
     }
@@ -2291,24 +2334,22 @@ pub(crate) fn request_reporting(
 /// Runs the queued requests in order; a request queued while one runs joins the end.
 /// A request's panic has no caller left, so it goes to the host reporter.
 /// How many requests are queued now, for [`drop_requests_after`].
-pub(crate) fn request_mark() -> usize {
-    REQUESTS.with(|q| q.borrow().len())
+pub(crate) fn request_mark(d: &Domain) -> usize {
+    d.requests.borrow().len()
 }
 
 /// Takes the requests queued after `mark`: a batch body's requests, which run after
 /// its commit, or are dropped when the body throws (R-request-order@2).
-pub(crate) fn take_requests_after(mark: usize) -> Vec<QueuedRequest> {
-    REQUESTS.with(|q| {
-        let mut q = q.borrow_mut();
-        let keep = mark.min(q.len());
-        q.drain(keep..).collect()
-    })
+pub(crate) fn take_requests_after(d: &Domain, mark: usize) -> Vec<QueuedRequest> {
+    let mut q = d.requests.borrow_mut();
+    let keep = mark.min(q.len());
+    q.drain(keep..).collect()
 }
 
 /// Drops the requests queued after `mark`: a batch body that throws drops its
 /// requests (R-request-order@2).
-pub(crate) fn drop_requests_after(mark: usize) {
-    drop(take_requests_after(mark));
+pub(crate) fn drop_requests_after(d: &Domain, mark: usize) {
+    drop(take_requests_after(d, mark));
 }
 
 /// Runs one request taken from the queue; its panic goes to the host reporter.
@@ -2316,19 +2357,21 @@ pub(crate) fn run_queued_request((reporter, request): QueuedRequest) {
     run_reported(reporter.as_ref(), "queued request", request);
 }
 
-pub(crate) fn drain_requests() {
-    if DRAINING_REQUESTS.with(Cell::get) {
+pub(crate) fn drain_requests(d: &DomainRef) {
+    if d.draining.get() {
         return;
     }
-    struct Draining;
+    struct Draining(DomainRef);
     impl Drop for Draining {
         fn drop(&mut self) {
-            DRAINING_REQUESTS.with(|d| d.set(false));
+            self.0.draining.set(false);
         }
     }
-    DRAINING_REQUESTS.with(|d| d.set(true));
-    let _draining = Draining;
-    while let Some(next) = REQUESTS.with(|q| q.borrow_mut().pop_front()) {
+    d.draining.set(true);
+    let _draining = Draining(d.clone());
+    loop {
+        let next = d.requests.borrow_mut().pop_front();
+        let Some(next) = next else { break };
         run_queued_request(next);
     }
 }
@@ -2340,10 +2383,11 @@ pub(crate) fn drain_requests() {
 /// work inside the cascade) just run `body` — the outer owner owns the single catch;
 /// host requests made during the wave are queued instead (R-request-order@2).
 fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnOnce() -> R) -> R {
-    if wave_in_flight() {
+    let d = owner.domain();
+    if wave_in_flight(&d) {
         return body();
     }
-    WAVE.with(|w| {
+    with_wave(&d, |w| {
         *w.borrow_mut() = Some(WaveScope {
             owner_graph_id: Rc::as_ptr(&owner.graph) as usize,
             wave_id: next_wave_scope_id(),
@@ -2353,8 +2397,10 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
         });
     });
     let result = catch_unwind(AssertUnwindSafe(body));
-    let mut scope = WAVE
-        .with(|w| w.borrow_mut().take())
+    let mut scope = d
+        .wave
+        .borrow_mut()
+        .take()
         .expect("wave owner installed a scope");
     let boundary_roots = std::mem::take(&mut scope.boundary_roots);
     let ret = match result {
@@ -2369,7 +2415,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             // aborted before its guard could drain them, carrying those actions into a
             // later unrelated wave would resurrect stale dep projections after B25 has
             // already reset the touched nodes.
-            clear_deferred_delivery_actions();
+            clear_deferred_delivery_actions(&d);
             // A failure surfaces as ERROR on a node ON the failure path (D30) — a
             // fresh terminal wave.
             let blamed = scope
@@ -2391,7 +2437,7 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
             let _ = catch_unwind(AssertUnwindSafe(move || {
                 blamed.down(vec![Message::Error(err)]);
             }));
-            clear_deferred_delivery_actions();
+            clear_deferred_delivery_actions(&d);
             on_error()
         }
     };
@@ -2399,9 +2445,9 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
     // The wave has ended: drain the boundary tasks (a quiet node's later output) and
     // then the requests made during the wave, each as a wave of its own
     // (R-request-order@2). An open batch frame holds the drain until its commit.
-    if !boundary_drains_blocked() {
+    if !boundary_drains_blocked(&d) {
         drain_committed_boundaries(std::slice::from_ref(owner), &boundary_roots);
-        drain_requests();
+        drain_requests(&d);
     }
     ret
 }
@@ -2630,7 +2676,8 @@ impl Core {
     }
 
     pub(crate) fn runtime_is_quiescent_for_release(&self) -> bool {
-        if wave_in_flight() || delivery_in_flight() {
+        let d = self.domain();
+        if wave_in_flight(&d) || delivery_in_flight(&d) {
             return false;
         }
         let g = self.graph.borrow();
@@ -3233,11 +3280,18 @@ impl Core {
             self.mark_as_source();
         }
         let subs = self.with_aux(snapshot_subscribers);
-        with_delivery_scope(|| deliver_subscriber_snapshot(subs, &[snapshot]));
+        with_delivery_scope(&self.domain(), || {
+            deliver_subscriber_snapshot(subs, &[snapshot])
+        });
         self.with_inner_edges_mut(|_, e| e.wave.pending = false);
         if self.with_inner_edges(|_, e| e.value.terminal) {
             self.close_ended_lifetime();
         }
+    }
+
+    /// The concurrency domain this node runs in (R-graph-domain@3).
+    pub(crate) fn domain(&self) -> DomainRef {
+        graph_domain(&self.graph)
     }
 
     /// The host reporter of the domain this node runs in.
@@ -3350,7 +3404,7 @@ impl Core {
     }
 
     fn schedule_settle(&self) {
-        if delivery_in_flight() {
+        if delivery_in_flight(&self.domain()) {
             defer_settle_until_delivery_boundary(self);
         } else {
             self.settle();
@@ -3571,7 +3625,7 @@ impl Core {
             BoundaryTask::Down {
                 target: CoreToken::from_core(self),
                 frames: prepare_output(msgs),
-                committed: active_batch_committed_token()
+                committed: active_batch_committed_token(&self.domain())
                     .unwrap_or_else(|| Rc::new(Cell::new(true))),
             },
         );
@@ -3885,7 +3939,7 @@ impl Core {
         if frames.is_empty() {
             return;
         }
-        let frames = if collecting_batch() {
+        let frames = if collecting_batch(&self.domain()) {
             let flat: Wave<AnyValue> = frames.into_iter().flatten().collect();
             if defer_to_batch(self, flat) {
                 return;
@@ -4005,7 +4059,7 @@ impl Core {
             })
             .collect();
         let subs = self.with_aux(snapshot_subscribers);
-        with_delivery_scope(|| deliver_subscriber_snapshot(subs, &out));
+        with_delivery_scope(&self.domain(), || deliver_subscriber_snapshot(subs, &out));
         if self.with_inner_edges(|_, e| e.value.terminal) {
             self.close_ended_lifetime();
         }
@@ -4047,7 +4101,7 @@ impl Core {
     /// its lifetime, so it is dropped at the commit if that lifetime has closed by
     /// then (R-request-order@2).
     pub(crate) fn owned_down_from(&self, lifetime: u64, msgs: Wave<AnyValue>) {
-        if crate::batch::collecting_batch() {
+        if crate::batch::collecting_batch(&self.domain()) {
             if self.with_inner_edges(|_, e| e.value.terminal) {
                 return;
             }
@@ -4061,7 +4115,8 @@ impl Core {
     }
 
     pub(crate) fn owned_down(&self, msgs: Wave<AnyValue>) {
-        if crate::batch::collecting_batch() || !wave_in_flight() {
+        let d = self.domain();
+        if crate::batch::collecting_batch(&d) || !wave_in_flight(&d) {
             with_wave_owner(self, || self.down(msgs), || {});
             return;
         }
@@ -4092,7 +4147,7 @@ impl Core {
             BoundaryTask::Down {
                 target: CoreToken::from_core(self),
                 frames,
-                committed: active_batch_committed_token()
+                committed: active_batch_committed_token(&self.domain())
                     .unwrap_or_else(|| Rc::new(Cell::new(true))),
             },
         );
@@ -4470,7 +4525,8 @@ impl<T: 'static> Node<T> {
         crate::batch::assert_stageable(&self.core, &msgs);
         // Inside a batch body the input is staged at once; during a wave it is a
         // request that runs after the wave (R-request-order@2).
-        if crate::batch::collecting_batch() || !wave_in_flight() {
+        let d = self.core.domain();
+        if crate::batch::collecting_batch(&d) || !wave_in_flight(&d) {
             with_wave_owner(&self.core, || self.core.down(msgs), || {});
             return;
         }
@@ -4527,7 +4583,8 @@ impl<T: 'static> Node<T> {
         let sink: Sink = Rc::new(crate::report::guard_sink(sink, move || {
             domain.upgrade().and_then(|graph| graph_reporter(&graph))
         }));
-        if !wave_in_flight() && !crate::batch::collecting_batch() {
+        let d = self.core.domain();
+        if !wave_in_flight(&d) && !crate::batch::collecting_batch(&d) {
             return requested_unsubscribe(&self.core, subscribe_now(&self.core, sink, kind));
         }
         // During a wave, or in a batch body, the subscription is a request that runs
@@ -4546,10 +4603,12 @@ impl<T: 'static> Node<T> {
         Box::new(move || {
             let state = std::mem::replace(&mut *slot.borrow_mut(), QueuedSubscription::Cancelled);
             if let QueuedSubscription::Active(unsub) = state {
-                let reporter = domain_core
-                    .upgrade()
-                    .and_then(|graph| graph_reporter(&graph));
-                request_reporting(reporter, unsub);
+                match domain_core.upgrade() {
+                    Some(graph) => {
+                        request_reporting(&graph_domain(&graph), graph_reporter(&graph), unsub);
+                    }
+                    None => unsub(),
+                }
             }
         })
     }
@@ -4660,7 +4719,7 @@ impl<T: 'static> State<T> {
             let current = current.as_ref().and_then(|v| v.downcast_ref::<T>());
             f(current).map(|v| Rc::new(v) as AnyValue)
         });
-        if crate::batch::collecting_batch() {
+        if crate::batch::collecting_batch(&self.node.core.domain()) {
             // A write after a terminal staged for this state is refused, as a value
             // write is (R-wave: a terminal is last).
             crate::batch::assert_stageable(&self.node.core, &[Message::Complete]);
@@ -5369,7 +5428,7 @@ mod tests {
     fn sink_panic_does_not_abort_the_wave() {
         // R-failure@3: a panicking sink on the source neither aborts the fanout nor
         // leaves queued delivery work behind; the dependent still runs once.
-        DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
+        default_domain().deferred_delivery.borrow_mut().clear();
 
         let source = Node::<i32>::state_empty();
         let runs = Rc::new(Cell::new(0usize));
@@ -5391,12 +5450,10 @@ mod tests {
         source.set(1);
 
         assert_eq!(runs.get(), 1, "the dependent still runs once");
-        DEFERRED_DELIVERY_ACTIONS.with(|queued| {
-            assert!(
-                queued.borrow().is_empty(),
-                "no delivery work is left queued"
-            );
-        });
+        assert!(
+            default_domain().deferred_delivery.borrow().is_empty(),
+            "no delivery work is left queued"
+        );
         source.set(2);
         assert_eq!(runs.get(), 2);
     }
@@ -5576,7 +5633,7 @@ mod tests {
                 wave_register(&victim.core);
                 wave_register(&victim.core);
                 wave_register(&victim.core);
-                WAVE.with(|w| {
+                with_wave(&victim.core.domain(), |w| {
                     let wave = w.borrow();
                     let scope = wave.as_ref().expect("wave installed");
                     assert_eq!(scope.touched.len(), 1);
@@ -6039,7 +6096,7 @@ mod tests {
             let initial_refs = refs.get();
             assert_eq!(initial_refs, 1);
 
-            crate::batch::batch({
+            crate::batch::batch_in(&arena.domain(), {
                 let graph = graph.clone();
                 let refs = refs.clone();
                 move |_| {
@@ -6069,7 +6126,7 @@ mod tests {
         let source = Node::<i32>::state_in_arena(&arena, 0);
         let refs = source.core.refs.clone();
         let key = source.core.key();
-        crate::batch::batch({
+        crate::batch::batch_in(&arena.domain(), {
             let graph = graph.clone();
             let refs = refs.clone();
             move |bctx| {
@@ -6232,7 +6289,7 @@ mod tests {
             &owner.core,
             || {
                 wave_register(&reused.core);
-                WAVE.with(|w| {
+                with_wave(&reused.core.domain(), |w| {
                     w.borrow_mut().as_mut().expect("wave installed").blamed = Some(old_arena_key);
                 });
                 panic!("stale blame");
@@ -6254,10 +6311,10 @@ mod tests {
 
     #[test]
     fn blame_key_is_arena_qualified_for_nested_cross_arena_panic() {
-        // DR-8/B54: WAVE is thread-local, so a nested public call into another
-        // GraphArena shares the outer wave-owner scope. Two independent arenas can
-        // both have slot 0/generation 0; blame lookup must include arena identity or
-        // the recovery ERROR can land on the wrong same-key node.
+        // DR-8/B54: each arena has its own wave (R-graph-domain@3), so a nested public
+        // call into another GraphArena runs as that arena's own wave. Two arenas can
+        // both have slot 0/generation 0; blame stays arena-qualified, so the recovery
+        // ERROR lands on the node that panicked.
         let arena_a = GraphArena::new();
         let arena_b = GraphArena::new();
         let outer = Node::<i32>::state_empty_in_arena(&arena_a);

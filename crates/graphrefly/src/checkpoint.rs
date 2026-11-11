@@ -994,12 +994,13 @@ pub fn restore_graph(
 
 fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
     // A checkpoint is taken only at a wave boundary (R-checkpoint@1).
-    if crate::node::in_wave() {
+    let domain = graph.domain();
+    if crate::node::in_wave(&domain) {
         return Err(GraphRestoreError::new(
             "checkpoint: refused inside a wave (R-checkpoint)",
         ));
     }
-    if crate::batch::collecting_batch() {
+    if crate::batch::collecting_batch(&domain) {
         return Err(GraphRestoreError::new(
             "checkpoint: refused inside a batch body (R-checkpoint)",
         ));
@@ -1960,7 +1961,7 @@ mod tests {
     fn checkpoint_is_refused_inside_a_wave_or_a_batch_body() {
         let g = crate::graph::graph();
         let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let in_batch = crate::batch(|_| g.checkpoint().map(|_| ()));
+        let in_batch = g.batch(|_| g.checkpoint().map(|_| ()));
         assert!(in_batch.unwrap_err().to_string().contains("batch body"));
         let in_wave = Rc::new(RefCell::new(None));
         let _sub = {

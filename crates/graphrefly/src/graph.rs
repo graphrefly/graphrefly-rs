@@ -10,7 +10,7 @@ use std::fmt;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
-use crate::batch::{batch as run_batch, BatchCtx};
+use crate::batch::BatchCtx;
 use crate::checkpoint::GraphCheckpointJson;
 use crate::ctx::{Ctx, DepRecord, DepTerminal};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
@@ -659,7 +659,13 @@ impl Graph {
 
     /// Declarative batch (D12): success commits, rollback/panic discards.
     pub fn batch<R>(&self, f: impl FnOnce(&BatchCtx) -> R) -> R {
-        run_batch(f)
+        // The graph's own batch (R-graph-domain@3).
+        crate::batch::batch_in(&self.inner.arena.domain(), f)
+    }
+
+    /// The graph's concurrency domain.
+    pub(crate) fn domain(&self) -> crate::node::DomainRef {
+        self.inner.arena.domain()
     }
 
     /// Instantiate a free-standing operator/source as a registered graph node (D43/D40).
