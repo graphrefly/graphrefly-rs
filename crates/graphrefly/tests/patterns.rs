@@ -1727,9 +1727,9 @@ fn agentic_memory_record_persistence_writes_frames_flushes_and_disposes() {
     let g = graph();
     let records = g.state_opts(vec![json_record("a", "a")], GraphNodeOpts::named("records"));
     let persistence = persist_agentic_memory_records(
+        &g,
         &records,
         PersistAgenticMemoryRecordsOptions {
-            graph: Some(g.clone()),
             name: Some("agenticPersistence".to_owned()),
             storage_prefix: Some("agentic-sidecar".to_owned()),
             snapshot_key: None,
@@ -1791,9 +1791,9 @@ fn agentic_memory_record_persist_observes_existing_node_without_hydrating_from_s
         GraphNodeOpts::named("records"),
     );
     let persistence = persist_agentic_memory_records(
+        &g,
         &records,
         PersistAgenticMemoryRecordsOptions {
-            graph: Some(g),
             name: Some("agenticNoHydrate".to_owned()),
             storage_prefix: Some("agentic-no-hydrate".to_owned()),
             snapshot_key: None,
@@ -1823,9 +1823,9 @@ fn agentic_memory_record_persistence_surfaces_change_write_errors_as_graph_facts
     let g = graph();
     let records = g.state_opts(vec![json_record("a", "a")], GraphNodeOpts::named("records"));
     let persistence = persist_agentic_memory_records(
+        &g,
         &records,
         PersistAgenticMemoryRecordsOptions {
-            graph: Some(g),
             name: Some("agenticFailingPersistence".to_owned()),
             storage_prefix: Some("agentic-failing".to_owned()),
             snapshot_key: None,
@@ -1882,7 +1882,6 @@ fn open_persistent_agentic_memory_records_preserves_loaded_change_cursor_on_atta
             name: Some("agenticOpenCursor".to_owned()),
             initial: Vec::new(),
             persistence: PersistAgenticMemoryRecordsOptions {
-                graph: None,
                 name: Some("agenticOpenCursor.persistence".to_owned()),
                 storage_prefix: Some("agentic-open-cursor".to_owned()),
                 snapshot_key: None,
@@ -1916,7 +1915,6 @@ fn open_persistent_agentic_memory_records_uses_initial_and_rejects_corruption() 
             name: Some("agenticRecords".to_owned()),
             initial: vec![json_record("initial", "initial")],
             persistence: PersistAgenticMemoryRecordsOptions {
-                graph: None,
                 name: Some("agenticRecords.persistence".to_owned()),
                 storage_prefix: Some("agentic-open".to_owned()),
                 snapshot_key: None,

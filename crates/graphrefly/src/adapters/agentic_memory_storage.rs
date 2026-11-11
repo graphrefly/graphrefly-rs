@@ -113,8 +113,6 @@ pub struct LoadAgenticMemoryRecordsStateOptions<'a> {
 #[derive(Clone)]
 /// `PersistAgenticMemoryRecordsOptions` data container.
 pub struct PersistAgenticMemoryRecordsOptions {
-    /// `graph` field for graph.
-    pub graph: Option<Graph>,
     /// `name` field for name.
     pub name: Option<String>,
     /// `storage_prefix` field for storage prefix.
@@ -140,7 +138,6 @@ impl PersistAgenticMemoryRecordsOptions {
         storage_prefix: impl Into<String>,
     ) -> Self {
         Self {
-            graph: None,
             name: None,
             storage_prefix: Some(storage_prefix.into()),
             snapshot_key: None,
@@ -327,22 +324,19 @@ pub fn load_agentic_memory_records_state(
 
 /// Creates or computes `persist_agentic_memory_records`.
 pub fn persist_agentic_memory_records(
+    graph: &Graph,
     records: &Node<Vec<AgenticMemoryRecord<JsonValue>>>,
     options: PersistAgenticMemoryRecordsOptions,
 ) -> StorageResult<AgenticMemoryRecordsPersistence> {
-    persist_agentic_memory_records_with_cursor(records, options, None)
+    persist_agentic_memory_records_with_cursor(graph, records, options, None)
 }
 
 fn persist_agentic_memory_records_with_cursor(
+    graph: &Graph,
     records: &Node<Vec<AgenticMemoryRecord<JsonValue>>>,
     options: PersistAgenticMemoryRecordsOptions,
     initial_change_seq: Option<u64>,
 ) -> StorageResult<AgenticMemoryRecordsPersistence> {
-    let graph = options.graph.as_ref().ok_or_else(|| {
-        StorageError::backend(
-            "persistAgenticMemoryRecords: graph is required for graph-visible sidecar facts",
-        )
-    })?;
     if !graph.contains_core(&records.erased()) {
         return Err(StorageError::backend(
             "persistAgenticMemoryRecords: records node belongs to a different graph or is not graph-registered",
@@ -644,12 +638,12 @@ pub fn open_persistent_agentic_memory_records(
                 .unwrap_or_else(|| "agenticMemoryRecords".to_owned()),
         ),
     );
-    let mut persistence_options = options.persistence;
-    if persistence_options.graph.is_none() {
-        persistence_options.graph = Some(options.graph.clone());
-    }
-    let persistence =
-        persist_agentic_memory_records_with_cursor(&records, persistence_options, loaded.cursor)?;
+    let persistence = persist_agentic_memory_records_with_cursor(
+        &options.graph,
+        &records,
+        options.persistence,
+        loaded.cursor,
+    )?;
     Ok(OpenPersistentAgenticMemoryRecords {
         records,
         persistence,

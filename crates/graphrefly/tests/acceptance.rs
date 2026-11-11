@@ -310,9 +310,9 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
     let snapshots = Rc::new(memory_kv::<Value>());
     let changes = Rc::new(memory_append_log::<Value>("acceptance-agentic/changes"));
     let persistence = persist_agentic_memory_records(
+        &g,
         &records,
         PersistAgenticMemoryRecordsOptions {
-            graph: Some(g.clone()),
             name: Some("recordsPersistence".to_owned()),
             storage_prefix: Some("acceptance-agentic".to_owned()),
             snapshot_key: None,

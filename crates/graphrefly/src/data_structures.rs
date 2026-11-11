@@ -736,6 +736,11 @@ pub struct ReactiveList<T> {
 }
 
 impl<T: Clone + 'static> ReactiveList<T> {
+    /// The graph that owns the collection's nodes.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     /// Creates or computes `new`.
     pub fn new(graph: &Graph, initial: Vec<T>, options: ReactiveListOptions) -> Self {
         if matches!(options.max_size, Some(0)) {
@@ -992,6 +997,11 @@ where
     S: Clone + Ord + 'static,
     V: Clone + 'static,
 {
+    /// The graph that owns the collection's nodes.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     /// Creates or computes `new`.
     pub fn new(
         graph: &Graph,
@@ -1171,6 +1181,11 @@ where
     K: Clone + Ord + fmt::Debug + 'static,
     V: Clone + 'static,
 {
+    /// The graph that owns the collection's nodes.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     /// Creates or computes `new`.
     pub fn new(graph: &Graph, initial: Vec<(K, V)>, options: ReactiveMapOptions) -> Self {
         let backend = MapBackend::new(initial);
@@ -1373,6 +1388,11 @@ impl<C, S> ReactiveView<C, S> {
 }
 
 impl<T: Clone + 'static> ReactiveLog<T> {
+    /// The graph that owns the collection's nodes.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     /// Creates or computes `new`.
     pub fn new(graph: &Graph, initial: Vec<T>, options: ReactiveLogOptions) -> Self {
         if matches!(options.max_size, Some(0)) {

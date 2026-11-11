@@ -87,8 +87,6 @@ pub struct ReactiveCollectionPersistenceErrorFact {
 #[derive(Clone)]
 /// `PersistReactiveCollectionOptions` data container.
 pub struct PersistReactiveCollectionOptions {
-    /// `graph` field for graph.
-    pub graph: Option<Graph>,
     /// `name` field for name.
     pub name: Option<String>,
     /// `storage_prefix` field for storage prefix.
@@ -112,7 +110,6 @@ impl PersistReactiveCollectionOptions {
         storage_prefix: impl Into<String>,
     ) -> Self {
         Self {
-            graph: None,
             name: None,
             storage_prefix: Some(storage_prefix.into()),
             snapshot_key: None,
@@ -276,6 +273,7 @@ where
     T: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveList,
         collection.to_vec(),
         &collection.delta,
@@ -295,6 +293,7 @@ where
     T: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveLog,
         collection.to_vec(),
         &collection.delta,
@@ -315,6 +314,7 @@ where
     V: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveMap,
         collection.to_map().into_iter().collect::<Vec<_>>(),
         &collection.delta,
@@ -336,6 +336,7 @@ where
     V: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveIndex,
         collection.to_vec(),
         &collection.delta,
@@ -355,6 +356,7 @@ where
     T: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveList,
         collection.to_vec(),
         &collection.delta,
@@ -374,6 +376,7 @@ where
     T: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveLog,
         collection.to_vec(),
         &collection.delta,
@@ -394,6 +397,7 @@ where
     V: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveMap,
         collection.to_map().into_iter().collect::<Vec<_>>(),
         &collection.delta,
@@ -415,6 +419,7 @@ where
     V: Clone + Serialize + 'static,
 {
     persist_collection(
+        collection.graph(),
         ReactiveCollectionKind::ReactiveIndex,
         collection.to_vec(),
         &collection.delta,
@@ -550,7 +555,11 @@ where
     })
 }
 
+// One private funnel for the four collection kinds; its arguments are each kind's
+// own pieces, so a parameter struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn persist_collection<C, S, F, A>(
+    graph: &Graph,
     kind: ReactiveCollectionKind,
     snapshot_state: S,
     delta: &Node<C>,
@@ -572,16 +581,6 @@ where
                 "persistReactiveCollection: snapshot_every_changes must be positive",
             ));
         }
-    }
-    let graph = options.graph.as_ref().ok_or_else(|| {
-        StorageError::backend(
-            "persistReactiveCollection: graph is required for graph-visible sidecar facts",
-        )
-    })?;
-    if !graph.contains_core(&delta.erased()) {
-        return Err(StorageError::backend(
-            "persistReactiveCollection: collection delta belongs to a different graph or is not graph-registered",
-        ));
     }
     let fact_prefix = options
         .name

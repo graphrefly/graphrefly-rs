@@ -908,7 +908,6 @@ fn open_persistent_reactive_list_composes_load_restore_and_persist() {
             initial: vec![10],
             collection: ReactiveListOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(opened_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-list".to_owned()),
                 snapshot_key: None,
@@ -944,7 +943,6 @@ fn open_persistent_reactive_list_composes_load_restore_and_persist() {
             initial: vec![99],
             collection: ReactiveListOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(reopened_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-list".to_owned()),
                 snapshot_key: None,
@@ -974,7 +972,6 @@ fn open_persistent_reactive_list_composes_load_restore_and_persist() {
             initial: vec![99],
             collection: ReactiveListOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(reopened_again_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-list".to_owned()),
                 snapshot_key: None,
@@ -1009,7 +1006,6 @@ fn open_persistent_reactive_log_composes_load_restore_and_persist() {
             initial: vec!["a".to_owned()],
             collection: ReactiveLogOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(opened_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-log".to_owned()),
                 snapshot_key: None,
@@ -1031,7 +1027,6 @@ fn open_persistent_reactive_log_composes_load_restore_and_persist() {
             initial: vec!["ignored".to_owned()],
             collection: ReactiveLogOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(reopened_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-log".to_owned()),
                 snapshot_key: None,
@@ -1063,7 +1058,6 @@ fn open_persistent_map_and_index_compose_load_restore_and_persist() {
             initial: vec![("a".to_owned(), 1)],
             collection: ReactiveMapOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(opened_map_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-map".to_owned()),
                 snapshot_key: None,
@@ -1085,7 +1079,6 @@ fn open_persistent_map_and_index_compose_load_restore_and_persist() {
             initial: vec![("ignored".to_owned(), 9)],
             collection: ReactiveMapOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(reopened_map_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-map".to_owned()),
                 snapshot_key: None,
@@ -1116,7 +1109,6 @@ fn open_persistent_map_and_index_compose_load_restore_and_persist() {
             }],
             collection: ReactiveIndexOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(opened_index_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-index".to_owned()),
                 snapshot_key: None,
@@ -1144,7 +1136,6 @@ fn open_persistent_map_and_index_compose_load_restore_and_persist() {
             initial: Vec::<graphrefly::IndexRow<String, i32, i32>>::new(),
             collection: ReactiveIndexOptions::default(),
             persistence: PersistReactiveCollectionOptions {
-                graph: Some(reopened_index_graph.clone()),
                 name: None,
                 storage_prefix: Some("persistent-index".to_owned()),
                 snapshot_key: None,
@@ -1173,7 +1164,6 @@ fn persistence_sidecar_snapshot_cadence_and_cross_graph_preflight() {
     let persistence = persist_reactive_list(
         &list,
         PersistReactiveCollectionOptions {
-            graph: Some(g.clone()),
             name: None,
             storage_prefix: Some("cadence".to_owned()),
             snapshot_key: None,
@@ -1219,67 +1209,6 @@ fn persistence_sidecar_snapshot_cadence_and_cross_graph_preflight() {
     let status = persistence.status_fact().unwrap();
     assert_eq!(status.state, ReactiveCollectionPersistenceStatus::Ready);
     assert_eq!(status.writes, 3);
-
-    let unbound = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default());
-    let unbound_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
-        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
-    let unbound_err = match persist_reactive_list(
-        &unbound,
-        PersistReactiveCollectionOptions {
-            graph: None,
-            name: Some("graphless/persistence".to_owned()),
-            storage_prefix: Some("graphless".to_owned()),
-            snapshot_key: Some("graphless/snapshot".to_owned()),
-            snapshot_store: unbound_snapshots.clone(),
-            change_log: None,
-            snapshot_on_attach: false,
-            snapshot_every_changes: None,
-        },
-    ) {
-        Ok(_) => panic!("persistence without a graph option must fail before creating facts"),
-        Err(err) => err,
-    };
-    assert!(unbound_err.to_string().contains("graph is required"));
-    assert!(unbound_snapshots
-        .get("graphless/snapshot")
-        .unwrap()
-        .is_none());
-
-    let owner = graph();
-    let other = graph();
-    let owned = reactive_list::<i32>(&owner, Vec::new(), ReactiveListOptions::named("owned"));
-    let cross_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
-        Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
-    let cross_changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
-        memory_append_log::<ReactiveCollectionChangeFrame>("bad/changes"),
-    );
-    let err = match persist_reactive_list(
-        &owned,
-        PersistReactiveCollectionOptions {
-            graph: Some(other.clone()),
-            name: Some("bad/persistence".to_owned()),
-            storage_prefix: Some("bad".to_owned()),
-            snapshot_key: Some("bad/snapshot".to_owned()),
-            snapshot_store: cross_snapshots.clone(),
-            change_log: Some(cross_changes.clone()),
-            snapshot_on_attach: false,
-            snapshot_every_changes: None,
-        },
-    ) {
-        Ok(_) => panic!("cross-graph persistence must fail before creating facts"),
-        Err(err) => err,
-    };
-    assert!(err.to_string().contains("different graph"));
-    assert!(
-        other.find("bad/persistence.ready").is_none(),
-        "cross-graph preflight must not create graph-visible sidecar facts"
-    );
-    assert!(
-        owner.find("bad/persistence.ready").is_none(),
-        "cross-graph preflight must not create facts on the collection owner graph either"
-    );
-    assert!(cross_snapshots.get("bad/snapshot").unwrap().is_none());
-    assert_eq!(cross_changes.size().unwrap(), 0);
 }
 
 #[test]
@@ -1295,7 +1224,6 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
     let persistence = persist_reactive_list(
         &list,
         PersistReactiveCollectionOptions {
-            graph: Some(snapshot_only_graph.clone()),
             name: None,
             storage_prefix: Some("snapshot-only".to_owned()),
             snapshot_key: None,
@@ -1324,7 +1252,6 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
     let failing_snapshot = persist_reactive_list(
         &failing_snapshot_list,
         PersistReactiveCollectionOptions {
-            graph: Some(failing_snapshot_graph.clone()),
             name: None,
             storage_prefix: Some("snapshot-failure".to_owned()),
             snapshot_key: None,
@@ -1356,7 +1283,6 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
     let retry = persist_reactive_list(
         &retry_list,
         PersistReactiveCollectionOptions {
-            graph: Some(retry_graph.clone()),
             name: None,
             storage_prefix: Some("retry".to_owned()),
             snapshot_key: None,
