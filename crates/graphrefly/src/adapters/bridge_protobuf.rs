@@ -1,5 +1,5 @@
 //! D497 canonical protobuf profile for D134/D496 wire bridge envelopes and the wire
-//! edge group's `WireEdgeCause` frame (R-bridge@1, graphrefly:D803).
+//! edge group's `WireEdgeCause` frame (R-bridge@2, graphrefly:D803 and D804).
 //!
 //! This module is schema-specific on purpose: it validates the locked
 //! `protocol.proto` bridge envelope subset without introducing a protobuf
@@ -104,7 +104,7 @@ pub enum CanonicalWireBridgeDataBody {
     EdgeCause(CanonicalWireEdgeCause),
 }
 
-/// One frame of a wire edge group: one sender wave (R-bridge@1).
+/// One frame of a wire edge group: one sender wave (R-bridge@2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalWireEdgeCause {
     /// The group's name.
@@ -127,7 +127,7 @@ pub struct CanonicalWireEdgeArrays {
 }
 
 /// A message that crosses a wire edge: PENDING, RESOLVED and START are each kernel's
-/// own and never cross (R-bridge@1).
+/// own and never cross (R-bridge@2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalWireMessage {
     /// DATA with the application's value bytes.
@@ -746,7 +746,7 @@ fn missing(what: &str) -> CanonicalProtobufError {
     )
 }
 
-/// A frame a receiver's gate refuses whole is `invalid_wire_edge` (R-bridge@1).
+/// A frame a receiver's gate refuses whole is `invalid_wire_edge` (R-bridge@2).
 fn validate_wire_edge_cause(cause: &CanonicalWireEdgeCause) -> Result<(), CanonicalProtobufError> {
     if cause.group.is_empty() || cause.session.is_empty() {
         return Err(missing("WireEdgeCause group or session"));

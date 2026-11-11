@@ -1,4 +1,4 @@
-//! Wire edge groups (R-bridge@1, graphrefly:D803).
+//! Wire edge groups (R-bridge@2, graphrefly:D803 and D804).
 //!
 //! A group carries a fixed set of edges from a sender graph to a receiver graph.
 //!
@@ -16,7 +16,7 @@
 //!
 //! DATA values and ERROR payloads cross as bytes (`Vec<u8>`), which the application
 //! encodes; an ERROR's payload is its message's UTF-8 bytes. Bridge nodes carry no
-//! recipe: they are local-only for a checkpoint (R-bridge@1 does not cover it).
+//! recipe: they are local-only for a checkpoint (R-bridge@2 does not cover it).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,6 +66,17 @@ pub enum WireEdgeIssue {
         from: u64,
         /// The last missing cause.
         to: u64,
+    },
+    /// An ended inbound edge was sent arrays that do not end with a terminal: they
+    /// were skipped, and the sender's edge goes on while the receiver's has ended,
+    /// which only a new group repairs (R-bridge@2).
+    Ended {
+        /// The session.
+        session: String,
+        /// The cause.
+        cause: u64,
+        /// The edge.
+        edge: String,
     },
     /// A frame refused whole; its number is taken.
     Refused {
@@ -176,8 +187,9 @@ fn brought(ctx: &Ctx, i: usize, id: &str, edge: &str) -> Vec<Vec<CanonicalWireMe
 
 /// The sender side of group `group`: the outbound node `name` over `edges` (edge id,
 /// node). A session is one lifetime of this node: its setup names the session, and
-/// its causes are numbered from 1. The first run carries every edge's snapshot and an
-/// INVALIDATE for an edge without one. A DATA value that is not `Vec<u8>` is a panic
+/// its causes are numbered from 1. The first run carries every edge's snapshot, with
+/// an INVALIDATE ahead of it for an edge without a value, one whose snapshot is its
+/// terminal alone included (R-bridge@2). A DATA value that is not `Vec<u8>` is a panic
 /// of the outbound node, so its ERROR.
 pub fn wire_edge_group_out(
     graph: &Graph,
@@ -211,16 +223,19 @@ pub fn wire_edge_group_out(
             let first = state.borrow().cause == 0;
             let mut carried = Vec::new();
             for (i, edge) in ids.iter().enumerate() {
-                let arrays = brought(ctx, i, &id, edge);
+                let mut arrays = brought(ctx, i, &id, edge);
+                // The first cause clears, on the receiver, a value an earlier session left
+                // for an edge that has none now, also one whose snapshot is its terminal.
+                let has_value = arrays
+                    .iter()
+                    .any(|a| matches!(a.first(), Some(CanonicalWireMessage::Data(_))));
+                if first && !has_value {
+                    arrays.insert(0, vec![CanonicalWireMessage::Invalidate]);
+                }
                 if !arrays.is_empty() {
                     carried.push(CanonicalWireEdgeArrays {
                         edge_id: edge.clone(),
                         arrays,
-                    });
-                } else if first {
-                    carried.push(CanonicalWireEdgeArrays {
-                        edge_id: edge.clone(),
-                        arrays: vec![vec![CanonicalWireMessage::Invalidate]],
                     });
                 }
             }
@@ -372,10 +387,17 @@ fn gate_fn(group: String, declared: BTreeSet<String>) -> impl Fn(&Ctx) + 'static
                     cause,
                     reason,
                 }),
-                Ok(view) => {
+                Ok(checked) => {
                     issues.extend(gap);
-                    st.view = Rc::new(view);
-                    released.push(frame);
+                    for edge in checked.diverged {
+                        issues.push(WireEdgeIssue::Ended {
+                            session: session.clone(),
+                            cause,
+                            edge,
+                        });
+                    }
+                    st.view = Rc::new(checked.view);
+                    released.push(checked.frame.map_or(frame, Rc::new));
                 }
             }
         }
@@ -391,15 +413,37 @@ fn gate_fn(group: String, declared: BTreeSet<String>) -> impl Fn(&Ctx) + 'static
     }
 }
 
-/// Checks a frame against what its inbound nodes could send as their own output and
-/// returns the view after it, or the reason it is refused whole.
+/// A frame that passed the gate's checks: the view after it, the frame to release
+/// when edges were skipped (`None`: release it as it is), and the ended edges whose
+/// skipped arrays did not end with a terminal.
+struct Checked {
+    view: BTreeMap<String, WireEdgeView>,
+    frame: Option<WireEdgeCause>,
+    diverged: Vec<String>,
+}
+
+fn is_terminal(m: &CanonicalWireMessage) -> bool {
+    matches!(
+        m,
+        CanonicalWireMessage::Complete | CanonicalWireMessage::Error(_)
+    )
+}
+
+/// Checks a frame against what any node could send as its output. Returns the reason
+/// it is refused whole, or the view after it with the frame to release. An edge whose
+/// inbound node has ended takes nothing more (R-bridge@2): its arrays are skipped and
+/// the rest of the frame is released; when the skipped arrays do not end with a
+/// terminal the edge is reported. A new session's first cause repeats an ended edge's
+/// snapshot with its terminal, which is not reported.
 fn view_after(
     frame: &WireEdgeCause,
     declared: &BTreeSet<String>,
     view: &BTreeMap<String, WireEdgeView>,
-) -> Result<BTreeMap<String, WireEdgeView>, String> {
+) -> Result<Checked, String> {
     let mut next = view.clone();
     let mut seen = BTreeSet::new();
+    let mut kept = Vec::new();
+    let mut diverged = Vec::new();
     for entry in &frame.edges {
         let edge = &entry.edge_id;
         if !declared.contains(edge) {
@@ -411,24 +455,30 @@ fn view_after(
         if entry.arrays.is_empty() {
             return Err(format!("edge {edge} carries no array"));
         }
-        let mut state = next.get(edge).cloned().unwrap_or_default();
+        let mut ended = false; // within this frame
         for array in &entry.arrays {
             if array.is_empty() {
                 return Err(format!("edge {edge}: an empty array"));
             }
-            if state.terminal.is_some() {
+            if ended {
                 return Err(format!("edge {edge}: an array after its terminal"));
             }
-            if let Some(i) = array.iter().position(|m| {
-                matches!(
-                    m,
-                    CanonicalWireMessage::Complete | CanonicalWireMessage::Error(_)
-                )
-            }) {
+            if let Some(i) = array.iter().position(is_terminal) {
                 if i != array.len() - 1 {
                     return Err(format!("edge {edge}: a terminal not last"));
                 }
             }
+            ended = array.last().is_some_and(is_terminal);
+        }
+        if next.get(edge).is_some_and(|v| v.terminal.is_some()) {
+            if !ended {
+                diverged.push(edge.clone());
+            }
+            continue;
+        }
+        let mut state = next.get(edge).cloned().unwrap_or_default();
+        state.terminal = None;
+        for array in &entry.arrays {
             // As the kernel applies it: what came before the last INVALIDATE is gone and
             // the value with it, the DATA after it is the value, a terminal ends the edge.
             let k = array
@@ -447,19 +497,20 @@ fn view_after(
             if !data.is_empty() {
                 state.values = Some(data);
             }
-            state.terminal = array
-                .iter()
-                .find(|m| {
-                    matches!(
-                        m,
-                        CanonicalWireMessage::Complete | CanonicalWireMessage::Error(_)
-                    )
-                })
-                .cloned();
+            state.terminal = array.iter().find(|m| is_terminal(m)).cloned();
         }
         next.insert(edge.clone(), state);
+        kept.push(entry.clone());
     }
-    Ok(next)
+    let frame = (kept.len() != frame.edges.len()).then(|| WireEdgeCause {
+        edges: kept,
+        ..frame.clone()
+    });
+    Ok(Checked {
+        view: next,
+        frame,
+        diverged,
+    })
 }
 
 fn to_message(m: &CanonicalWireMessage) -> Message<AnyValue> {

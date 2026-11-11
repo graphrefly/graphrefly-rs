@@ -1,4 +1,4 @@
-//! C-1 and C-1b — wire edge groups (R-bridge@1, graphrefly:D803): each sender wave is
+//! C-1 and C-1b — wire edge groups (R-bridge@2, graphrefly:D803 and D804): each sender wave is
 //! one cause and one receiver wave; a gate releases a session's causes whole, in order
 //! and at most once. The tests carry each group's frames by hand, through the
 //! canonical protobuf codec for C-1.
@@ -341,7 +341,7 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
 
     // A new session starts the count at 1 and carries an INVALIDATE for x.
     u_out();
-    let _u_out2 = out.subscribe(queue_sink(&q));
+    let u_out2 = out.subscribe(queue_sink(&q));
     let fresh = q.borrow().back().cloned().unwrap();
     assert_eq!(fresh.cause, 1);
     assert!(fresh
@@ -350,7 +350,30 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
         .any(|e| e.edge_id == "x" && e.arrays == vec![vec![CanonicalWireMessage::Invalidate]]));
     let session = fresh.session.clone();
     assert_ne!(session, first.session);
+    // It repeats y's snapshot and COMPLETE: inbound y has ended, so they are skipped
+    // without an issue, and x's INVALIDATE is released (R-bridge@2).
+    assert!(fresh.edges.iter().any(
+        |e| e.edge_id == "y" && e.arrays.last() == Some(&vec![CanonicalWireMessage::Complete])
+    ));
+    issues.borrow_mut().clear();
+    x_arrays.borrow_mut().clear();
     deliver_all(&q, &slot);
+    assert!(issues.borrow().is_empty(), "{:?}", issues.borrow());
+    let released = gin
+        .gate
+        .cache()
+        .expect("the gate released the cause")
+        .released;
+    let carried: Vec<&str> = released[0]
+        .edges
+        .iter()
+        .map(|e| e.edge_id.as_str())
+        .collect();
+    assert_eq!(
+        carried,
+        vec!["x"],
+        "y's arrays are skipped, x's INVALIDATE released"
+    );
 
     // Frames handed to the receiver: duplicate, older, two past, refused, other group.
     let deliver = slot.borrow().clone().unwrap();
@@ -369,10 +392,18 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
             vec![vec![CanonicalWireMessage::Complete], vec![data(1)]],
         )],
     ));
+    // Arrays for the ended y that do not end with a terminal: skipped, the rest of
+    // the frame released, the divergence reported.
+    deliver(frame(
+        "g",
+        &session,
+        6,
+        vec![("x", vec![vec![data(11)]]), ("y", vec![vec![data(12)]])],
+    ));
     deliver(frame(
         "other",
         &session,
-        6,
+        7,
         vec![("x", vec![vec![data(1)]])],
     ));
     let got = issues.borrow().clone();
@@ -408,7 +439,11 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
     assert!(
         matches!(&got[4], WireEdgeIssue::Refused { cause: 5, reason, .. } if reason.contains("after its terminal"))
     );
-    assert_eq!(got.len(), 5, "another group's frame is ignored");
+    assert!(
+        matches!(&got[5], WireEdgeIssue::Ended { cause: 6, edge, .. } if edge == "y"),
+        "{got:?}"
+    );
+    assert_eq!(got.len(), 6, "another group's frame is ignored");
     // F may run on the waves that release nothing (its inputs send RESOLVED, which is
     // input, R-invocation@2), but only the cause two past brings it a value.
     let seen_x: Vec<Option<u8>> = f_runs.borrow()[runs..].iter().map(|r| r.0).collect();
@@ -417,10 +452,55 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
         !seen_x.iter().any(|x| matches!(x, Some(8 | 10 | 1))),
         "dropped and refused frames bring nothing: {seen_x:?}"
     );
-    assert_eq!(f_runs.borrow().last().unwrap().0, Some(9));
+    assert!(
+        seen_x.contains(&Some(11)),
+        "the rest of the diverged frame is released"
+    );
+    assert_eq!(
+        f_runs.borrow().last().unwrap(),
+        &(Some(11), Some(7)),
+        "y is unchanged"
+    );
     assert_eq!(
         gin.inbound["x"].status().output,
         graphrefly::OutputStatus::Open
+    );
+    assert_eq!(
+        gin.inbound["y"].status().output,
+        graphrefly::OutputStatus::Completed
+    );
+
+    // After x lost its value and completed, a new session's first cause carries an
+    // INVALIDATE ahead of x's COMPLETE, so inbound x ends without the old value.
+    assert_eq!(gin.inbound["x"].cache(), Some(vec![11]));
+    tx.complete();
+    q.borrow_mut().clear(); // the session-2 causes are never delivered
+    u_out2();
+    let _u_out3 = out.subscribe(queue_sink(&q));
+    let third = q.borrow().back().cloned().unwrap();
+    let x_entry = third.edges.iter().find(|e| e.edge_id == "x").unwrap();
+    assert_eq!(
+        x_entry.arrays,
+        vec![
+            vec![CanonicalWireMessage::Invalidate],
+            vec![CanonicalWireMessage::Complete]
+        ]
+    );
+    issues.borrow_mut().clear();
+    deliver_all(&q, &slot);
+    assert_eq!(
+        gin.inbound["x"].status().output,
+        graphrefly::OutputStatus::Completed
+    );
+    assert_eq!(
+        gin.inbound["x"].cache(),
+        None,
+        "ended without the old value"
+    );
+    assert!(
+        issues.borrow().is_empty(),
+        "y's repeated snapshot is skipped silently: {:?}",
+        issues.borrow()
     );
 
     // An edge value that is not bytes is a throw, so an ERROR, of the outbound node.
@@ -430,7 +510,7 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
     assert_eq!(bad.status().output, graphrefly::OutputStatus::Errored);
 }
 
-/// R-bridge@1: an inbound node's snapshot is what its edge last brought, whichever
+/// R-bridge@2: an inbound node's snapshot is what its edge last brought, whichever
 /// frames carried it — also for an inbound node first activated after the causes
 /// were released.
 #[test]
