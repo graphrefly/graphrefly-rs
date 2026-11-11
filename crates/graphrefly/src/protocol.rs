@@ -74,24 +74,11 @@ pub enum Message<T> {
 }
 
 impl<T> Message<T> {
-    /// The message's class rank in R-messages order: START, PENDING, value (DATA,
-    /// RESOLVED), INVALIDATE, terminal (COMPLETE, ERROR).
-    #[inline]
-    pub(crate) fn class_rank(&self) -> u8 {
-        match self {
-            Message::Start => 0,
-            Message::Pending => 1,
-            Message::Data(_) | Message::Resolved => 2,
-            Message::Invalidate => 3,
-            Message::Complete | Message::Error(_) => 4,
-        }
-    }
-
     /// Whether this message is a value (DATA or RESOLVED) or a later class, the part
     /// of an array a batch holds until its commit.
     #[inline]
     pub(crate) fn is_settling(&self) -> bool {
-        self.class_rank() >= 2
+        !matches!(self, Message::Start | Message::Pending)
     }
 
     /// Whether this message is COMPLETE or ERROR.
@@ -144,15 +131,15 @@ pub(crate) fn reject_kernel_only_output<T>(msgs: &[Message<T>]) {
 mod tests {
     use super::*;
 
-    // R-messages: the class order of the closed set.
+    // R-wave: everything but START and PENDING settles a pending mark.
     #[test]
-    fn class_rank_follows_message_class_order() {
-        assert_eq!(Message::<i32>::Start.class_rank(), 0);
-        assert_eq!(Message::<i32>::Pending.class_rank(), 1);
-        assert_eq!(Message::Data(1).class_rank(), 2);
-        assert_eq!(Message::<i32>::Resolved.class_rank(), 2);
-        assert_eq!(Message::<i32>::Invalidate.class_rank(), 3);
-        assert_eq!(Message::<i32>::Complete.class_rank(), 4);
+    fn only_start_and_pending_do_not_settle() {
+        assert!(!Message::<i32>::Start.is_settling());
+        assert!(!Message::<i32>::Pending.is_settling());
+        assert!(Message::Data(1).is_settling());
+        assert!(Message::<i32>::Resolved.is_settling());
+        assert!(Message::<i32>::Invalidate.is_settling());
+        assert!(Message::<i32>::Complete.is_settling());
     }
 
     // R-subscription, R-wave: START, PENDING and RESOLVED are kernel-only.
