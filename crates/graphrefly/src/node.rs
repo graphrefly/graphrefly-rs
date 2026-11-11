@@ -44,11 +44,6 @@ use crate::dispatcher::default_dispatcher;
 use crate::dispatcher::{Dispatcher, NodeFn, PoolKind};
 use crate::environment::EnvironmentDrivers;
 use crate::protocol::{reject_kernel_only_output, AnyValue, GraphError, Handle, Message, Wave};
-use crate::versioning::{
-    advance_node_version, assert_node_version_data_compatible, create_node_version,
-    resolve_node_versioning_policy, NodeVersion, NodeVersioningPolicy,
-    ResolvedNodeVersioningPolicy,
-};
 
 /// A node's cache status (R-node): no retained value, a pending mark it received or
 /// sent in the current wave is unsettled, or ready.
@@ -131,6 +126,17 @@ pub enum Policy {
 /// Node construction options (substrate-level). Sugar/operator opts are the graph layer
 /// (D6/D24); this is the minimal substrate surface needed to select a pool (D20) and
 /// the dep-terminal propagation policy (R-deps-terminal).
+///
+/// A node has no runtime version (D109 is retired, review Q7):
+///
+/// ```compile_fail
+/// let _ = graphrefly::NodeOpts { versioning: None, ..Default::default() };
+/// ```
+///
+/// ```compile_fail
+/// let g = graphrefly::graph();
+/// let _ = g.state(1i32).version();
+/// ```
 #[derive(Debug, Clone)]
 pub struct NodeOpts {
     /// The factory name `describe` shows for a node with no graph entry of its own
@@ -157,9 +163,6 @@ pub struct NodeOpts {
     /// ([`DepView::invalidated`](crate::ctx::DepView::invalidated)), and the node keeps its values until the function clears
     /// them or sends INVALIDATE itself.
     pub invalidate: Policy,
-    /// D109 node runtime versioning policy. `None` means the package default V0; graph-owned
-    /// nodes may inherit a graph default before construction.
-    pub versioning: Option<NodeVersioningPolicy>,
     /// The instance's setup (R-lifetime@2): runs once per lifetime, before the
     /// function's first run in it, and may return the lifetime's cleanup.
     pub setup: Option<crate::lifetime::Setup>,
@@ -191,7 +194,6 @@ impl Default for NodeOpts {
             complete: Policy::Auto,
             error: Policy::Auto,
             invalidate: Policy::Auto,
-            versioning: None,
             setup: None,
             recipe: None,
         }
@@ -419,7 +421,6 @@ struct GraphCore {
     call_slots: Vec<Option<NodeCallSlot>>,
     config_slots: Vec<Option<NodeConfigSlot>>,
     edge_slots: Vec<Option<DepEdges>>,
-    version_slots: Vec<Option<NodeVersionState>>,
     aux_slots: Vec<Option<NodeAux>>,
     generations: Vec<u64>,
     touched_waves: Vec<u64>,
@@ -475,7 +476,6 @@ type TakenNodeSlot = (
     NodeCallSlot,
     NodeConfigSlot,
     DepEdges,
-    NodeVersionState,
     NodeAux,
 );
 
@@ -487,7 +487,6 @@ impl GraphCore {
             call_slots: Vec::new(),
             config_slots: Vec::new(),
             edge_slots: Vec::new(),
-            version_slots: Vec::new(),
             aux_slots: Vec::new(),
             generations: Vec::new(),
             touched_waves: Vec::new(),
@@ -504,7 +503,6 @@ impl GraphCore {
         topology: NodeTopologySlot,
         call: NodeCallSlot,
         config: NodeConfigSlot,
-        version: NodeVersionState,
     ) -> NodeId {
         let edges = DepEdges::new(topology.deps.len());
         let aux = NodeAux::new();
@@ -518,7 +516,6 @@ impl GraphCore {
             self.call_slots[id] = Some(call);
             self.config_slots[id] = Some(config);
             self.edge_slots[id] = Some(edges);
-            self.version_slots[id] = Some(version);
             self.aux_slots[id] = Some(aux);
             self.generations[id] = next_generation;
             self.touched_waves[id] = 0;
@@ -531,7 +528,6 @@ impl GraphCore {
             self.call_slots.push(Some(call));
             self.config_slots.push(Some(config));
             self.edge_slots.push(Some(edges));
-            self.version_slots.push(Some(version));
             self.aux_slots.push(Some(aux));
             self.generations.push(0);
             self.touched_waves.push(0);
@@ -607,28 +603,6 @@ impl GraphCore {
             .get(key.id.0)
             .and_then(Option::as_ref)
             .expect("Core points at a live GraphCore config slot")
-    }
-
-    fn get_version(&self, key: NodeKey) -> &NodeVersionState {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.version_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore version slot")
-    }
-
-    fn get_version_mut(&mut self, key: NodeKey) -> &mut NodeVersionState {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.version_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore version slot")
     }
 
     fn get_node_edges_aux_mut(
@@ -753,7 +727,6 @@ impl GraphCore {
             debug_assert!(self.call_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.config_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.edge_slots.get(id.0).is_some_and(Option::is_some));
-            debug_assert!(self.version_slots.get(id.0).is_some_and(Option::is_some));
             debug_assert!(self.aux_slots.get(id.0).is_some_and(Option::is_some));
         }
         live
@@ -801,9 +774,8 @@ impl GraphCore {
         let call = self.call_slots.get_mut(key.id.0)?.take()?;
         let config = self.config_slots.get_mut(key.id.0)?.take()?;
         let edges = self.edge_slots.get_mut(key.id.0)?.take()?;
-        let version = self.version_slots.get_mut(key.id.0)?.take()?;
         let aux = self.aux_slots.get_mut(key.id.0)?.take()?;
-        Some((inner, topology, call, config, edges, version, aux))
+        Some((inner, topology, call, config, edges, aux))
     }
 }
 
@@ -1030,7 +1002,6 @@ struct NodeConfigSlot {
     complete: Policy,
     error: Policy,
     invalidate: Policy,
-    versioning: Option<NodeVersioningPolicy>,
     setup: Option<crate::lifetime::Setup>,
     recipe: Option<serde_json::Value>,
 }
@@ -1042,24 +1013,9 @@ impl NodeConfigSlot {
             complete: opts.complete,
             error: opts.error,
             invalidate: opts.invalidate,
-            versioning: opts.versioning.clone(),
             setup: opts.setup.clone(),
             recipe: opts.recipe.clone(),
         }
-    }
-}
-
-struct NodeVersionState {
-    policy: ResolvedNodeVersioningPolicy,
-    value: Option<NodeVersion>,
-}
-
-impl NodeVersionState {
-    fn new(policy: Option<NodeVersioningPolicy>, initial: Option<&AnyValue>) -> Self {
-        let policy = resolve_node_versioning_policy(policy);
-        let value = create_node_version(&policy, initial)
-            .unwrap_or_else(|err| panic!("node versioning: {err}"));
-        Self { policy, value }
     }
 }
 
@@ -1428,7 +1384,7 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
     if refs.get() != 0 {
         return;
     }
-    let (mut inner, _topology, mut call, _config, mut edges, _version, mut aux) = {
+    let (mut inner, _topology, mut call, _config, mut edges, mut aux) = {
         let mut graph = graph_ref.borrow_mut();
         if graph.pin_count(key) != 0 {
             return;
@@ -2255,10 +2211,6 @@ impl Core {
         }
     }
 
-    pub(crate) fn version(&self) -> Option<NodeVersion> {
-        self.graph.borrow().get_version(self.key()).value.clone()
-    }
-
     pub(crate) fn handle(&self) -> Option<Handle> {
         self.with_call(|c| c.handle)
     }
@@ -2326,7 +2278,7 @@ impl Core {
             armed: true,
         };
         unregister_backend_state_contributor(self);
-        let (mut inner, _topology, mut call, _config, mut edges, _version, mut aux) = slot;
+        let (mut inner, _topology, mut call, _config, mut edges, mut aux) = slot;
         inner.cleanup_before_free(&mut call, &mut edges, &mut aux, graph_reporter(&self.graph));
         free_slot.armed = false;
         self.graph.borrow_mut().free.push(key.id.0);
@@ -2518,10 +2470,9 @@ impl Core {
             environment,
         };
         let config = NodeConfigSlot::from_opts(&opts);
-        let version = NodeVersionState::new(config.versioning.clone(), initial.as_ref());
         {
             let mut g = arena.0.borrow_mut();
-            let id = g.alloc(inner, topology, call, config, version);
+            let id = g.alloc(inner, topology, call, config);
             let generation = g.key_for(id).generation;
             // R-initial: a provided initial pre-populates the cache.
             if let Some(v) = initial {
@@ -3554,9 +3505,7 @@ impl Core {
             for m in frame {
                 match &m {
                     Message::Data(value) => {
-                        let next_version = self.next_version(value);
                         let mut g = self.graph.borrow_mut();
-                        g.get_version_mut(self.key()).value = next_version;
                         let (_n, e) = g.get_node_and_edges_mut(self.key());
                         e.value.cache = Some(value.clone());
                         e.value.has_data = true;
@@ -3597,16 +3546,6 @@ impl Core {
             }
         }
         out
-    }
-
-    fn next_version(&self, value: &AnyValue) -> Option<NodeVersion> {
-        let (policy, current) = {
-            let graph = self.graph.borrow();
-            let version = graph.get_version(self.key());
-            (version.policy.clone(), version.value.clone())
-        };
-        assert_node_version_data_compatible(&policy, value).unwrap_or_else(|err| panic!("{err}"));
-        advance_node_version(current.as_ref(), &policy, value).unwrap_or_else(|err| panic!("{err}"))
     }
 
     /// Delivers arrays already applied to this node (R-wave). A pending node that ends
@@ -4017,7 +3956,6 @@ impl<T: 'static> Node<T> {
                 cfg.complete = opts.complete;
                 cfg.error = opts.error;
                 cfg.invalidate = opts.invalidate;
-                cfg.versioning = opts.versioning;
                 call.factory = factory;
             });
         }
@@ -4072,11 +4010,6 @@ impl<T: 'static> Node<T> {
     /// The node's lifecycle status (R-status-enum).
     pub fn status(&self) -> Status {
         self.core.status()
-    }
-
-    /// Read-only node runtime version metadata (D109).
-    pub fn version(&self) -> Option<NodeVersion> {
-        self.core.version()
     }
 
     /// Subscribe a sink; returns an unsubscribe handle (call it to detach; the node
@@ -4352,8 +4285,6 @@ impl<T> Clone for Node<T> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-
-    use serde_json::json;
 
     /// A bare arena with the Graph constructor names, for the kernel unit tests that
     /// count a node's handles or arena slots: a Graph's registry holds a handle of its
@@ -5946,119 +5877,4 @@ mod tests {
     }
 
     // ── rewire (R-rewire / D42, C-8) ──
-
-    #[test]
-    fn d109_default_v0_advances_only_on_data() {
-        let g = crate::graph::graph();
-        let s = g.state::<i32>(1);
-        assert_eq!(s.version(), Some(NodeVersion::V0 { counter: 0 }));
-
-        s.set(2);
-        assert_eq!(s.version(), Some(NodeVersion::V0 { counter: 1 }));
-
-        s.down(vec![Message::Data(Rc::new(3)), Message::Data(Rc::new(4))]);
-        assert_eq!(s.version(), Some(NodeVersion::V0 { counter: 3 }));
-
-        s.down(vec![Message::Invalidate]);
-        s.down(vec![Message::Complete]);
-        assert_eq!(s.version(), Some(NodeVersion::V0 { counter: 3 }));
-    }
-
-    #[test]
-    fn d112_v1_hash_receives_strict_canonical_json_bytes() {
-        let g = crate::graph::graph();
-        let calls = Rc::new(RefCell::new(Vec::<String>::new()));
-        let calls_for_hash = calls.clone();
-        let hash = Rc::new(move |bytes: &[u8]| {
-            let text = std::str::from_utf8(bytes)
-                .expect("strict canonical JSON bytes are UTF-8")
-                .to_owned();
-            calls_for_hash.borrow_mut().push(text.clone());
-            format!("h:{text}")
-        });
-        let node = g.node_opts::<serde_json::Value, _>(
-            vec![],
-            |ctx| ctx.emit(json!({ "b": 2, "a": 1 })),
-            crate::graph::GraphNodeOpts::default().with_node(NodeOpts {
-                versioning: Some(NodeVersioningPolicy::Level1 { hash: Some(hash) }),
-                ..NodeOpts::default()
-            }),
-        );
-        let _u = node.subscribe(|_| {});
-
-        assert_eq!(
-            calls.borrow().as_slice(),
-            &[
-                "{\"@graphrefly/node-version\":\"v1-absent\"}".to_owned(),
-                "{\"a\":1,\"b\":2}".to_owned(),
-            ]
-        );
-        assert_eq!(
-            node.version(),
-            Some(NodeVersion::V1 {
-                counter: 1,
-                cid: "h:{\"a\":1,\"b\":2}".to_owned(),
-                prev: Some("h:{\"@graphrefly/node-version\":\"v1-absent\"}".to_owned()),
-            })
-        );
-    }
-
-    #[test]
-    fn d112_v1_rejects_invalid_data_before_cache_or_version_mutation() {
-        let g = crate::graph::graph();
-        let node = g.node_opts::<serde_json::Value, _>(
-            vec![],
-            |_ctx| {},
-            crate::graph::GraphNodeOpts::default().with_node(NodeOpts {
-                versioning: Some(NodeVersioningPolicy::Level1 { hash: None }),
-                ..NodeOpts::default()
-            }),
-        );
-        let before = node.version();
-        node.down(vec![Message::Data(Rc::new(f64::NAN))]);
-
-        assert_eq!(node.version(), before);
-        assert_eq!(node.cache(), None);
-        assert_eq!(node.status().output, crate::OutputStatus::Errored);
-    }
-
-    #[test]
-    fn d112_v1_hash_runs_outside_graphcore_borrow() {
-        let graph = crate::graph::graph();
-        let probe = graph.state_opts(1i32, crate::graph::GraphNodeOpts::named("probe"));
-        let probe_core = probe.erased();
-        let calls = Rc::new(Cell::new(0usize));
-        let calls_for_hash = calls.clone();
-        let hash = Rc::new(move |bytes: &[u8]| {
-            let _ = probe_core.version();
-            calls_for_hash.set(calls_for_hash.get() + 1);
-            format!(
-                "h:{}",
-                std::str::from_utf8(bytes).expect("strict canonical JSON bytes are UTF-8")
-            )
-        });
-        let node = graph.state_opts(
-            json!(1),
-            crate::graph::GraphNodeOpts {
-                name: Some("versioned".to_owned()),
-                node: NodeOpts {
-                    versioning: Some(NodeVersioningPolicy::Level1 { hash: Some(hash) }),
-                    ..NodeOpts::default()
-                },
-                ..crate::graph::GraphNodeOpts::default()
-            },
-        );
-
-        node.set(json!(2));
-
-        assert_eq!(calls.get(), 2);
-        assert_eq!(
-            node.version(),
-            Some(NodeVersion::V1 {
-                counter: 1,
-                cid: "h:2".to_owned(),
-                prev: Some("h:1".to_owned()),
-            })
-        );
-    }
 }

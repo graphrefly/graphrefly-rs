@@ -18,7 +18,6 @@ use crate::environment::EnvironmentDrivers;
 use crate::node::{Core, GraphArena, Node, NodeOpts, State, Status};
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, Message};
-use crate::versioning::{NodeVersion, NodeVersioningPolicy};
 
 /// Graph construction options.
 #[derive(Clone, Default)]
@@ -31,8 +30,6 @@ pub struct GraphOptions {
     pub dispatcher: Option<Dispatcher>,
     /// `environment` field for environment.
     pub environment: EnvironmentDrivers,
-    /// `versioning` field for versioning.
-    pub versioning: Option<NodeVersioningPolicy>,
     /// The host reporter (R-failure@3): failures in this graph with no caller and no
     /// node to end, such as a panicking sink or cleanup, go to it. Without one they
     /// are dropped; a panicking reporter is ignored (graphrefly-rs:D6).
@@ -46,7 +43,6 @@ impl fmt::Debug for GraphOptions {
             .field("profile", &self.profile)
             .field("dispatcher", &self.dispatcher)
             .field("environment", &self.environment)
-            .field("versioning", &self.versioning)
             .field("report", &self.report.is_some())
             .finish()
     }
@@ -60,7 +56,6 @@ impl GraphOptions {
             profile: false,
             dispatcher: None,
             environment: EnvironmentDrivers::default(),
-            versioning: None,
             report: None,
         }
     }
@@ -209,7 +204,6 @@ struct GraphInner {
     arena: GraphArena,
     dispatcher: Dispatcher,
     environment: EnvironmentDrivers,
-    versioning: Option<NodeVersioningPolicy>,
     profile_enabled: Cell<bool>,
     entries: RefCell<Vec<Entry>>,
     by_id: RefCell<HashMap<String, Core>>,
@@ -445,7 +439,6 @@ impl Graph {
                 arena: GraphArena::with_reporter(opts.report),
                 dispatcher,
                 environment,
-                versioning: opts.versioning,
                 profile_enabled: Cell::new(opts.profile),
                 entries: RefCell::new(Vec::new()),
                 by_id: RefCell::new(HashMap::new()),
@@ -517,7 +510,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
             initial,
             f,
         );
@@ -535,7 +528,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             initial,
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
         );
         State::from_node(self.add(node, "state", opts))
     }
@@ -550,7 +543,7 @@ impl Graph {
         let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
         );
         State::from_node(self.add(node, "state", opts))
     }
@@ -569,7 +562,7 @@ impl Graph {
         let node = Node::producer_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
             f,
         );
         self.add(node, "producer", opts)
@@ -600,7 +593,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
             move |ctx| {
                 if !sugar_gate(ctx) {
                     return;
@@ -633,7 +626,7 @@ impl Graph {
         opts: GraphNodeOpts,
     ) -> Node<()> {
         self.assert_graph_local_deps(&deps, opts.name.as_deref().unwrap_or("effect"));
-        let mut node_opts = self.apply_default_node_opts(opts.node.clone());
+        let mut node_opts = opts.node.clone();
         // The effect keeps its latest per-run cleanup in private state; the lifetime's
         // cleanup runs it (R-lifetime@2). A caller's own setup still runs first.
         let user_setup = node_opts.setup.take();
@@ -691,7 +684,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
         );
         self.add(node, op.factory, opts)
     }
@@ -867,7 +860,7 @@ impl Graph {
         let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
         );
         self.add_with_id(node, "state", id, opts)
     }
@@ -885,7 +878,7 @@ impl Graph {
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             deps,
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
             move |ctx| f(ctx),
         );
         self.add_with_id(node, &factory, id, opts)
@@ -904,18 +897,11 @@ impl Graph {
         self.add_with_id(node, factory, id, opts)
     }
 
-    fn apply_default_node_opts(&self, mut opts: NodeOpts) -> NodeOpts {
-        if opts.versioning.is_none() {
-            opts.versioning = self.inner.versioning.clone();
-        }
-        opts
-    }
-
     pub(crate) fn empty_source<T: 'static>(&self, factory: &str, opts: GraphNodeOpts) -> Node<T> {
         let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
-            self.apply_default_node_opts(opts.node.clone()),
+            opts.node.clone(),
         );
         self.add(node, factory, opts)
     }
@@ -1383,7 +1369,6 @@ impl Graph {
                 factory: entry.factory.clone(),
                 status: entry.core.status(),
                 value: entry.core.cache_any().as_ref().map(describe_value),
-                version: entry.core.version(),
                 kind: DescribeKind::of(&entry.core),
                 deps,
                 quiet: entry.core.is_quiet(),
@@ -1428,7 +1413,6 @@ impl Graph {
                 factory: core.factory().unwrap_or_else(|| "?".to_owned()),
                 status: core.status(),
                 value: core.cache_any().as_ref().map(describe_value),
-                version: core.version(),
                 kind: DescribeKind::of(&core),
                 deps,
                 quiet: core.is_quiet(),
@@ -1690,11 +1674,6 @@ impl GraphNode {
         self.core.status()
     }
 
-    /// Updates or reads `version`.
-    pub fn version(&self) -> Option<NodeVersion> {
-        self.core.version()
-    }
-
     /// Updates or reads `cache_any`.
     pub fn cache_any(&self) -> Option<AnyValue> {
         self.core.cache_any()
@@ -1737,8 +1716,6 @@ pub struct DescribeNode {
     pub status: Status,
     /// `value` field for value.
     pub value: Option<DescribeValue>,
-    /// `version` field for version.
-    pub version: Option<NodeVersion>,
     /// Whether the node is a state or a computed node (R-node@2).
     pub kind: DescribeKind,
     /// The current dependencies, in order (R-node@2).

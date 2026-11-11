@@ -577,7 +577,6 @@ fn is_default_node_opts(opts: &NodeOpts) -> bool {
         && opts.complete == Policy::Auto
         && opts.error == Policy::Auto
         && opts.invalidate == Policy::Auto
-        && opts.versioning.is_none()
 }
 
 fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
@@ -603,9 +602,6 @@ fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
     }
     if caller.invalidate != default.invalidate {
         opts.invalidate = caller.invalidate;
-    }
-    if caller.versioning.is_some() {
-        opts.versioning = caller.versioning;
     }
     opts
 }

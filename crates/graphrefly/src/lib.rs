@@ -94,7 +94,6 @@ pub mod solutions;
 pub mod sources;
 pub mod storage;
 pub mod time;
-mod versioning;
 pub mod work_queue;
 #[cfg(feature = "tokio-worker")]
 pub mod worker;
@@ -392,10 +391,6 @@ pub use storage::{
 pub use time::{
     audit, audit_time, buffer_time, debounce, debounce_time, delay, throttle, throttle_time,
     timeout,
-};
-pub use versioning::{
-    default_node_version_hash, NodeVersion, NodeVersionHashFn, NodeVersioningPolicy,
-    ResolvedNodeVersioningPolicy,
 };
 pub use work_queue::readiness::{
     work_queue_lease_expiration_command, work_queue_lease_expiration_command_projector,

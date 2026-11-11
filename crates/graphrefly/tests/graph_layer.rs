@@ -6,16 +6,15 @@ use graphrefly::{
     default_dispatcher, default_restore_registry, describe_to_ascii, describe_to_d2,
     describe_to_d2_with_direction, describe_to_json, describe_to_mermaid, describe_to_mermaid_url,
     describe_to_mermaid_with_direction, describe_to_pretty, distinct_until_changed, explain_path,
-    filter, from_iter, graph, graph_opts, map, merge, of, profile_summary,
-    profile_summary_from_snapshots, reachable, reactive_list, restore_graph, restore_registry,
-    scan, take, timeout, topology_diff, validate_no_islands, DescribeEdge, DescribeEvent,
-    DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher,
-    Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
+    filter, from_iter, graph, graph_opts, map, merge, profile_summary,
+    profile_summary_from_snapshots, reachable, restore_graph, restore_registry, scan, take,
+    timeout, topology_diff, validate_no_islands, DescribeEdge, DescribeEvent, DescribeNode,
+    DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher, Explain,
+    ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
     GraphCheckpointJson, GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry,
-    IslandReport, Message, NodeOpts, NodeVersion, NodeVersioningPolicy, ProfileSummaryOptions,
-    ReachableDirection, ReachableOptions, ReactiveListOptions, RestoreFactoryMeta,
-    RestoreGraphOptions, Status, TopologyEvent, TopologyEventKind, TopologyGroupOptions, Values,
-    GRAPH_CHECKPOINT_VERSION,
+    IslandReport, Message, NodeOpts, ProfileSummaryOptions, ReachableDirection, ReachableOptions,
+    RestoreFactoryMeta, RestoreGraphOptions, Status, TopologyEvent, TopologyEventKind,
+    TopologyGroupOptions, Values, GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -75,47 +74,6 @@ fn graph_state_derived_effect_and_batch_are_graph_owned() {
     assert_eq!(*seen.borrow(), vec![0, 4]);
     effect_unsub();
     assert_eq!(cleanups.get(), 1);
-}
-
-#[test]
-fn graph_default_versioning_applies_to_operator_and_empty_source_nodes() {
-    let hash = Rc::new(|bytes: &[u8]| {
-        format!(
-            "h:{}",
-            std::str::from_utf8(bytes).expect("strict canonical JSON bytes are UTF-8")
-        )
-    });
-    let g = graph_opts(GraphOptions {
-        versioning: Some(NodeVersioningPolicy::Level1 {
-            hash: Some(hash.clone()),
-        }),
-        ..GraphOptions::default()
-    });
-
-    let operator_source = g.init_node(
-        of(json!({ "b": 2, "a": 1 })),
-        vec![],
-        GraphNodeOpts::named("operator_source"),
-    );
-    let _operator_sub = operator_source.subscribe(|_| {});
-    assert_eq!(
-        operator_source.version(),
-        Some(NodeVersion::V1 {
-            counter: 1,
-            cid: "h:{\"a\":1,\"b\":2}".to_owned(),
-            prev: Some("h:{\"@graphrefly/node-version\":\"v1-absent\"}".to_owned()),
-        })
-    );
-
-    let list = reactive_list::<i32>(&g, vec![], ReactiveListOptions::named("items"));
-    assert_eq!(
-        list.delta.version(),
-        Some(NodeVersion::V1 {
-            counter: 0,
-            cid: "h:{\"@graphrefly/node-version\":\"v1-absent\"}".to_owned(),
-            prev: None,
-        })
-    );
 }
 
 #[test]
@@ -903,7 +861,6 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                     lifecycle: graphrefly::Lifecycle::Inactive,
                 },
                 value: None,
-                version: None,
                 kind: graphrefly::DescribeKind::State,
                 deps: vec![],
                 quiet: false,
@@ -919,7 +876,6 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                     lifecycle: graphrefly::Lifecycle::Inactive,
                 },
                 value: None,
-                version: None,
                 kind: graphrefly::DescribeKind::Node,
                 deps: vec![],
                 quiet: false,
@@ -965,7 +921,6 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                     lifecycle: graphrefly::Lifecycle::Inactive,
                 },
                 value: None,
-                version: None,
                 kind: graphrefly::DescribeKind::State,
                 deps: vec!["missing".to_owned()],
                 quiet: false,
@@ -981,7 +936,6 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                     lifecycle: graphrefly::Lifecycle::Inactive,
                 },
                 value: None,
-                version: None,
                 kind: graphrefly::DescribeKind::Node,
                 deps: vec![],
                 quiet: false,
@@ -1026,7 +980,6 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                     lifecycle: graphrefly::Lifecycle::Inactive,
                 },
                 value: None,
-                version: None,
                 kind: graphrefly::DescribeKind::Node,
                 deps: vec!["b".to_owned()],
                 quiet: false,
@@ -1042,7 +995,6 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                     lifecycle: graphrefly::Lifecycle::Inactive,
                 },
                 value: None,
-                version: None,
                 kind: graphrefly::DescribeKind::Node,
                 deps: vec!["a".to_owned()],
                 quiet: false,
