@@ -982,42 +982,45 @@ fn websocket_session_nodes(
     let inbound = graph.node_opts::<WebSocketSessionInbound, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 if let WebSocketSessionEvent::Message(message) = event.as_ref() {
-                    ctx.emit(message.clone());
+                    emitted.push(message.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/inbound")),
     );
     let lifecycle = graph.node_opts::<WebSocketSessionLifecycle, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 match event.as_ref() {
                     WebSocketSessionEvent::Attempt {
                         attempt,
                         max_attempts,
-                    } => ctx.emit(WebSocketSessionLifecycle::Starting {
+                    } => emitted.push(WebSocketSessionLifecycle::Starting {
                         attempt: *attempt,
                         max_attempts: *max_attempts,
                     }),
                     WebSocketSessionEvent::Open { attempt } => {
-                        ctx.emit(WebSocketSessionLifecycle::Open { attempt: *attempt });
+                        emitted.push(WebSocketSessionLifecycle::Open { attempt: *attempt });
                     }
                     WebSocketSessionEvent::Sent { message } => {
-                        ctx.emit(WebSocketSessionLifecycle::Sent {
+                        emitted.push(WebSocketSessionLifecycle::Sent {
                             message: message.clone(),
                         });
                     }
                     WebSocketSessionEvent::Closing { code, reason } => {
-                        ctx.emit(WebSocketSessionLifecycle::Closing {
+                        emitted.push(WebSocketSessionLifecycle::Closing {
                             code: *code,
                             reason: reason.clone(),
                         });
                     }
                     WebSocketSessionEvent::Closed { code, reason } => {
-                        ctx.emit(WebSocketSessionLifecycle::Closed {
+                        emitted.push(WebSocketSessionLifecycle::Closed {
                             code: *code,
                             reason: reason.clone(),
                         });
@@ -1027,14 +1030,14 @@ fn websocket_session_nodes(
                         next_attempt,
                         delay_ms,
                         error,
-                    } => ctx.emit(WebSocketSessionLifecycle::Retrying {
+                    } => emitted.push(WebSocketSessionLifecycle::Retrying {
                         attempt: *attempt,
                         next_attempt: *next_attempt,
                         delay_ms: *delay_ms,
                         error: error.clone(),
                     }),
                     WebSocketSessionEvent::Exhausted { attempt, error } => {
-                        ctx.emit(WebSocketSessionLifecycle::Exhausted {
+                        emitted.push(WebSocketSessionLifecycle::Exhausted {
                             attempt: *attempt,
                             error: error.clone(),
                         });
@@ -1043,17 +1046,20 @@ fn websocket_session_nodes(
                     WebSocketSessionEvent::Outbound(_) => {}
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/lifecycle")),
     );
     let outbound = graph.node_opts::<WebSocketSessionOutbound, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 if let WebSocketSessionEvent::Outbound(fact) = event.as_ref() {
-                    ctx.emit(fact.clone());
+                    emitted.push(fact.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/outbound")),
     );
@@ -1083,11 +1089,12 @@ fn websocket_session_nodes(
     let errors = graph.node_opts::<String, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 match event.as_ref() {
                     WebSocketSessionEvent::Retry { error, .. }
                     | WebSocketSessionEvent::Error { error, .. }
-                    | WebSocketSessionEvent::Exhausted { error, .. } => ctx.emit(error.clone()),
+                    | WebSocketSessionEvent::Exhausted { error, .. } => emitted.push(error.clone()),
                     WebSocketSessionEvent::Attempt { .. }
                     | WebSocketSessionEvent::Open { .. }
                     | WebSocketSessionEvent::Message(_)
@@ -1097,17 +1104,20 @@ fn websocket_session_nodes(
                     | WebSocketSessionEvent::Outbound(_) => {}
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/errors")),
     );
     let attempts = graph.node_opts::<u32, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WebSocketSessionEvent>() {
                 if let WebSocketSessionEvent::Attempt { attempt, .. } = event.as_ref() {
-                    ctx.emit(*attempt);
+                    emitted.push(*attempt);
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/attempts")),
     );
@@ -1742,31 +1752,35 @@ where
     let attempts = graph.node_opts::<u32, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<OutboundEvent<T, R>>() {
                 match event.as_ref() {
                     OutboundEvent::Attempt { attempt, .. }
                     | OutboundEvent::Retry { attempt, .. }
                     | OutboundEvent::Sent { attempt, .. }
-                    | OutboundEvent::Exhausted { attempt, .. } => ctx.emit(*attempt),
+                    | OutboundEvent::Exhausted { attempt, .. } => emitted.push(*attempt),
                     OutboundEvent::UpstreamComplete | OutboundEvent::UpstreamError { .. } => {}
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/attempts")),
     );
     let errors = graph.node_opts::<String, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<OutboundEvent<T, R>>() {
                 match event.as_ref() {
                     OutboundEvent::Retry { error, .. }
                     | OutboundEvent::Exhausted { error, .. }
-                    | OutboundEvent::UpstreamError { error } => ctx.emit(error.clone()),
+                    | OutboundEvent::UpstreamError { error } => emitted.push(error.clone()),
                     OutboundEvent::Attempt { .. }
                     | OutboundEvent::Sent { .. }
                     | OutboundEvent::UpstreamComplete => {}
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/errors")),
     );

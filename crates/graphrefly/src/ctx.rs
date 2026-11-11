@@ -234,22 +234,23 @@ impl Ctx {
         self.dep_records.is_empty()
     }
 
-    /// Emit one typed DATA downstream — the value-level sugar (R-primary-api-clean).
-    /// Consecutive emits of one run join one array, closed by any `down` (Rust sugar;
-    /// graphrefly:D797 (9)); the PENDING prefix is the kernel's (R-wave).
+    /// Emit one typed DATA downstream as one array of its own, the value-level sugar
+    /// (R-primary-api-clean): `ctx.emit(v)` is `ctx.down(vec![Message::Data(v)])`. Each
+    /// call is its own array (R-wave-boundary); the PENDING prefix is the kernel's.
     pub fn emit<T: 'static>(&self, v: T) {
-        if self.open() {
-            self.node.emit_value(Rc::new(v));
-        }
+        self.down(vec![Message::Data(Rc::new(v) as AnyValue)]);
     }
 
-    /// Emits each of `values`, as [`Ctx::emit`] does: they join the run's open array.
+    /// Emits `values` as one array, in order; nothing when `values` is empty. A
+    /// source that has several values at once sends them this way, so its snapshot
+    /// keeps them all (R-subscription).
     pub fn emit_all<T: 'static>(&self, values: impl IntoIterator<Item = T>) {
-        if !self.open() {
-            return;
-        }
-        for v in values {
-            self.node.emit_value(Rc::new(v));
+        let msgs: Wave<AnyValue> = values
+            .into_iter()
+            .map(|v| Message::Data(Rc::new(v) as AnyValue))
+            .collect();
+        if !msgs.is_empty() {
+            self.down(msgs);
         }
     }
 

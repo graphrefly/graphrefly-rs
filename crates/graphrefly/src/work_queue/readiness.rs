@@ -543,15 +543,17 @@ pub fn work_queue_lease_expiration_command_projector<T: Clone + 'static>(
     graph.node_opts::<WorkQueueCommand<T>, _>(
         opts.candidates.iter().map(Node::erased).collect(),
         move |ctx| {
+            let mut emitted = Vec::new();
             for index in 0..dep_count {
                 for candidate in ctx.dep(index).values::<WorkQueueReadinessCandidate>() {
                     if let Some(command) =
                         work_queue_lease_expiration_command::<T>(candidate.as_ref(), &prefix)
                     {
-                        ctx.emit(command);
+                        emitted.push(command);
                     }
                 }
             }
+            ctx.emit_all(emitted);
         },
         node_opts(name, "workQueueLeaseExpirationCommandProjector"),
     )
@@ -1340,11 +1342,13 @@ fn project_fact<T: Clone + 'static>(
     graph.node_opts::<T, _>(
         vec![runtime.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for fact in ctx.dep(0).values::<WorkQueueReadinessFact>() {
                 if let Some(value) = select(&fact) {
-                    ctx.emit(value);
+                    emitted.push(value);
                 }
             }
+            ctx.emit_all(emitted);
         },
         node_opts(name, factory),
     )

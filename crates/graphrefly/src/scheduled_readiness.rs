@@ -988,11 +988,13 @@ fn project_fact<T: Clone + 'static>(
     graph.node_opts::<T, _>(
         vec![runtime.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for fact in ctx.dep(0).values::<ScheduledReadinessFact>() {
                 if let Some(value) = select(&fact) {
-                    ctx.emit(value);
+                    emitted.push(value);
                 }
             }
+            ctx.emit_all(emitted);
         },
         node_opts(name, factory),
     )

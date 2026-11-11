@@ -1234,9 +1234,11 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, pattern_node_config(), move |ctx| {
+            let mut emitted = Vec::new();
             for snapshot in ctx.dep(0).values::<KnowledgeGraphSnapshot>() {
-                ctx.emit(select(snapshot.as_ref()));
+                emitted.push(select(snapshot.as_ref()));
             }
+            ctx.emit_all(emitted);
         }),
         vec![snapshot.erased()],
         named_graph_node_opts(name),
@@ -1435,9 +1437,11 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, pattern_node_config(), move |ctx| {
+            let mut emitted = Vec::new();
             for snapshot in ctx.dep(0).values::<MemoryRetrievalSnapshot<T>>() {
-                ctx.emit(select(snapshot.as_ref()));
+                emitted.push(select(snapshot.as_ref()));
             }
+            ctx.emit_all(emitted);
         }),
         vec![snapshot.erased()],
         named_graph_node_opts(name),

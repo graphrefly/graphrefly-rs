@@ -3611,3 +3611,59 @@ fn derived_and_effect_wait_until_every_dependency_has_a_value() {
     assert_eq!(sum.cache(), Some(7));
     assert_eq!(*effects.borrow(), vec![3, 7]);
 }
+
+/// Review Q4 (R-wave-boundary) — each ctx.emit is one array of its own, and
+/// ctx.emit_all is one array of every value it is given: emits are never joined.
+#[test]
+fn each_emit_is_one_array_and_emit_all_sends_one() {
+    let g = graphrefly::graph();
+    let trigger = g.state(0i32);
+    let n = g.node::<i32, _>(vec![trigger.erased()], |ctx| {
+        if ctx.dep(0).values::<i32>().iter().any(|v| **v == 1) {
+            ctx.emit(1i32);
+            ctx.emit(2i32);
+            ctx.emit_all([3i32, 4]);
+            ctx.emit_all(Vec::<i32>::new());
+        }
+    });
+    let (log, _u) = record_values(&n);
+    log.borrow_mut().clear();
+    trigger.set(1);
+    let data: Vec<Vec<i32>> = log
+        .borrow()
+        .iter()
+        .filter(|w| !w.is_empty())
+        .cloned()
+        .collect();
+    assert_eq!(data, vec![vec![1], vec![2], vec![3, 4]]);
+    let (snap, _u2) = record_values(&n);
+    assert_eq!(
+        *snap.borrow(),
+        vec![vec![3, 4]],
+        "a new subscriber's snapshot is the last array that carried DATA"
+    );
+}
+
+/// Review Q4 — a source with several values at once sends them as one array, and an
+/// operator over it forwards one array per run, so a late subscriber's snapshot keeps
+/// every value.
+#[test]
+fn multi_value_sources_keep_every_value_in_the_snapshot() {
+    use graphrefly::{concat, from_iter, tap};
+    let g = graphrefly::graph();
+    let src = g.init_node(from_iter(vec![1i32, 2, 3]), vec![], named("src"));
+    let tapped = g.init_node(tap::<i32>(|_| {}), vec![src.erased()], named("tap"));
+    let _keep = tapped.subscribe(|_| {});
+    let (snap, _u) = record_values(&tapped);
+    assert_eq!(snap.borrow()[0], vec![1, 2, 3]);
+
+    let a = g.init_node(from_iter(vec![1i32, 2]), vec![], named("a"));
+    let b = g.init_node(from_iter(vec![3i32, 4]), vec![], named("b"));
+    let both = g.init_node(
+        concat::<i32>(),
+        vec![a.erased(), b.erased()],
+        named("concat"),
+    );
+    let (snap, _u) = record_values(&both);
+    assert_eq!(snap.borrow()[0], vec![1, 2, 3, 4]);
+}

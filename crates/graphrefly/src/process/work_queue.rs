@@ -286,9 +286,11 @@ pub fn process_effect_submit_commands<TEffect: Clone + 'static>(
     graph.node_opts::<WorkQueueCommand<ProcessQueuedEffectPayload<TEffect>>, _>(
         vec![effect_requests.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for effect in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
-                ctx.emit(process_effect_submit_command((*effect).clone()));
+                emitted.push(process_effect_submit_command((*effect).clone()));
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(name.into()),
     )
@@ -474,11 +476,13 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
     graph.node_opts::<TOut, _>(
         vec![source.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for fact in ctx.dep(0).values::<TIn>() {
                 if let Some(value) = pick(&fact) {
-                    ctx.emit(value);
+                    emitted.push(value);
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(name),
     )

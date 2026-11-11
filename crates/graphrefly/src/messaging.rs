@@ -1192,15 +1192,17 @@ impl<T: Clone + 'static> MessageBus<T> {
         let runtime = graph.node_opts::<RuntimeEvent<T>, _>(
             vec![commands.erased()],
             move |ctx| {
+                let mut emitted = Vec::new();
                 for command in ctx.dep(0).values::<MessageBusCommand<T>>() {
                     let events = {
                         let mut state = runtime_state.borrow_mut();
                         reduce_message_bus_command(&mut state, (*command).clone())
                     };
                     for event in events {
-                        ctx.emit(event);
+                        emitted.push(event);
                     }
                 }
+                ctx.emit_all(emitted);
             },
             node_opts(format!("{name}/runtime"), "messageBusRuntime"),
         );
@@ -1210,33 +1212,39 @@ impl<T: Clone + 'static> MessageBus<T> {
         let messages = graph.node_opts::<MessageEnvelope<T>, _>(
             vec![runtime.erased()],
             move |ctx| {
+                let mut emitted = Vec::new();
                 for event in ctx.dep(0).values::<RuntimeEvent<T>>() {
                     if let RuntimeEvent::Message(message) = event.as_ref() {
-                        ctx.emit(message.clone());
+                        emitted.push(message.clone());
                     }
                 }
+                ctx.emit_all(emitted);
             },
             node_opts(format!("{name}/messages"), "messageBusMessages"),
         );
         let status = graph.node_opts::<MessageBusStatus, _>(
             vec![runtime.erased()],
             move |ctx| {
+                let mut emitted = Vec::new();
                 for event in ctx.dep(0).values::<RuntimeEvent<T>>() {
                     if let RuntimeEvent::Status(status) = event.as_ref() {
-                        ctx.emit(status.clone());
+                        emitted.push(status.clone());
                     }
                 }
+                ctx.emit_all(emitted);
             },
             node_opts(format!("{name}/status"), "messageBusStatus"),
         );
         let issues = graph.node_opts::<DataIssue, _>(
             vec![runtime.erased()],
             move |ctx| {
+                let mut emitted = Vec::new();
                 for event in ctx.dep(0).values::<RuntimeEvent<T>>() {
                     if let RuntimeEvent::Issue(issue) = event.as_ref() {
-                        ctx.emit(issue.clone());
+                        emitted.push(issue.clone());
                     }
                 }
+                ctx.emit_all(emitted);
             },
             node_opts(format!("{name}/issues"), "messageBusIssues"),
         );
@@ -1455,6 +1463,7 @@ impl<T: Clone + 'static> MessageBus<T> {
         let cursor = self.graph.node_opts::<MessageBusCursor, _>(
             vec![self.status.erased()],
             move |ctx| {
+                let mut emitted = Vec::new();
                 for status in ctx.dep(0).values::<MessageBusStatus>() {
                     let subscription_moved = status.topic.as_deref()
                         == Some(cursor_sub.topic.as_str())
@@ -1471,9 +1480,10 @@ impl<T: Clone + 'static> MessageBus<T> {
                         == Some(cursor_sub.topic.as_str())
                         && status.kind == MessageBusStatusKind::RetentionTrimmed;
                     if subscription_moved || retention_changed {
-                        ctx.emit(cursor_snapshot(&cursor_state.borrow(), &cursor_sub));
+                        emitted.push(cursor_snapshot(&cursor_state.borrow(), &cursor_sub));
                     }
                 }
+                ctx.emit_all(emitted);
             },
             node_opts(
                 format!("{projection_name}/cursor"),
@@ -1587,8 +1597,9 @@ pub fn to_topic<T: Clone + 'static>(
     let commands = graph.node_opts::<MessageBusCommand<T>, _>(
         vec![source.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for value in ctx.dep(0).values::<T>() {
-                ctx.emit(MessageBusCommand::Publish {
+                emitted.push(MessageBusCommand::Publish {
                     topic: topic_for_fn.clone(),
                     payload: (*value).clone(),
                     key: None,
@@ -1596,6 +1607,7 @@ pub fn to_topic<T: Clone + 'static>(
                     idempotency_key: None,
                 });
             }
+            ctx.emit_all(emitted);
         },
         node_opts(name.into(), "messageBusToTopic"),
     );

@@ -418,6 +418,7 @@ where
                 state.count = 0;
                 state.reset_at_ms = current.saturating_add(window_ms);
             }
+            let mut emitted = Vec::new();
             for value in ctx.dep(0).values::<T>() {
                 let kind = if state.count < max {
                     state.count = state.count.saturating_add(1);
@@ -433,12 +434,13 @@ where
                     remaining: max.saturating_sub(state.count),
                     reset_at_ms: state.reset_at_ms,
                 };
-                ctx.emit(RateLimitEvent {
+                emitted.push(RateLimitEvent {
                     kind,
                     value: (*value).clone(),
                     status,
                 });
             }
+            ctx.emit_all(emitted);
             ctx.state_set(state);
         },
         GraphNodeOpts::named(format!("{name}/events")),
@@ -446,31 +448,37 @@ where
     let allowed = graph.node_opts::<T, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<RateLimitEvent<T>>() {
                 if matches!(event.kind, RateLimitEventKind::Allowed) {
-                    ctx.emit(event.value.clone());
+                    emitted.push(event.value.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/allowed")),
     );
     let dropped = graph.node_opts::<T, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<RateLimitEvent<T>>() {
                 if matches!(event.kind, RateLimitEventKind::Dropped) {
-                    ctx.emit(event.value.clone());
+                    emitted.push(event.value.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/dropped")),
     );
     let status = graph.node_opts::<RateLimitStatus, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<RateLimitEvent<T>>() {
-                ctx.emit(event.status.clone());
+                emitted.push(event.status.clone());
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/status")),
     );

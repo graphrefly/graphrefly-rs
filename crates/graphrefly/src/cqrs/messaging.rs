@@ -164,21 +164,23 @@ pub fn cqrs_messaging_recipe<
     let runtime = graph.node_opts::<CqrsMessagingFact<TCommand>, _>(
         vec![opts.deliveries.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for page in ctx.dep(0).values::<MessageBusAvailablePage<TPayload>>() {
                 for message in &page.messages {
                     let delivery = message_delivery(page.as_ref(), message);
                     if let Some(command) = (policy.command)(message, &delivery) {
-                        ctx.emit(CqrsMessagingFact::Command(CqrsDeliveredCommand {
+                        emitted.push(CqrsMessagingFact::Command(CqrsDeliveredCommand {
                             command,
                             delivery,
                         }));
                     } else {
-                        ctx.emit(CqrsMessagingFact::<TCommand>::Issue(message_issue(
+                        emitted.push(CqrsMessagingFact::<TCommand>::Issue(message_issue(
                             &delivery,
                         )));
                     }
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );
@@ -270,6 +272,7 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
                     .or_default()
                     .push(delivered.delivery.clone());
             }
+            let mut emitted = Vec::new();
             for status in ctx.dep(1).values::<CqrsStatus>() {
                 if status.state == CqrsStatusState::Rejected && !opts.ack_rejected {
                     continue;
@@ -278,21 +281,24 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
                     continue;
                 };
                 if let Some(delivery) = shift_delivery(&mut state.deliveries, command_id) {
-                    ctx.emit(ack_command::<TCommand>(
+                    emitted.push(ack_command::<TCommand>(
                         &delivery,
                         cqrs_ack_id(&delivery, "status-ack"),
                     ));
                 }
             }
+            ctx.emit_all(emitted);
             if opts.issues.is_some() {
+                let mut emitted = Vec::new();
                 for issue in ctx.dep(2).values::<DataIssue>() {
                     if let Some(delivery) = issue_delivery(&issue) {
-                        ctx.emit(ack_command::<TCommand>(
+                        emitted.push(ack_command::<TCommand>(
                             &delivery,
                             cqrs_ack_id(&delivery, "issue-ack"),
                         ));
                     }
                 }
+                ctx.emit_all(emitted);
             }
             ctx.state_set(state);
         },
@@ -324,8 +330,9 @@ pub fn cqrs_event_outbox_commands<TEvent: Clone + 'static>(
     graph.node_opts::<MessageBusCommand<CqrsEvent<TEvent>>, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<CqrsEvent<TEvent>>() {
-                ctx.emit(MessageBusCommand::Publish {
+                emitted.push(MessageBusCommand::Publish {
                     topic: topic.clone(),
                     payload: (*event).clone(),
                     key: event.aggregate_id.clone(),
@@ -333,6 +340,7 @@ pub fn cqrs_event_outbox_commands<TEvent: Clone + 'static>(
                     idempotency_key: Some(event.id.clone()),
                 });
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(name.into()),
     )
@@ -347,11 +355,13 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
     graph.node_opts::<TOut, _>(
         vec![source.erased()],
         move |ctx: &Ctx| {
+            let mut emitted = Vec::new();
             for fact in ctx.dep(0).values::<TIn>() {
                 if let Some(value) = pick(&fact) {
-                    ctx.emit(value);
+                    emitted.push(value);
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(name),
     )

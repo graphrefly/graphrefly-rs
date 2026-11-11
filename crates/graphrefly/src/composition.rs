@@ -210,11 +210,13 @@ where
         },
         move |ctx: &Ctx| {
             if let Some(rules) = ctx.dep(rules_index).value::<R>() {
+                let mut emitted = Vec::new();
                 for value in ctx.dep(source_index).values::<T>() {
                     if classifier(rules.as_ref(), value.as_ref()) {
-                        ctx.emit((*value).clone());
+                        emitted.push((*value).clone());
                     }
                 }
+                ctx.emit_all(emitted);
             }
 
             match ctx.dep(source_index).terminal() {

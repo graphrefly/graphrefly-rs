@@ -960,8 +960,6 @@ struct NodeWaveState {
     inside_run_wave: bool,
     /// Arrays the running function sent through `ctx.down`, published after it returns.
     run_out: Vec<Wave<AnyValue>>,
-    /// The last array of `run_out` was opened by `ctx.emit` and takes further emits.
-    emit_open: bool,
     /// Acquiring dependencies (activation or rewire): their snapshots are recorded as
     /// input and the node settles once afterwards.
     in_dep_mutation: bool,
@@ -973,7 +971,6 @@ impl NodeWaveState {
             pending: false,
             inside_run_wave: false,
             run_out: Vec::new(),
-            emit_open: false,
             in_dep_mutation: false,
         }
     }
@@ -3455,7 +3452,6 @@ impl Core {
                 .collect();
             e.wave.inside_run_wave = true;
             e.wave.run_out.clear();
-            e.wave.emit_open = false;
             // A run belongs to the open lifetime; the setup runs before the
             // lifetime's first run (R-lifetime@2).
             let lifetime = a
@@ -3518,32 +3514,6 @@ impl Core {
 
     // ── downstream output (R-wave) ──
 
-    /// One DATA value from the running function (`ctx.emit`). Consecutive emits of one
-    /// run join one array; a `ctx.down` in between closes it. This is Rust sugar
-    /// (graphrefly:D797 (9) leaves the combinators' array rule to each language): an
-    /// operator that emits per value still sends what one run produced as one array.
-    pub(crate) fn emit_value(&self, value: AnyValue) {
-        let (terminal, inside) =
-            self.with_inner_edges(|_n, e| (e.value.terminal, e.wave.inside_run_wave));
-        if terminal {
-            return;
-        }
-        if !inside {
-            self.down(vec![Message::Data(value)]);
-            return;
-        }
-        self.with_inner_edges_mut(|_, e| {
-            if e.wave.emit_open {
-                if let Some(last) = e.wave.run_out.last_mut() {
-                    last.push(Message::Data(value));
-                    return;
-                }
-            }
-            e.wave.run_out.push(vec![Message::Data(value)]);
-            e.wave.emit_open = true;
-        });
-    }
-
     /// One submitted array from this node: from its running function (`ctx.down`),
     /// from the host, or as later output. The array keeps its written order, a
     /// terminal must be last, and it is split at its last INVALIDATE (R-wave). Called
@@ -3557,10 +3527,7 @@ impl Core {
         }
         let frames = prepare_output(msgs);
         if inside {
-            self.with_inner_edges_mut(|_, e| {
-                e.wave.emit_open = false;
-                e.wave.run_out.extend(frames);
-            });
+            self.with_inner_edges_mut(|_, e| e.wave.run_out.extend(frames));
             return;
         }
         if frames.is_empty() {

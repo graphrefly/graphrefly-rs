@@ -1315,9 +1315,11 @@ where
                     state.pending.remove_by_request_id(&timeout.request_id);
                 }
             }
+            let mut emitted = Vec::new();
             for response in ready {
-                ctx.emit(response);
+                emitted.push(response);
             }
+            ctx.emit_all(emitted);
         },
         no_terminal_graph_opts(format!("{name}/responses")),
     )
@@ -1576,6 +1578,7 @@ where
     graph.node_opts::<RemoteCallResult<TResponse>, _>(
         vec![responses.erased()],
         |ctx| {
+            let mut emitted = Vec::new();
             for response in ctx.dep(0).values::<RemoteCallResponse<TResponse>>() {
                 if let RemoteCallResponse::Result {
                     operation,
@@ -1583,13 +1586,14 @@ where
                     payload,
                 } = response.as_ref()
                 {
-                    ctx.emit(RemoteCallResult {
+                    emitted.push(RemoteCallResult {
                         operation: operation.clone(),
                         request_id: request_id.clone(),
                         payload: payload.clone(),
                     });
                 }
             }
+            ctx.emit_all(emitted);
         },
         no_terminal_graph_opts(format!("{name}/results")),
     )
@@ -1872,6 +1876,7 @@ where
                 }
             }
             let mut accepted_response_counts = HashMap::new();
+            let mut emitted = Vec::new();
             for response in ctx.dep(0).values::<RemoteCallResponse<TResponse>>() {
                 *accepted_response_counts
                     .entry(remote_call_response_key(response.as_ref()))
@@ -1883,7 +1888,7 @@ where
                         error,
                     } => {
                         pending.remove_by_request_id(request_id);
-                        ctx.emit(RemoteCallError {
+                        emitted.push(RemoteCallError {
                             operation: Some(operation.clone()),
                             request_id: Some(request_id.clone()),
                             error: error.clone(),
@@ -1895,14 +1900,17 @@ where
                     RemoteCallResponse::Status { .. } => {}
                 }
             }
+            ctx.emit_all(emitted);
+            let mut emitted = Vec::new();
             for timeout in ctx.dep(1).values::<RemoteCallTimeout>() {
                 pending.remove_by_request_id(&timeout.request_id);
-                ctx.emit(RemoteCallError {
+                emitted.push(RemoteCallError {
                     operation: timeout.operation.clone(),
                     request_id: Some(timeout.request_id.clone()),
                     error: timeout.error.clone(),
                 });
             }
+            ctx.emit_all(emitted);
             for event in ctx.dep(2).values::<
                 WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
             >() {
@@ -2018,12 +2026,13 @@ where
             let mut cursor = ctx
                 .state_get::<RemoteResponderCursor>()
                 .map_or_else(RemoteResponderCursor::default, |cursor| (*cursor).clone());
+            let mut emitted = Vec::new();
             for value in raw_data(ctx, 0) {
                 let ingress = match value.downcast::<WireBridgeIngress<RemoteCallRequest<TRequest>>>()
                 {
                     Ok(ingress) => (*ingress).clone(),
                     Err(_) => {
-                        ctx.emit(RemoteResponderEvent::<TRequest, TResponse>::Invalid {
+                        emitted.push(RemoteResponderEvent::<TRequest, TResponse>::Invalid {
                             error: "remoteResponder: inbound DATA must carry a wire bridge ingress fact"
                                 .to_owned(),
                         });
@@ -2035,13 +2044,13 @@ where
                         RemoteResponderInbound::Request { request, seq } => (request, seq),
                         RemoteResponderInbound::Consumed => continue,
                         RemoteResponderInbound::Invalid { error } => {
-                            ctx.emit(RemoteResponderEvent::<TRequest, TResponse>::Invalid {
+                            emitted.push(RemoteResponderEvent::<TRequest, TResponse>::Invalid {
                                 error,
                             });
                             continue;
                         }
                     };
-                ctx.emit(RemoteResponderEvent::<TRequest, TResponse>::Request {
+                emitted.push(RemoteResponderEvent::<TRequest, TResponse>::Request {
                     request: request.clone(),
                     seq,
                 });
@@ -2049,7 +2058,7 @@ where
                     if reject_unknown {
                         let error =
                             format!("remoteResponder: unknown operation '{}'", request.operation);
-                        ctx.emit(remote_responder_rejected_event::<TRequest, TResponse>(
+                        emitted.push(remote_responder_rejected_event::<TRequest, TResponse>(
                             request, error,
                         ));
                     }
@@ -2093,12 +2102,13 @@ where
                     )),
                     request_id: Some(request.request_id.clone()),
                 };
-                ctx.emit(RemoteResponderEvent::<TRequest, TResponse>::Response {
+                emitted.push(RemoteResponderEvent::<TRequest, TResponse>::Response {
                     request_id: request.request_id,
                     operation: request.operation,
                     command,
                 });
             }
+            ctx.emit_all(emitted);
             ctx.state_set(cursor);
         },
         no_terminal_graph_opts(format!("{name}/events")),
@@ -2381,6 +2391,7 @@ where
         move |ctx| {
             let state = bridge_state::<TOutbound>(ctx);
             state.borrow_mut().active = true;
+            let mut emitted = Vec::new();
             for value in raw_data(ctx, 1) {
                 match value.downcast::<WireBridgeIngress<TInbound>>() {
                     Ok(ingress) => process_inbound(
@@ -2389,12 +2400,14 @@ where
                         (*ingress).clone(),
                         &session_id,
                     ),
-                    Err(_) => ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                    Err(_) => emitted.push(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
                         error: "wireBridge: inbound DATA must carry a wire bridge envelope"
                             .to_owned(),
                     }),
                 }
             }
+            ctx.emit_all(emitted);
+            let mut emitted = Vec::new();
             for value in raw_data(ctx, 0) {
                 match value.downcast::<WireBridgeCommand<TOutbound>>() {
                     Ok(command) => {
@@ -2407,12 +2420,13 @@ where
                             &now,
                         );
                     }
-                    Err(_) => ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                    Err(_) => emitted.push(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
                         error: "wireBridge: command DATA must carry a wire bridge command"
                             .to_owned(),
                     }),
                 }
             }
+            ctx.emit_all(emitted);
             if let Some(terminal) = ctx.dep(1).terminal() {
                 let error = match terminal {
                     DepTerminal::Complete => format!(
@@ -3026,11 +3040,13 @@ where
     graph.node_opts::<WireBridgeEnvelope<TOutbound>, _>(
         vec![events.erased()],
         |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
-                    ctx.emit(envelope.clone());
+                    emitted.push(envelope.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/outbound")),
     )
@@ -3048,6 +3064,7 @@ where
     graph.node_opts::<WireBridgeAck<TInbound>, _>(
         vec![events.erased()],
         |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Ack {
                     ack_for_seq,
@@ -3055,12 +3072,13 @@ where
                     ..
                 } = event.as_ref()
                 {
-                    ctx.emit(WireBridgeAck {
+                    emitted.push(WireBridgeAck {
                         ack_for_seq: *ack_for_seq,
                         envelope: envelope.clone(),
                     });
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/acks")),
     )
@@ -3078,6 +3096,7 @@ where
     graph.node_opts::<WireBridgeNack<TInbound>, _>(
         vec![events.erased()],
         |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Nack {
                     ack_for_seq,
@@ -3086,13 +3105,14 @@ where
                     ..
                 } = event.as_ref()
                 {
-                    ctx.emit(WireBridgeNack {
+                    emitted.push(WireBridgeNack {
                         ack_for_seq: *ack_for_seq,
                         envelope: envelope.clone(),
                         error: error.clone(),
                     });
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/nacks")),
     )
@@ -3245,27 +3265,28 @@ where
     graph.node_opts::<String, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 match event.as_ref() {
                     WireBridgeEvent::Nack { error, .. }
                     | WireBridgeEvent::Exhausted { error, .. }
-                    | WireBridgeEvent::Invalid { error } => ctx.emit(error.clone()),
-                    WireBridgeEvent::OutOfOrder { seq, expected } => ctx.emit(format!(
+                    | WireBridgeEvent::Invalid { error } => emitted.push(error.clone()),
+                    WireBridgeEvent::OutOfOrder { seq, expected } => emitted.push(format!(
                         "{name}: inbound seq {seq} arrived before expected seq {expected}"
                     )),
-                    WireBridgeEvent::SessionMismatch { expected, actual } => ctx.emit(format!(
+                    WireBridgeEvent::SessionMismatch { expected, actual } => emitted.push(format!(
                         "{name}: inbound session {actual} did not match expected {expected}"
                     )),
                     WireBridgeEvent::LateReceipt {
                         receipt,
                         ack_for_seq,
-                    } => ctx.emit(format!(
+                    } => emitted.push(format!(
                         "{name}: late {receipt:?} for unknown or completed ack_for_seq {ack_for_seq}"
                     )),
                     WireBridgeEvent::Inbound { envelope }
                         if envelope.envelope_type == WireBridgeEnvelopeType::Error =>
                     {
-                        ctx.emit(payload_error_string(
+                        emitted.push(payload_error_string(
                             &envelope.payload,
                             "remote error envelope",
                         ));
@@ -3279,6 +3300,7 @@ where
                     | WireBridgeEvent::Duplicate { .. } => {}
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{node_name}/errors")),
     )
@@ -3296,11 +3318,13 @@ where
     graph.node_opts::<u64, _>(
         vec![events.erased()],
         |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Cursor { cursor } = event.as_ref() {
-                    ctx.emit(*cursor);
+                    emitted.push(*cursor);
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/cursor")),
     )
@@ -3318,10 +3342,11 @@ where
     graph.node_opts::<WireBridgeAttempt, _>(
         vec![events.erased()],
         |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
                 if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
                     if should_track_ack(envelope.envelope_type) {
-                        ctx.emit(WireBridgeAttempt {
+                        emitted.push(WireBridgeAttempt {
                             seq: envelope.metadata.seq,
                             attempt: envelope.metadata.attempt,
                             max_attempts: envelope.metadata.max_attempts,
@@ -3329,6 +3354,7 @@ where
                     }
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/attempts")),
     )

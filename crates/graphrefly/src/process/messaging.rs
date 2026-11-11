@@ -160,21 +160,23 @@ pub fn process_messaging_recipe<
     let runtime = graph.node_opts::<ProcessMessagingFact<TCommand>, _>(
         vec![opts.deliveries.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for page in ctx.dep(0).values::<MessageBusAvailablePage<TPayload>>() {
                 for message in &page.messages {
                     let delivery = message_delivery(page.as_ref(), message);
                     if let Some(command) = (policy.command)(message, &delivery) {
-                        ctx.emit(ProcessMessagingFact::Command(ProcessDeliveredCommand {
+                        emitted.push(ProcessMessagingFact::Command(ProcessDeliveredCommand {
                             command,
                             delivery,
                         }));
                     } else {
-                        ctx.emit(ProcessMessagingFact::<TCommand>::Issue(message_issue(
+                        emitted.push(ProcessMessagingFact::<TCommand>::Issue(message_issue(
                             &delivery,
                         )));
                     }
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(format!("{name}/runtime")),
     );
@@ -266,6 +268,7 @@ pub fn process_message_ack_commands<TCommand: Clone + 'static>(
                     .or_default()
                     .push(delivered.delivery.clone());
             }
+            let mut emitted = Vec::new();
             for status in ctx.dep(1).values::<ProcessStatus>() {
                 if status.state == ProcessStatusState::Rejected && !opts.ack_rejected {
                     continue;
@@ -274,21 +277,24 @@ pub fn process_message_ack_commands<TCommand: Clone + 'static>(
                     continue;
                 };
                 if let Some(delivery) = shift_delivery(&mut state.deliveries, command_id) {
-                    ctx.emit(ack_command::<TCommand>(
+                    emitted.push(ack_command::<TCommand>(
                         &delivery,
                         process_ack_id(&delivery, "status-ack"),
                     ));
                 }
             }
+            ctx.emit_all(emitted);
             if opts.issues.is_some() {
+                let mut emitted = Vec::new();
                 for issue in ctx.dep(2).values::<DataIssue>() {
                     if let Some(delivery) = issue_delivery(&issue) {
-                        ctx.emit(ack_command::<TCommand>(
+                        emitted.push(ack_command::<TCommand>(
                             &delivery,
                             process_ack_id(&delivery, "issue-ack"),
                         ));
                     }
                 }
+                ctx.emit_all(emitted);
             }
             ctx.state_set(state);
         },
@@ -320,8 +326,9 @@ pub fn process_event_outbox_commands<TEvent: Clone + 'static>(
     graph.node_opts::<MessageBusCommand<ProcessEvent<TEvent>>, _>(
         vec![events.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<ProcessEvent<TEvent>>() {
-                ctx.emit(MessageBusCommand::Publish {
+                emitted.push(MessageBusCommand::Publish {
                     topic: topic.clone(),
                     payload: (*event).clone(),
                     key: event.process_id.clone(),
@@ -329,6 +336,7 @@ pub fn process_event_outbox_commands<TEvent: Clone + 'static>(
                     idempotency_key: Some(event.id.clone()),
                 });
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(name.into()),
     )
@@ -343,11 +351,13 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
     graph.node_opts::<TOut, _>(
         vec![source.erased()],
         move |ctx: &Ctx| {
+            let mut emitted = Vec::new();
             for fact in ctx.dep(0).values::<TIn>() {
                 if let Some(value) = pick(&fact) {
-                    ctx.emit(value);
+                    emitted.push(value);
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(name),
     )

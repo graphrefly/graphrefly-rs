@@ -539,12 +539,14 @@ impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
         })?;
         let definition = ctx.resolve_definition(fn_ref)?;
         let body: NodeFn = Rc::new(move |ctx: &Ctx| {
+            let mut emitted = Vec::new();
             for value in ctx.dep(0).values::<GraphCheckpointJson>() {
                 match definition.call(value.as_ref()) {
-                    Ok(out) => ctx.emit(out),
+                    Ok(out) => emitted.push(out),
                     Err(err) => panic!("{err}"),
                 }
             }
+            ctx.emit_all(emitted);
         });
         Ok(RestoreNodeDefinition {
             factory: "map".to_owned(),
@@ -1713,10 +1715,12 @@ mod tests {
                         .state_get::<GraphCheckpointJson>()
                         .and_then(|v| v.as_i64())
                         .unwrap_or(40);
+                    let mut emitted = Vec::new();
                     for _ in ctx.dep(0).values::<GraphCheckpointJson>() {
                         acc += 1;
-                        ctx.emit(json!(acc));
+                        emitted.push(json!(acc));
                     }
+                    ctx.emit_all(emitted);
                     ctx.state_set(json!(acc));
                 })),
                 opts: restored_opts(ctx.checkpoint)?,
@@ -1737,10 +1741,12 @@ mod tests {
                     .state_get::<GraphCheckpointJson>()
                     .and_then(|v| v.as_i64())
                     .unwrap_or(40);
+                let mut emitted = Vec::new();
                 for _ in ctx.dep(0).values::<GraphCheckpointJson>() {
                     acc += 1;
-                    ctx.emit(json!(acc));
+                    emitted.push(json!(acc));
                 }
+                ctx.emit_all(emitted);
                 ctx.state_set(json!(acc));
             },
             opts,
@@ -1848,9 +1854,11 @@ mod tests {
         let doubled = g.node_opts::<GraphCheckpointJson, _>(
             vec![source.erased()],
             |ctx| {
+                let mut emitted = Vec::new();
                 for value in ctx.dep(0).values::<GraphCheckpointJson>() {
-                    ctx.emit(json!(value.as_i64().expect("number input") * 2));
+                    emitted.push(json!(value.as_i64().expect("number input") * 2));
                 }
+                ctx.emit_all(emitted);
             },
             opts,
         );
@@ -1909,9 +1917,11 @@ mod tests {
         let memo = g.node_opts::<GraphCheckpointJson, _>(
             vec![source.erased()],
             |ctx| {
+                let mut emitted = Vec::new();
                 for value in ctx.dep(0).values::<GraphCheckpointJson>() {
-                    ctx.emit(value.as_ref().clone());
+                    emitted.push(value.as_ref().clone());
                 }
+                ctx.emit_all(emitted);
             },
             opts,
         );

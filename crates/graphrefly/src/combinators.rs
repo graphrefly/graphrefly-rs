@@ -104,14 +104,16 @@ pub fn zip<T: Clone + 'static>() -> Operator<Vec<T>> {
                 }
             }
 
+            let mut emitted = Vec::new();
             while st.queues.iter().all(|q| !q.is_empty()) {
                 let tuple = st
                     .queues
                     .iter_mut()
                     .map(|q| q.pop_front().expect("zip queue is non-empty"))
                     .collect::<Vec<_>>();
-                ctx.emit(tuple);
+                emitted.push(tuple);
             }
+            ctx.emit_all(emitted);
 
             let should_complete = st
                 .complete
@@ -151,10 +153,14 @@ pub fn concat<T: Clone + 'static>() -> Operator<T> {
                     second_done: false,
                 });
 
+            // What one run forwards goes out as one array.
             if st.phase == 0 {
-                for wave in ctx.dep(0).waves::<T>() {
-                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
-                }
+                let mut emitted: Vec<T> = ctx
+                    .dep(0)
+                    .values::<T>()
+                    .iter()
+                    .map(|value| (**value).clone())
+                    .collect();
                 for value in ctx.dep(1).values::<T>() {
                     st.pending.push((*value).clone());
                 }
@@ -163,15 +169,21 @@ pub fn concat<T: Clone + 'static>() -> Operator<T> {
                 }
                 if is_complete(ctx.dep(0).terminal()) {
                     st.phase = 1;
-                    ctx.emit_all(st.pending.drain(..));
+                    emitted.append(&mut st.pending);
+                    ctx.emit_all(emitted);
                     if st.second_done {
                         ctx.down(vec![Message::Complete]);
                     }
+                } else {
+                    ctx.emit_all(emitted);
                 }
             } else {
-                for wave in ctx.dep(1).waves::<T>() {
-                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
-                }
+                ctx.emit_all(
+                    ctx.dep(1)
+                        .values::<T>()
+                        .iter()
+                        .map(|value| (**value).clone()),
+                );
                 if is_complete(ctx.dep(1).terminal()) {
                     ctx.down(vec![Message::Complete]);
                 }
@@ -231,16 +243,18 @@ pub fn race<T: Clone + 'static>() -> Operator<T> {
                     None => {}
                 }
             } else {
+                let mut emitted = Vec::new();
                 for i in 0..n {
                     let batch = ctx.dep(i).values::<T>();
                     if !batch.is_empty() {
                         st.winner = Some(i);
                         for value in batch {
-                            ctx.emit((*value).clone());
+                            emitted.push((*value).clone());
                         }
                         break;
                     }
                 }
+                ctx.emit_all(emitted);
                 if st.winner.is_none() && st.terminals.iter().all(|t| *t) {
                     ctx.state_set(st);
                     ctx.down(vec![Message::Complete]);
@@ -301,19 +315,22 @@ pub fn buffer_count<T: Clone + 'static>(count: usize) -> Operator<Vec<T>> {
                 .state_get::<Vec<T>>()
                 .map(|v| (*v).clone())
                 .unwrap_or_default();
+            let mut emitted = Vec::new();
             for value in ctx.dep(0).values::<T>() {
                 buf.push((*value).clone());
                 if buf.len() >= count {
-                    ctx.emit(std::mem::take(&mut buf));
+                    emitted.push(std::mem::take(&mut buf));
                 }
             }
             if is_complete(ctx.dep(0).terminal()) {
                 if !buf.is_empty() {
-                    ctx.emit(buf.clone());
+                    emitted.push(std::mem::take(&mut buf));
                 }
+                ctx.emit_all(emitted);
                 ctx.state_set(Vec::<T>::new());
                 ctx.down(vec![Message::Complete]);
             } else {
+                ctx.emit_all(emitted);
                 ctx.state_set(buf);
             }
         },
@@ -386,9 +403,11 @@ pub fn take_until<T: Clone + 'static>() -> Operator<T> {
                 ctx.down(vec![Message::Complete]);
                 return;
             }
+            let mut emitted = Vec::new();
             for value in ctx.dep(0).values::<T>() {
-                ctx.emit((*value).clone());
+                emitted.push((*value).clone());
             }
+            ctx.emit_all(emitted);
             if is_complete(ctx.dep(0).terminal()) {
                 ctx.down(vec![Message::Complete]);
             }

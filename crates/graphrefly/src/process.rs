@@ -909,6 +909,7 @@ pub fn process_bundle<
                         Err(message) => {
                             let mut recovery =
                                 RuntimeState::cursor_recovery(initial_state_json.clone());
+                            let mut emitted = Vec::new();
                             for command in ctx.dep(0).values::<ProcessCommand<TCommand>>() {
                                 for fact in failure::<TCommand, TState, TEvent, TEffect>(
                                     &mut recovery,
@@ -916,14 +917,16 @@ pub fn process_bundle<
                                     ProcessErrorCode::MalformedState,
                                     message.clone(),
                                 ) {
-                                    ctx.emit(fact);
+                                    emitted.push(fact);
                                 }
                             }
+                            ctx.emit_all(emitted);
                             return;
                         }
                     },
                     None => RuntimeState::new(initial_state_json.clone()),
                 };
+                let mut emitted = Vec::new();
                 for command in ctx.dep(0).values::<ProcessCommand<TCommand>>() {
                     for fact in reduce_process_command_fact(
                         &mut state,
@@ -931,10 +934,11 @@ pub fn process_bundle<
                         reduce.as_ref(),
                         now.as_ref(),
                     ) {
-                        ctx.emit(fact);
+                        emitted.push(fact);
                     }
                     ctx.state_set(state.to_json());
                 }
+                ctx.emit_all(emitted);
             }
         }),
         vec![command.erased()],
@@ -1061,9 +1065,11 @@ where
 
     let requests = graph.init_node::<ProcessEffectRequest<TEffect>>(
         Operator::with_opts("processEffectRunnerRequests", no_terminal_opts(), |ctx| {
+            let mut emitted = Vec::new();
             for request in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
-                ctx.emit((*request).clone());
+                emitted.push((*request).clone());
             }
+            ctx.emit_all(emitted);
         }),
         vec![process.effect_request.erased()],
         effect_runner_meta_opts(format!("{name}/requests"), "requests"),
@@ -1074,6 +1080,7 @@ where
         Operator::with_opts("processEffectRunner", no_terminal_opts(), {
             let outcome_count = outcome_deps.len();
             move |ctx: &Ctx| {
+                let mut emitted = Vec::new();
                 for index in 0..outcome_count {
                     for outcome in ctx.dep(index).values::<ProcessEffectOutcome<TResult>>() {
                         match process_effect_outcome_command(
@@ -1081,19 +1088,22 @@ where
                             command_payload.as_ref(),
                         ) {
                             Ok((command, payload)) => {
-                                ctx.emit(ProcessEffectRunnerFact::<TCommand, TResult>::Outcome(
-                                    (*outcome).clone(),
-                                ));
-                                ctx.emit(ProcessEffectRunnerFact::Command(command, payload));
+                                emitted.push(
+                                    ProcessEffectRunnerFact::<TCommand, TResult>::Outcome(
+                                        (*outcome).clone(),
+                                    ),
+                                );
+                                emitted.push(ProcessEffectRunnerFact::Command(command, payload));
                             }
                             Err(error) => {
-                                ctx.emit(ProcessEffectRunnerFact::<TCommand, TResult>::Error(
+                                emitted.push(ProcessEffectRunnerFact::<TCommand, TResult>::Error(
                                     *error,
                                 ));
                             }
                         }
                     }
                 }
+                ctx.emit_all(emitted);
             }
         }),
         outcome_deps,
@@ -1137,9 +1147,10 @@ where
                 .map_or_else(ProcessEffectRunnerCounters::default, |state| {
                     (*state).clone()
                 });
+            let mut emitted = Vec::new();
             for request in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
                 counters.requested += 1;
-                ctx.emit(ProcessEffectRunnerStatus {
+                emitted.push(ProcessEffectRunnerStatus {
                     state: ProcessEffectRunnerStatusState::Requested,
                     effect_id: Some(request.id.clone()),
                     effect_type: Some(request.effect_type.clone()),
@@ -1150,6 +1161,7 @@ where
                     rejected: counters.rejected,
                 });
             }
+            ctx.emit_all(emitted);
             for fact in ctx
                 .dep(1)
                 .values::<ProcessEffectRunnerFact<TCommand, TResult>>()

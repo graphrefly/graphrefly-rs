@@ -408,10 +408,12 @@ pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
 /// tap: run a side-effect for each DATA occurrence and pass values through unchanged.
 pub fn tap<S: Clone + 'static>(f: impl Fn(&S) + 'static) -> Operator<S> {
     Operator::new("tap", move |ctx| {
+        let mut emitted = Vec::new();
         for value in ctx.dep(0).values::<S>() {
             f(value.as_ref());
-            ctx.emit((*value).clone());
+            emitted.push((*value).clone());
         }
+        ctx.emit_all(emitted);
     })
 }
 
@@ -427,13 +429,15 @@ pub fn on_first_data_where<S: Clone + 'static>(
 ) -> Operator<S> {
     Operator::new("onFirstData", move |ctx| {
         let mut fired = ctx.state_get::<bool>().is_some_and(|v| *v);
+        let mut emitted = Vec::new();
         for value in ctx.dep(0).values::<S>() {
             if !fired && where_pred(value.as_ref()) {
                 fired = true;
                 f(value.as_ref());
             }
-            ctx.emit((*value).clone());
+            emitted.push((*value).clone());
         }
+        ctx.emit_all(emitted);
         ctx.state_set(fired);
     })
 }
@@ -478,14 +482,16 @@ pub fn settle_by<S: Clone + 'static>(
         }
         st.waves += 1;
         let mut saw_change = false;
+        let mut emitted = Vec::new();
         for value in ctx.dep(0).values::<S>() {
             let next = (*value).clone();
             if st.last.as_ref().is_none_or(|prev| !equals(prev, &next)) {
                 saw_change = true;
             }
             st.last = Some(next.clone());
-            ctx.emit(next);
+            emitted.push(next);
         }
+        ctx.emit_all(emitted);
         st.quiet = if saw_change { 0 } else { st.quiet + 1 };
         let settled = st.last.is_some() && st.quiet >= quiet_waves;
         let exhausted = max_waves.is_some_and(|max| st.waves >= max);
@@ -517,9 +523,11 @@ pub fn rescue<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) -> Oper
             ..NodeOpts::default()
         },
         move |ctx| {
+            let mut emitted = Vec::new();
             for value in ctx.dep(0).values::<S>() {
-                ctx.emit((*value).clone());
+                emitted.push((*value).clone());
             }
+            ctx.emit_all(emitted);
             match ctx.dep(0).terminal() {
                 Some(DepTerminal::Complete) => ctx.down(vec![Message::Complete]),
                 Some(DepTerminal::Error(error)) => ctx.emit(recover(error.as_ref())),
@@ -569,9 +577,11 @@ pub fn valve<S: Clone + 'static>() -> Operator<S> {
                     }
                 }
             } else {
+                let mut emitted = Vec::new();
                 for value in source_batch {
-                    ctx.emit((*value).clone());
+                    emitted.push((*value).clone());
                 }
+                ctx.emit_all(emitted);
             }
         },
     )

@@ -1520,6 +1520,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                 .dep(1)
                 .values::<MessageBusAvailablePage<WorkQueueSubmit<T>>>()
             {
+                let mut emitted = Vec::new();
                 for message in &page.messages {
                     let now_ms = timestamp_or_zero(&runtime_opts.now);
                     let events = {
@@ -1527,10 +1528,12 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                         admit_message(&runtime_opts, &mut state, message, now_ms)
                     };
                     for event in events {
-                        ctx.emit(event);
+                        emitted.push(event);
                     }
                 }
+                ctx.emit_all(emitted);
             }
+            let mut emitted = Vec::new();
             for command in ctx.dep(0).values::<WorkQueueCommand<T>>() {
                 let now_ms = command
                     .now_ms()
@@ -1540,42 +1543,49 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                     reduce_queue_command(&runtime_opts, &mut state, (*command).clone(), now_ms)
                 };
                 for event in events {
-                    ctx.emit(event);
+                    emitted.push(event);
                 }
             }
+            ctx.emit_all(emitted);
         },
         node_opts(format!("{name}/runtime"), "workQueueRuntime"),
     );
     let records = graph.node_opts::<WorkQueueRecord<T>, _>(
         vec![runtime.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<QueueEvent<T>>() {
                 if let QueueEvent::Record(record) = event.as_ref() {
-                    ctx.emit(record.clone());
+                    emitted.push(record.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         node_opts(format!("{name}/records"), "workQueueRecords"),
     );
     let status = graph.node_opts::<WorkQueueStatus, _>(
         vec![runtime.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<QueueEvent<T>>() {
                 if let QueueEvent::Status(status) = event.as_ref() {
-                    ctx.emit(status.clone());
+                    emitted.push(status.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         node_opts(format!("{name}/status"), "workQueueStatus"),
     );
     let issues = graph.node_opts::<DataIssue, _>(
         vec![runtime.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<QueueEvent<T>>() {
                 if let QueueEvent::Issue(issue) = event.as_ref() {
-                    ctx.emit(issue.clone());
+                    emitted.push(issue.clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
         node_opts(format!("{name}/issues"), "workQueueIssues"),
     );
@@ -1583,11 +1593,13 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
         vec![records.erased()],
         {
             move |ctx| {
+                let mut emitted = Vec::new();
                 for record in ctx.dep(0).values::<WorkQueueRecord<T>>() {
                     if let Some(command) = admission_ack_command(&record) {
-                        ctx.emit(command);
+                        emitted.push(command);
                     }
                 }
+                ctx.emit_all(emitted);
             }
         },
         node_opts(
@@ -1627,11 +1639,13 @@ fn work_queue_command_body<T: Clone + 'static>(
     command_source_count: usize,
 ) -> impl Fn(&Ctx) + 'static {
     move |ctx| {
+        let mut emitted = Vec::new();
         for index in 0..command_source_count {
             for command in ctx.dep(index).values::<WorkQueueCommand<T>>() {
-                ctx.emit((*command).clone());
+                emitted.push((*command).clone());
             }
         }
+        ctx.emit_all(emitted);
     }
 }
 

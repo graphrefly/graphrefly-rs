@@ -1849,11 +1849,13 @@ pub fn merge_reactive_logs<T: Clone + 'static>(logs: Vec<ReactiveLog<T>>) -> Nod
             ..NodeOpts::default()
         },
         move |ctx| {
+            let mut emitted = Vec::new();
             for i in 0..logs.len() {
                 for change in ctx.dep(i).values::<LogChange<T>>() {
-                    ctx.emit((*change).clone());
+                    emitted.push((*change).clone());
                 }
             }
+            ctx.emit_all(emitted);
         },
     )
 }
@@ -2342,9 +2344,11 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
             ..NodeOpts::default()
         },
         move |ctx| {
+            let mut emitted = Vec::new();
             for change in ctx.dep(0).values::<C>() {
-                ctx.emit((*change).clone());
+                emitted.push((*change).clone());
             }
+            ctx.emit_all(emitted);
         },
     );
     let delta = match group.as_ref() {

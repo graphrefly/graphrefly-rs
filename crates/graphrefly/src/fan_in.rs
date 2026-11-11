@@ -53,11 +53,13 @@ impl FanInSources {
             if !current {
                 ctx.rewire(wanted);
             }
+            let mut emitted = Vec::new();
             for i in 0..ctx.dep_len() {
                 for value in ctx.dep(i).values::<T>() {
-                    ctx.emit((*value).clone());
+                    emitted.push((*value).clone());
                 }
             }
+            ctx.emit_all(emitted);
         }
     }
 

@@ -630,11 +630,13 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
     graph.node_opts::<TOut, _>(
         vec![source.erased()],
         move |ctx| {
+            let mut emitted = Vec::new();
             for fact in ctx.dep(0).values::<TIn>() {
                 if let Some(value) = pick(&fact) {
-                    ctx.emit(value);
+                    emitted.push(value);
                 }
             }
+            ctx.emit_all(emitted);
         },
         GraphNodeOpts::named(name),
     )

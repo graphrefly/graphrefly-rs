@@ -331,12 +331,13 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                 .state_get::<SeqState>()
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
+            let mut emitted = Vec::new();
             for event in ctx.dep(0).values::<CascadingCacheEvent<V>>() {
                 match event.as_ref() {
                     CascadingCacheEvent::Request { key, request_seq }
                     | CascadingCacheEvent::Invalidate { key, request_seq } => {
                         st.seq = *request_seq;
-                        ctx.emit(CascadingCacheStatus::Loading {
+                        emitted.push(CascadingCacheStatus::Loading {
                             key: key.clone(),
                             request_seq: *request_seq,
                         });
@@ -349,29 +350,31 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                         error,
                         ..
                     } if *request_seq == st.seq => match status {
-                        TieredReadThroughStatus::Hit => ctx.emit(CascadingCacheStatus::Hit {
+                        TieredReadThroughStatus::Hit => emitted.push(CascadingCacheStatus::Hit {
                             key: key.clone(),
                             request_seq: *request_seq,
                             tier: tier.clone(),
                         }),
-                        TieredReadThroughStatus::Miss => ctx.emit(CascadingCacheStatus::Miss {
+                        TieredReadThroughStatus::Miss => emitted.push(CascadingCacheStatus::Miss {
                             key: key.clone(),
                             request_seq: *request_seq,
                         }),
-                        TieredReadThroughStatus::Error => ctx.emit(CascadingCacheStatus::Error {
-                            key: key.clone(),
-                            request_seq: *request_seq,
-                            error: error
-                                .clone()
-                                .unwrap_or_else(|| StorageError::backend("read-through failed")),
-                        }),
+                        TieredReadThroughStatus::Error => {
+                            emitted.push(CascadingCacheStatus::Error {
+                                key: key.clone(),
+                                request_seq: *request_seq,
+                                error: error.clone().unwrap_or_else(|| {
+                                    StorageError::backend("read-through failed")
+                                }),
+                            })
+                        }
                     },
                     CascadingCacheEvent::Error {
                         key,
                         request_seq,
                         error,
                         ..
-                    } if *request_seq == st.seq => ctx.emit(CascadingCacheStatus::Error {
+                    } if *request_seq == st.seq => emitted.push(CascadingCacheStatus::Error {
                         key: key.clone(),
                         request_seq: *request_seq,
                         error: error.clone(),
@@ -379,6 +382,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                     _ => {}
                 }
             }
+            ctx.emit_all(emitted);
             ctx.state_set(st);
         },
         GraphNodeOpts {

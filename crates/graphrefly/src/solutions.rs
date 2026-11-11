@@ -1884,9 +1884,11 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, solution_node_config(), move |ctx| {
+            let mut emitted = Vec::new();
             for projection in ctx.dep(0).values::<AgenticMemoryProjection<T>>() {
-                ctx.emit(select(projection.as_ref()));
+                emitted.push(select(projection.as_ref()));
             }
+            ctx.emit_all(emitted);
         }),
         vec![projection.erased()],
         named_solution_node_opts(name),
@@ -1907,9 +1909,11 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, solution_node_config(), move |ctx| {
+            let mut emitted = Vec::new();
             for context in ctx.dep(0).values::<AgenticMemoryContext<T>>() {
-                ctx.emit(select(context.as_ref()));
+                emitted.push(select(context.as_ref()));
             }
+            ctx.emit_all(emitted);
         }),
         vec![context.erased()],
         named_solution_node_opts(name),
@@ -1930,9 +1934,11 @@ where
 {
     graph.init_node(
         Operator::with_opts(factory, solution_node_config(), move |ctx| {
+            let mut emitted = Vec::new();
             for snapshot in ctx.dep(0).values::<S>() {
-                ctx.emit(select(snapshot.as_ref()));
+                emitted.push(select(snapshot.as_ref()));
             }
+            ctx.emit_all(emitted);
         }),
         vec![snapshot.erased()],
         named_solution_node_opts(name),
