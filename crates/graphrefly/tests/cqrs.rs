@@ -19,11 +19,16 @@ fn last_or_prev(values: &Values<'_>, i: usize) -> Option<Rc<i32>> {
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                seen_sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                    seen_sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -351,7 +356,7 @@ fn cqrs_runtime_state_is_checkpoint_json_friendly() {
     );
 
     app.dispatch(CqrsCommand::new("cmd-1", "PlaceOrder", "o1".to_owned()));
-    app.command.down(vec![Message::Invalidate]);
+    app.command.invalidate();
 
     let checkpoint = g.checkpoint().expect("checkpoint succeeds");
     let runtime = checkpoint

@@ -165,7 +165,8 @@ pub struct ReactiveCascadingCacheOptions<V: Clone + 'static> {
 
 impl<V: Clone + 'static> ReactiveCascadingCacheOptions<V> {
     /// Creates or computes `new`.
-    pub fn new(request: Node<String>, tiers: Vec<Rc<dyn KvStorageTier<V>>>) -> Self {
+    pub fn new(request: impl Into<Node<String>>, tiers: Vec<Rc<dyn KvStorageTier<V>>>) -> Self {
+        let request: Node<String> = request.into();
         Self {
             request,
             policy: None,

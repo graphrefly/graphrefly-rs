@@ -139,9 +139,11 @@ pub struct CqrsWorkQueueRecipeOptions<TCommand> {
 impl<TCommand> CqrsWorkQueueRecipeOptions<TCommand> {
     /// Creates or computes `new`.
     pub fn new(
-        records: Node<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>>,
-        status: Node<CqrsStatus>,
+        records: impl Into<Node<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>>>,
+        status: impl Into<Node<CqrsStatus>>,
     ) -> Self {
+        let records: Node<WorkQueueRecord<CqrsQueuedCommandPayload<TCommand>>> = records.into();
+        let status: Node<CqrsStatus> = status.into();
         Self {
             name: "cqrsWorkQueue".to_owned(),
             records,
@@ -159,7 +161,8 @@ impl<TCommand> CqrsWorkQueueRecipeOptions<TCommand> {
     }
 
     /// Updates or reads `with_errors`.
-    pub fn with_errors(mut self, errors: Node<CqrsError<TCommand>>) -> Self {
+    pub fn with_errors(mut self, errors: impl Into<Node<CqrsError<TCommand>>>) -> Self {
+        let errors: Node<CqrsError<TCommand>> = errors.into();
         self.errors = Some(errors);
         self
     }

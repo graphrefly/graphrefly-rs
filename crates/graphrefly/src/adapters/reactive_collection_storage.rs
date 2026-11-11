@@ -866,74 +866,81 @@ where
     let cadence_snapshot_due_for_sub = cadence_snapshot_due.clone();
     let armed = Rc::new(Cell::new(false));
     let armed_for_sub = armed.clone();
-    let unsub = delta.subscribe(move |message| {
-        if disposed_for_sub.get() || errored_for_sub.get() {
-            return;
-        }
-        let Message::Data(value) = message else {
-            return;
-        };
-        if !armed_for_sub.get() {
-            return;
-        }
-        let Some(change) = value.as_ref().downcast_ref::<C>() else {
-            return;
-        };
-        ready_for_sub.set(false);
-        status_for_sub.set(status_json(
-            ReactiveCollectionPersistenceStatus::Flushing,
-            pending_changes_for_sub.borrow().len(),
-            error_count_for_sub.get(),
-            cursor_json(
-                kind,
-                cursor_cell_for_sub.get(),
-                snapshot_writes_for_sub.get(),
-                change_writes_for_sub.get(),
-            ),
-        ));
-        let result = (|| {
-            apply_change_for_sub(&mut snapshot_state_for_sub.borrow_mut(), change)?;
-            let change_value = encode_change(change)?;
-            let frame = reactive_collection_change_frame(kind, change_value)?;
-            if change_log_for_sub.is_some() {
-                pending_changes_for_sub.borrow_mut().push(frame);
-            } else {
-                snapshot_dirty_for_sub.set(true);
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                error_for_sub.set(Value::Null);
-                let next = changes_since_snapshot_for_sub.get().saturating_add(1);
-                changes_since_snapshot_for_sub.set(next);
-                if snapshot_every_changes.is_some_and(|every| next >= every) {
-                    changes_since_snapshot_for_sub.set(0);
-                    cadence_snapshot_due_for_sub.set(true);
+    let unsub = delta.subscribe(
+        move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+            let handle = |message: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                if disposed_for_sub.get() || errored_for_sub.get() {
+                    return;
                 }
-            }
-            Err(err) => {
-                record_persistence_error(
-                    PersistenceErrorTargets {
-                        ready: &ready_for_sub,
-                        status: &status_for_sub,
-                        error: &error_for_sub,
-                        errored: &errored_for_sub,
-                        error_count: &error_count_for_sub,
-                    },
-                    PersistenceErrorFacts {
+                let Message::Data(value) = message else {
+                    return;
+                };
+                if !armed_for_sub.get() {
+                    return;
+                }
+                let Some(change) = value.as_ref().downcast_ref::<C>() else {
+                    return;
+                };
+                ready_for_sub.set(false);
+                status_for_sub.set(status_json(
+                    ReactiveCollectionPersistenceStatus::Flushing,
+                    pending_changes_for_sub.borrow().len(),
+                    error_count_for_sub.get(),
+                    cursor_json(
                         kind,
-                        cursor: cursor_cell_for_sub.get(),
-                        snapshot_writes: snapshot_writes_for_sub.get(),
-                        change_writes: change_writes_for_sub.get(),
-                        pending: pending_changes_for_sub.borrow().len(),
-                    },
-                    "change",
-                    err,
-                );
+                        cursor_cell_for_sub.get(),
+                        snapshot_writes_for_sub.get(),
+                        change_writes_for_sub.get(),
+                    ),
+                ));
+                let result = (|| {
+                    apply_change_for_sub(&mut snapshot_state_for_sub.borrow_mut(), change)?;
+                    let change_value = encode_change(change)?;
+                    let frame = reactive_collection_change_frame(kind, change_value)?;
+                    if change_log_for_sub.is_some() {
+                        pending_changes_for_sub.borrow_mut().push(frame);
+                    } else {
+                        snapshot_dirty_for_sub.set(true);
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        error_for_sub.set(Value::Null);
+                        let next = changes_since_snapshot_for_sub.get().saturating_add(1);
+                        changes_since_snapshot_for_sub.set(next);
+                        if snapshot_every_changes.is_some_and(|every| next >= every) {
+                            changes_since_snapshot_for_sub.set(0);
+                            cadence_snapshot_due_for_sub.set(true);
+                        }
+                    }
+                    Err(err) => {
+                        record_persistence_error(
+                            PersistenceErrorTargets {
+                                ready: &ready_for_sub,
+                                status: &status_for_sub,
+                                error: &error_for_sub,
+                                errored: &errored_for_sub,
+                                error_count: &error_count_for_sub,
+                            },
+                            PersistenceErrorFacts {
+                                kind,
+                                cursor: cursor_cell_for_sub.get(),
+                                snapshot_writes: snapshot_writes_for_sub.get(),
+                                change_writes: change_writes_for_sub.get(),
+                                pending: pending_changes_for_sub.borrow().len(),
+                            },
+                            "change",
+                            err,
+                        );
+                    }
+                }
+            };
+            for message in msgs {
+                handle(message);
             }
-        }
-    });
+        },
+    );
     armed.set(true);
 
     let dispose = {
@@ -1010,7 +1017,9 @@ fn drain_pending_changes(
 }
 
 fn persistence_fact<T: 'static>(graph: &Graph, name: String, initial: T) -> Node<T> {
-    graph.state_opts(initial, GraphNodeOpts::named(name))
+    graph
+        .state_opts(initial, GraphNodeOpts::named(name))
+        .into_node()
 }
 
 fn resolve_snapshot_key(options: &PersistReactiveCollectionOptions) -> StorageResult<String> {

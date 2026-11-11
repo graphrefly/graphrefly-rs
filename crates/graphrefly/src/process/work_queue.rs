@@ -122,7 +122,10 @@ pub struct ProcessWorkQueueRecipeOptions<TEffect> {
 
 impl<TEffect> ProcessWorkQueueRecipeOptions<TEffect> {
     /// Creates or computes `new`.
-    pub fn new(records: Node<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>>) -> Self {
+    pub fn new(
+        records: impl Into<Node<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>>>,
+    ) -> Self {
+        let records: Node<WorkQueueRecord<ProcessQueuedEffectPayload<TEffect>>> = records.into();
         Self {
             name: "processWorkQueue".to_owned(),
             effect_requests: None,
@@ -139,8 +142,9 @@ impl<TEffect> ProcessWorkQueueRecipeOptions<TEffect> {
     /// Updates or reads `with_effect_requests`.
     pub fn with_effect_requests(
         mut self,
-        effect_requests: Node<ProcessEffectRequest<TEffect>>,
+        effect_requests: impl Into<Node<ProcessEffectRequest<TEffect>>>,
     ) -> Self {
+        let effect_requests: Node<ProcessEffectRequest<TEffect>> = effect_requests.into();
         self.effect_requests = Some(effect_requests);
         self
     }
@@ -273,9 +277,10 @@ pub fn process_effect_submit_command<TEffect: Clone>(
 /// Creates or computes `process_effect_submit_commands`.
 pub fn process_effect_submit_commands<TEffect: Clone + 'static>(
     graph: &Graph,
-    effect_requests: Node<ProcessEffectRequest<TEffect>>,
+    effect_requests: impl Into<Node<ProcessEffectRequest<TEffect>>>,
     name: impl Into<String>,
 ) -> Node<WorkQueueCommand<ProcessQueuedEffectPayload<TEffect>>> {
+    let effect_requests: Node<ProcessEffectRequest<TEffect>> = effect_requests.into();
     graph.node_opts::<WorkQueueCommand<ProcessQueuedEffectPayload<TEffect>>, _>(
         vec![effect_requests.erased()],
         move |ctx| {

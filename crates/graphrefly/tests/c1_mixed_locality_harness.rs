@@ -48,11 +48,16 @@ fn wire_edge_cause_id(group_id: &str, seq: u64) -> String {
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.downcast_ref::<T>() {
-                seen_sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.downcast_ref::<T>() {
+                    seen_sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -165,19 +170,24 @@ fn capture_outbound_bytes(
 ) -> Rc<RefCell<VecDeque<Vec<u8>>>> {
     let queue = Rc::new(RefCell::new(VecDeque::new()));
     let queue_sink = queue.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(envelope) =
-                value.downcast_ref::<graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody>>()
-            {
-                let encoded =
-                    encode_wire_bridge_protobuf_bytes(&semantic_to_protobuf_envelope(envelope));
-                assert_eq!(encoded.status.kind, WireBridgeProtobufStatusKind::Valid);
-                assert!(encoded.issues.is_empty());
-                queue_sink
-                    .borrow_mut()
-                    .push_back(encoded.bytes.expect("valid encode yields bytes"));
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(envelope) = value
+                    .downcast_ref::<graphrefly::WireBridgeEnvelope<WireBridgeProtobufDataBody>>()
+                {
+                    let encoded =
+                        encode_wire_bridge_protobuf_bytes(&semantic_to_protobuf_envelope(envelope));
+                    assert_eq!(encoded.status.kind, WireBridgeProtobufStatusKind::Valid);
+                    assert!(encoded.issues.is_empty());
+                    queue_sink
+                        .borrow_mut()
+                        .push_back(encoded.bytes.expect("valid encode yields bytes"));
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     queue

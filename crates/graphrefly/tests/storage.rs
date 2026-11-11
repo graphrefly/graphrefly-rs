@@ -93,11 +93,16 @@ type KindLog = (Rc<RefCell<Vec<&'static str>>>, Box<dyn FnOnce()>);
 fn data_of<T: Clone + 'static>(node: &Node<T>) -> Collected<T> {
     let out = Rc::new(RefCell::new(Vec::new()));
     let sink = out.clone();
-    let unsub = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                sink.borrow_mut().push(value.clone());
+    let unsub = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                    sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     (out, unsub)
@@ -106,17 +111,22 @@ fn data_of<T: Clone + 'static>(node: &Node<T>) -> Collected<T> {
 fn message_kinds<T: 'static>(node: &Node<T>) -> KindLog {
     let out = Rc::new(RefCell::new(Vec::new()));
     let sink = out.clone();
-    let unsub = node.subscribe(move |msg| {
-        let kind = match msg {
-            Message::Start => "START",
-            Message::Pending => "PENDING",
-            Message::Data(_) => "DATA",
-            Message::Resolved => "RESOLVED",
-            Message::Invalidate => "INVALIDATE",
-            Message::Complete => "COMPLETE",
-            Message::Error(_) => "ERROR",
+    let unsub = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            let kind = match msg {
+                Message::Start => "START",
+                Message::Pending => "PENDING",
+                Message::Data(_) => "DATA",
+                Message::Resolved => "RESOLVED",
+                Message::Invalidate => "INVALIDATE",
+                Message::Complete => "COMPLETE",
+                Message::Error(_) => "ERROR",
+            };
+            sink.borrow_mut().push(kind);
         };
-        sink.borrow_mut().push(kind);
+        for msg in msgs {
+            handle(msg);
+        }
     });
     (out, unsub)
 }
@@ -3018,11 +3028,11 @@ fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() 
     let cache = reactive_cascading_cache(
         &g,
         ReactiveCascadingCacheOptions {
-            request: request.clone(),
+            request: request.node().clone(),
             tiers: vec![Rc::new(hot.clone()), Rc::new(cold.clone())],
             tier_names: vec!["hot".to_owned(), "cold".to_owned()],
             name: Some("cache".to_owned()),
-            ..ReactiveCascadingCacheOptions::new(request.clone(), Vec::new())
+            ..ReactiveCascadingCacheOptions::new(request.node().clone(), Vec::new())
         },
     );
     let (statuses, _status_unsub) = data_of(&cache.status);
@@ -3030,7 +3040,7 @@ fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() 
     let (events, _events_unsub) = data_of(&cache.events);
 
     assert_eq!(*statuses.borrow(), vec![CascadingCacheStatus::Idle]);
-    request.down(vec![Message::Data(Rc::new("user:1".to_owned()))]);
+    request.set("user:1".to_owned());
 
     let snap = g.describe();
     let mut ids = snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>();
@@ -3080,7 +3090,7 @@ fn reactive_cascading_cache_promotes_only_when_explicitly_enabled() {
     let cold = memory_kv::<i32>();
     cold.set("k", 42).unwrap();
     let mut opts = ReactiveCascadingCacheOptions::new(
-        request.clone(),
+        request.node().clone(),
         vec![Rc::new(hot.clone()), Rc::new(cold.clone())],
     );
     opts.tier_names = vec!["hot".to_owned(), "cold".to_owned()];
@@ -3091,7 +3101,7 @@ fn reactive_cascading_cache_promotes_only_when_explicitly_enabled() {
     let (_values, _value_unsub) = data_of(&cache.value);
     let (events, _events_unsub) = data_of(&cache.events);
 
-    request.down(vec![Message::Data(Rc::new("k".to_owned()))]);
+    request.set("k".to_owned());
 
     assert_eq!(cache.value.cache(), Some(42));
     assert_eq!(hot.get("k").unwrap(), Some(42));
@@ -3112,7 +3122,7 @@ fn reactive_cascading_cache_uses_versioned_promotion_without_overwriting_stale_t
     let cold = memory_kv::<i32>();
     cold.set("k", 7).unwrap();
     let mut opts = ReactiveCascadingCacheOptions::new(
-        request.clone(),
+        request.node().clone(),
         vec![Rc::new(hot), Rc::new(cold.clone())],
     );
     opts.promote_to = PromotionPolicy::Indices(vec![0]);
@@ -3122,7 +3132,7 @@ fn reactive_cascading_cache_uses_versioned_promotion_without_overwriting_stale_t
     let (_values, _value_unsub) = data_of(&cache.value);
     let (events, _events_unsub) = data_of(&cache.events);
 
-    request.down(vec![Message::Data(Rc::new("k".to_owned()))]);
+    request.set("k".to_owned());
 
     assert_eq!(cache.value.cache(), Some(7));
     assert_eq!(hot_inner.get("k").unwrap(), Some(1));
@@ -3147,11 +3157,11 @@ fn reactive_cascading_cache_loader_fallback_policy_and_invalidation_are_graph_ev
     let load_calls = Rc::new(RefCell::new(Vec::new()));
     let calls = load_calls.clone();
     let mut opts = ReactiveCascadingCacheOptions::new(
-        request.clone(),
+        request.node().clone(),
         vec![Rc::new(hot.clone()), Rc::new(cold.clone())],
     );
-    opts.policy = Some(policy.clone());
-    opts.invalidate = Some(invalidate.clone());
+    opts.policy = Some(policy.node().clone());
+    opts.invalidate = Some(invalidate.node().clone());
     opts.load = Some(Rc::new(move |key| {
         calls.borrow_mut().push(key.to_owned());
         Ok(if key == "remote" { Some(9) } else { None })
@@ -3162,7 +3172,7 @@ fn reactive_cascading_cache_loader_fallback_policy_and_invalidation_are_graph_ev
     let (value_kinds, _value_kind_unsub) = message_kinds(&cache.value);
     let (events, _events_unsub) = data_of(&cache.events);
 
-    request.down(vec![Message::Data(Rc::new("remote".to_owned()))]);
+    request.set("remote".to_owned());
 
     assert_eq!(cache.value.cache(), Some(9));
     assert_eq!(hot.get("remote").unwrap(), None);
@@ -3179,12 +3189,12 @@ fn reactive_cascading_cache_loader_fallback_policy_and_invalidation_are_graph_ev
     );
 
     cold.set("remote", 3).unwrap();
-    policy.down(vec![Message::Data(Rc::new(CascadingCachePolicy {
+    policy.set(CascadingCachePolicy {
         promote_to: Some(PromotionPolicy::Indices(vec![0])),
-    }))]);
+    });
     assert_eq!(hot.get("remote").unwrap(), Some(3));
 
-    invalidate.down(vec![Message::Data(Rc::new("remote".to_owned()))]);
+    invalidate.set("remote".to_owned());
 
     assert_eq!(
         events
@@ -3202,7 +3212,7 @@ fn reactive_cascading_cache_loader_fallback_policy_and_invalidation_are_graph_ev
 fn reactive_cascading_cache_load_panic_becomes_error_events_not_terminal_error() {
     let g = graph();
     let request = g.state_empty::<String>();
-    let mut opts = ReactiveCascadingCacheOptions::new(request.clone(), Vec::new());
+    let mut opts = ReactiveCascadingCacheOptions::new(request.node().clone(), Vec::new());
     opts.load = Some(Rc::new(|_| -> StorageResult<Option<i32>> {
         panic!("loader exploded")
     }));
@@ -3211,7 +3221,7 @@ fn reactive_cascading_cache_load_panic_becomes_error_events_not_terminal_error()
     let (statuses, _status_unsub) = data_of(&cache.status);
     let (events, _events_unsub) = data_of(&cache.events);
 
-    request.down(vec![Message::Data(Rc::new("k".to_owned()))]);
+    request.set("k".to_owned());
 
     assert_eq!(cache.events.status(), graphrefly::Status::Settled);
     assert_eq!(

@@ -95,10 +95,12 @@ pub struct CqrsMessagingRecipeOptions<TPayload, TCommand, TEvent> {
 impl<TPayload, TCommand, TEvent> CqrsMessagingRecipeOptions<TPayload, TCommand, TEvent> {
     /// Creates or computes `new`.
     pub fn new(
-        deliveries: Node<MessageBusAvailablePage<TPayload>>,
-        status: Node<CqrsStatus>,
+        deliveries: impl Into<Node<MessageBusAvailablePage<TPayload>>>,
+        status: impl Into<Node<CqrsStatus>>,
         policy: CqrsMessagingPolicy<TPayload, TCommand>,
     ) -> Self {
+        let deliveries: Node<MessageBusAvailablePage<TPayload>> = deliveries.into();
+        let status: Node<CqrsStatus> = status.into();
         Self {
             name: "cqrsMessaging".to_owned(),
             deliveries,
@@ -115,7 +117,8 @@ impl<TPayload, TCommand, TEvent> CqrsMessagingRecipeOptions<TPayload, TCommand, 
     }
 
     /// Updates or reads `with_events`.
-    pub fn with_events(mut self, events: Node<CqrsEvent<TEvent>>) -> Self {
+    pub fn with_events(mut self, events: impl Into<Node<CqrsEvent<TEvent>>>) -> Self {
+        let events: Node<CqrsEvent<TEvent>> = events.into();
         self.events = Some(events);
         self
     }
@@ -294,7 +297,14 @@ pub fn cqrs_message_ack_commands<TCommand: Clone + 'static>(
             ctx.state_set(state);
             ctx.state_persist(true);
         },
-        GraphNodeOpts::named(opts.name),
+        {
+            // Every delivery is folded as it arrives, before any status exists: the
+            // node runs without the first-run gate (Rust sugar), since a gated run's
+            // input is not kept for a later wave (R-invocation).
+            let mut node_opts = GraphNodeOpts::named(opts.name);
+            node_opts.node.partial = true;
+            node_opts
+        },
     )
 }
 
@@ -313,10 +323,11 @@ fn cqrs_ack_id(delivery: &MessageBusDelivery, reason: &str) -> String {
 /// Creates or computes `cqrs_event_outbox_commands`.
 pub fn cqrs_event_outbox_commands<TEvent: Clone + 'static>(
     graph: &Graph,
-    events: Node<CqrsEvent<TEvent>>,
+    events: impl Into<Node<CqrsEvent<TEvent>>>,
     topic: impl Into<String>,
     name: impl Into<String>,
 ) -> Node<MessageBusCommand<CqrsEvent<TEvent>>> {
+    let events: Node<CqrsEvent<TEvent>> = events.into();
     let topic = topic.into();
     graph.node_opts::<MessageBusCommand<CqrsEvent<TEvent>>, _>(
         vec![events.erased()],

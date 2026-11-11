@@ -29,7 +29,7 @@
 //! no-emit functions settle with substrate-synthesized undirty RESOLVED (D49).
 
 use std::cell::{Cell, Ref, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
@@ -41,7 +41,7 @@ use crate::batch::{
 use crate::checkpoint::{
     unregister_backend_state_contributor, unregister_backend_state_contributor_key,
 };
-use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
+use crate::ctx::{Ctx, DepRecord, DepTerminal};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 use crate::environment::EnvironmentDrivers;
 use crate::protocol::{reject_kernel_only_output, AnyValue, GraphError, Handle, Message, Wave};
@@ -98,6 +98,10 @@ pub struct NodeOpts {
     /// false. The first-run gate is Rust sugar, not protocol (graphrefly:D797 (9)):
     /// the kernel runs a function on whatever its dependencies have delivered.
     pub partial: bool,
+    /// A quiet node consumes its input waves without being marked pending or passing
+    /// a mark on, and publishes its function's output as a later wave of its own
+    /// (R-wave). Default false.
+    pub quiet: bool,
     /// Auto-emit COMPLETE when ALL deps complete (default `true`; combineLatest
     /// semantics — ALL not ANY). last/reduce/*Map set `false` to ABSORB inner
     /// terminals (R-deps-terminal).
@@ -122,6 +126,7 @@ impl Default for NodeOpts {
             factory: None,
             pool: PoolKind::default(),
             partial: false,
+            quiet: false,
             complete_when_deps_complete: true,
             error_when_deps_error: true,
             terminal_as_real_input: false,
@@ -131,13 +136,16 @@ impl Default for NodeOpts {
 }
 
 type Msg = Message<AnyValue>;
-type Sink = Rc<dyn Fn(&Msg)>;
+type Sink = Rc<dyn Fn(&[Msg])>;
 type Unsub = Box<dyn FnOnce()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubscriberKind {
     External,
     GraphObserver,
+    /// A dependent node's input edge. Only these receive the kernel's lone `[PENDING]`
+    /// mark (R-wave).
+    Dependent,
 }
 
 struct SubscriberEntry {
@@ -152,14 +160,6 @@ enum SubscriberSnapshot {
     Many(Vec<Sink>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum MaybeRunDecision {
-    #[default]
-    Skip,
-    Passthrough,
-    Run,
-}
-
 fn snapshot_subscribers(a: &NodeAux) -> SubscriberSnapshot {
     match a.subscribers.as_slice() {
         [] => SubscriberSnapshot::Empty,
@@ -168,16 +168,118 @@ fn snapshot_subscribers(a: &NodeAux) -> SubscriberSnapshot {
     }
 }
 
-fn deliver_subscriber_snapshot(subs: SubscriberSnapshot, msg: &Msg) {
+fn snapshot_dependents(a: &NodeAux) -> SubscriberSnapshot {
+    let mut deps = a
+        .subscribers
+        .iter()
+        .filter(|entry| entry.kind == SubscriberKind::Dependent)
+        .map(|entry| entry.sink.clone());
+    match (deps.next(), deps.next()) {
+        (None, _) => SubscriberSnapshot::Empty,
+        (Some(one), None) => SubscriberSnapshot::One(one),
+        (Some(a), Some(b)) => {
+            let mut many = vec![a, b];
+            many.extend(deps);
+            SubscriberSnapshot::Many(many)
+        }
+    }
+}
+
+/// Delivers arrays to a subscriber snapshot: every array to one subscriber, then the
+/// next (R-wave).
+fn deliver_subscriber_snapshot(subs: SubscriberSnapshot, frames: &[Wave<AnyValue>]) {
     match subs {
         SubscriberSnapshot::Empty => {}
-        SubscriberSnapshot::One(s) => s(msg),
+        SubscriberSnapshot::One(s) => {
+            for f in frames {
+                s(f);
+            }
+        }
         SubscriberSnapshot::Many(subs) => {
             for s in subs {
-                s(msg);
+                for f in frames {
+                    s(f);
+                }
             }
         }
     }
+}
+
+/// The first array a subscriber gets: START, the node's retained values, then its
+/// terminal if it has ended (R-subscription).
+fn snapshot_array(value: &NodeValueState) -> Wave<AnyValue> {
+    let mut out = Vec::with_capacity(value.values.len() + 2);
+    out.push(Message::Start);
+    out.extend(value.values.iter().cloned().map(Message::Data));
+    if let Some(ended) = &value.ended {
+        out.push(terminal_message(ended));
+    }
+    out
+}
+
+fn terminal_message(ended: &DepTerminal) -> Msg {
+    match ended {
+        DepTerminal::Complete => Message::Complete,
+        DepTerminal::Error(err) => Message::Error(err.to_string().into()),
+    }
+}
+
+fn starts_with_invalidate(frame: &[InMsg]) -> bool {
+    matches!(frame.first(), Some(InMsg::Invalidate))
+}
+
+/// Checks one submitted array and splits it into the arrays that are published
+/// (R-wave). A terminal must be the last message; an INVALIDATE removes what came
+/// before it and goes out as its own array, so `[DATA 1, INVALIDATE, DATA 2]` is
+/// published as `[INVALIDATE]` then `[DATA 2]`. Rejections panic before anything is
+/// applied (R-failure).
+pub(crate) fn prepare_output(msgs: Wave<AnyValue>) -> Vec<Wave<AnyValue>> {
+    check_output_shape(&msgs);
+    let cut = msgs.iter().rposition(|m| matches!(m, Message::Invalidate));
+    let mut frames = Vec::with_capacity(2);
+    match cut {
+        Some(at) => {
+            let rest: Wave<AnyValue> = msgs.into_iter().skip(at + 1).collect();
+            frames.push(vec![Message::Invalidate]);
+            if !rest.is_empty() {
+                frames.push(rest);
+            }
+        }
+        None if !msgs.is_empty() => frames.push(msgs),
+        None => {}
+    }
+    frames
+}
+
+/// Panics when an array breaks the written-order rules: a terminal must be last, and
+/// START is not output (R-wave, R-messages).
+fn check_output_shape(msgs: &[Msg]) {
+    if let Some(end) = msgs.iter().position(Message::is_terminal) {
+        assert!(
+            end + 1 == msgs.len(),
+            "a terminal must be the last message of its array (R-wave)"
+        );
+    }
+    assert!(
+        !msgs.iter().any(|m| matches!(m, Message::Start)),
+        "START is the subscription handshake, not node output (R-messages)"
+    );
+}
+
+/// What a node's settlement does (R-wave, R-terminals, R-invalidation).
+enum SettlePlan {
+    /// A dependency's ERROR ends the node under the auto policy.
+    End {
+        invalidated_first: bool,
+        error: Rc<str>,
+    },
+    Run {
+        invalidated: bool,
+        runs: bool,
+        auto_complete: bool,
+        quiet: bool,
+        passthrough: bool,
+    },
 }
 
 /// A deferred self-rewire request (R-rewire-deferred / D47), issued via `ctx.rewire_next`
@@ -269,18 +371,19 @@ struct ArenaNodeKey {
     node: NodeKey,
 }
 
+#[derive(Clone)]
 pub(crate) struct CoreIdentity {
     arena_key: ArenaNodeKey,
 }
 
 impl CoreIdentity {
-    fn from_core(core: &Core) -> Self {
+    pub(crate) fn from_core(core: &Core) -> Self {
         Self {
             arena_key: core.arena_node_key(),
         }
     }
 
-    fn matches(&self, core: &Core) -> bool {
+    pub(crate) fn matches(&self, core: &Core) -> bool {
         self.arena_key == core.arena_node_key()
     }
 }
@@ -430,6 +533,7 @@ impl GraphCore {
         (n, e)
     }
 
+    #[cfg(test)]
     fn get_node_call_config_run_edges(
         &self,
         key: NodeKey,
@@ -724,126 +828,179 @@ thread_local! {
     static DEFAULT_GRAPH_CORE: Rc<RefCell<GraphCore>> = Rc::new(RefCell::new(GraphCore::new()));
 }
 
+/// One message as a dependent records it: PENDING and START stripped, the error kept
+/// as its message (a dependency's error crosses a subscription as a borrow, D31).
+#[derive(Clone)]
+enum InMsg {
+    Data(AnyValue),
+    Resolved,
+    Invalidate,
+    Complete,
+    Error(Rc<str>),
+}
+
+impl InMsg {
+    fn from_message(msg: &Msg) -> Option<Self> {
+        match msg {
+            Message::Start | Message::Pending => None,
+            Message::Data(v) => Some(Self::Data(v.clone())),
+            Message::Resolved => Some(Self::Resolved),
+            Message::Invalidate => Some(Self::Invalidate),
+            Message::Complete => Some(Self::Complete),
+            Message::Error(e) => Some(Self::Error(format!("{e}").into())),
+        }
+    }
+
+    fn is_value(&self) -> bool {
+        matches!(self, Self::Data(_) | Self::Resolved)
+    }
+
+    fn terminal(&self) -> Option<DepTerminal> {
+        match self {
+            Self::Complete => Some(DepTerminal::Complete),
+            Self::Error(e) => Some(DepTerminal::Error(e.clone())),
+            _ => None,
+        }
+    }
+
+    /// DATA, RESOLVED, INVALIDATE, COMPLETE and ERROR settle a pending mark (R-wave).
+    fn settles(&self) -> bool {
+        true
+    }
+}
+
+/// What a node holds about one dependency (R-invocation): the latest value received,
+/// its terminal, and the arrays it delivered in the current wave.
+#[derive(Clone, Default)]
+struct DepInput {
+    has: bool,
+    value: Option<AnyValue>,
+    /// The latest value as it was before this wave's arrays (the `Values::prev` sugar).
+    value_before_wave: Option<AnyValue>,
+    ended: Option<DepTerminal>,
+    /// This wave's arrays from the dependency, each kept whole (R-wave).
+    frames: Vec<Vec<InMsg>>,
+    /// Marked pending in this wave and not settled yet.
+    pending: bool,
+}
+
+impl DepInput {
+    /// Records one received array. Returns whether it settles this input's mark.
+    fn record(&mut self, frame: Vec<InMsg>) -> bool {
+        if self.frames.is_empty() {
+            self.value_before_wave = self.value.clone();
+        }
+        for m in &frame {
+            match m {
+                InMsg::Data(v) => {
+                    self.has = true;
+                    self.value = Some(v.clone());
+                }
+                InMsg::Invalidate => {
+                    self.has = false;
+                    self.value = None;
+                }
+                InMsg::Complete | InMsg::Error(_) => self.ended = m.terminal(),
+                InMsg::Resolved => {}
+            }
+        }
+        let settles = frame.iter().any(InMsg::settles);
+        if !frame.is_empty() {
+            self.frames.push(frame);
+        }
+        settles
+    }
+}
+
 /// Per-dependency wave bookkeeping for one node slot.
 struct DepState {
-    batch: Vec<Option<Vec<AnyValue>>>,
-    batch_waves: Vec<Vec<Vec<WaveData>>>,
-    batch_wave_id: Vec<Option<u64>>,
-    prev: Vec<Option<AnyValue>>,
-    has_data: Vec<bool>,
-    dirty: Vec<bool>,
-    tier: Vec<u8>,
-    pending: i32,
-    terminal: Vec<Option<DepTerminal>>,
-    terminal_wave: Vec<Option<DepTerminal>>,
+    inputs: Vec<DepInput>,
+    /// How many inputs are marked pending and not settled in this wave.
+    pending: usize,
 }
 
 impl DepState {
     fn new(dep_count: usize) -> Self {
         Self {
-            batch: vec![None; dep_count],
-            batch_waves: vec![Vec::new(); dep_count],
-            batch_wave_id: vec![None; dep_count],
-            prev: vec![None; dep_count],
-            has_data: vec![false; dep_count],
-            dirty: vec![false; dep_count],
-            tier: vec![0; dep_count],
+            inputs: vec![DepInput::default(); dep_count],
             pending: 0,
-            terminal: vec![None; dep_count],
-            terminal_wave: vec![None; dep_count],
         }
     }
 
+    /// The first-run gate (Rust sugar, graphrefly:D797 (9)): every dependency has a
+    /// value, or has ended when its terminal is the function's input.
     fn all_settled(&self, terminal_as_real_input: bool) -> bool {
-        for i in 0..self.has_data.len() {
-            if self.has_data[i] {
-                continue;
-            }
-            if terminal_as_real_input && self.terminal[i].is_some() {
-                continue;
-            }
-            return false;
+        self.inputs
+            .iter()
+            .all(|input| input.has || (terminal_as_real_input && input.ended.is_some()))
+    }
+
+    fn has_frames(&self) -> bool {
+        self.inputs.iter().any(|input| !input.frames.is_empty())
+    }
+
+    fn clear_frames(&mut self) {
+        for input in &mut self.inputs {
+            input.frames.clear();
+            input.pending = false;
         }
-        true
-    }
-
-    fn current_wave_mut(&mut self, idx: usize) -> &mut Vec<WaveData> {
-        let delivery_id = current_delivery_id();
-        if self.batch_wave_id[idx] != Some(delivery_id) {
-            self.batch_waves[idx].push(Vec::new());
-            self.batch_wave_id[idx] = Some(delivery_id);
-        }
-        self.batch_waves[idx]
-            .last_mut()
-            .expect("current_wave_mut just pushed an entry")
-    }
-
-    fn record_wave_data(&mut self, idx: usize, value: AnyValue) {
-        self.current_wave_mut(idx).push(WaveData::Data(value));
-    }
-
-    fn record_wave_sentinel(&mut self, idx: usize) -> bool {
-        let had_current_projection = self.batch_wave_id[idx] == Some(current_delivery_id());
-        self.current_wave_mut(idx).push(WaveData::Sentinel);
-        had_current_projection
-    }
-
-    fn has_run_triggering_projection(&self) -> bool {
-        self.batch_waves.iter().any(|dep_waves| {
-            dep_waves.iter().any(|wave| {
-                wave.is_empty() || wave.iter().any(|item| matches!(item, WaveData::Data(_)))
-            })
-        })
-    }
-
-    fn clear_wave_projection(&mut self, idx: usize) {
-        self.batch_waves[idx].clear();
-        self.batch_wave_id[idx] = None;
-    }
-
-    fn record_resolved_wave(&mut self, idx: usize) {
-        let _ = self.current_wave_mut(idx);
+        self.pending = 0;
     }
 }
 
 /// Per-node transient wave/mutation flags.
 struct NodeWaveState {
-    emitted_dirty_this_wave: bool,
-    emitted_tier3_this_wave: bool,
+    /// Marked pending in the current wave and not yet published (R-wave).
+    pending: bool,
     inside_run_wave: bool,
+    /// Arrays the running function sent through `ctx.down`, published after it returns.
+    run_out: Vec<Wave<AnyValue>>,
+    /// The last array of `run_out` was opened by `ctx.emit` and takes further emits.
+    emit_open: bool,
+    /// Acquiring dependencies (activation or rewire): their snapshots are recorded as
+    /// input and the node settles once afterwards.
     in_dep_mutation: bool,
-    rewire_run_pending: bool,
-    batch_dirty_owed: bool,
 }
 
 impl NodeWaveState {
     fn new() -> Self {
         Self {
-            emitted_dirty_this_wave: false,
-            emitted_tier3_this_wave: false,
+            pending: false,
             inside_run_wave: false,
+            run_out: Vec::new(),
+            emit_open: false,
             in_dep_mutation: false,
-            rewire_run_pending: false,
-            batch_dirty_owed: false,
         }
     }
 }
 
 struct NodeValueState {
     cache: Option<AnyValue>,
+    /// The DATA values of the last array that carried any (R-subscription).
+    values: Vec<AnyValue>,
     has_data: bool,
     status: Status,
     terminal: bool,
+    /// The terminal this node ended with, carried by its snapshot (R-subscription).
+    ended: Option<DepTerminal>,
 }
 
 impl NodeValueState {
     fn new() -> Self {
         Self {
             cache: None,
+            values: Vec::new(),
             has_data: false,
             status: Status::Sentinel,
             terminal: false,
+            ended: None,
         }
+    }
+
+    fn clear_values(&mut self) {
+        self.cache = None;
+        self.values.clear();
+        self.has_data = false;
     }
 }
 
@@ -855,7 +1012,6 @@ struct DepEdges {
     state: DepState,
     unsubs: Vec<Option<Unsub>>,
     idx_boxes: Vec<Rc<Cell<i64>>>,
-    restored_activation_handshake: Vec<bool>,
 }
 
 impl DepEdges {
@@ -866,7 +1022,6 @@ impl DepEdges {
             state: DepState::new(dep_count),
             unsubs: (0..dep_count).map(|_| None).collect(),
             idx_boxes: (0..dep_count).map(|_| Rc::new(Cell::new(-1i64))).collect(),
-            restored_activation_handshake: vec![false; dep_count],
         }
     }
 }
@@ -885,6 +1040,7 @@ struct NodeCallSlot {
 /// public `Core` handle can keep thinning toward a graph/id/generation token.
 struct NodeConfigSlot {
     partial: bool,
+    quiet: bool,
     complete_when_deps_complete: bool,
     error_when_deps_error: bool,
     terminal_as_real_input: bool,
@@ -895,6 +1051,7 @@ impl NodeConfigSlot {
     fn from_opts(opts: &NodeOpts) -> Self {
         Self {
             partial: opts.partial,
+            quiet: opts.quiet,
             complete_when_deps_complete: opts.complete_when_deps_complete,
             error_when_deps_error: opts.error_when_deps_error,
             terminal_as_real_input: opts.terminal_as_real_input,
@@ -1144,6 +1301,7 @@ impl Core {
         f(n, e)
     }
 
+    #[cfg(test)]
     fn with_node_state<R>(
         &self,
         f: impl FnOnce(&NodeTopologySlot, &NodeCallSlot, &NodeConfigSlot, &NodeRunState, &DepEdges) -> R,
@@ -1194,7 +1352,6 @@ impl Core {
         f(g.get_call_mut(self.key()))
     }
 
-    #[cfg(test)]
     fn with_config<R>(&self, f: impl FnOnce(&NodeConfigSlot) -> R) -> R {
         let g = self.graph.borrow();
         f(g.get_config(self.key()))
@@ -1374,22 +1531,47 @@ impl BatchTarget {
         self.pin.boundary_root()
     }
 
-    pub(crate) fn commit_batched_wave(&self, wave: Wave<AnyValue>) {
-        if let Some(core) = self.pin.borrowed_core() {
-            core.commit_batched_wave(wave);
-        }
-    }
-
-    pub(crate) fn rollback_batched(&self) {
-        if let Some(core) = self.pin.borrowed_core() {
-            core.rollback_batched();
-        }
-    }
-
-    #[cfg(test)]
     fn borrowed_core(&self) -> Option<Core> {
         self.pin.borrowed_core()
     }
+}
+
+/// Commits a batch as one wave (R-request-order): every staged node applies its one
+/// accumulated array, every source's cone is marked pending, and only then is anything
+/// delivered, so a fan-in over several staged sources runs once.
+pub(crate) fn commit_batched_waves(entries: Vec<(&BatchTarget, Wave<AnyValue>)>) {
+    let staged: Vec<(Core, Wave<AnyValue>)> = entries
+        .into_iter()
+        .filter_map(|(target, wave)| target.borrowed_core().map(|core| (core, wave)))
+        .collect();
+    // A borrowed view: the batch target pins keep the slots live even when every
+    // public handle has been dropped (DR-8/B54).
+    let Some(owner) = staged.first().map(|(core, _)| core.borrowed_view()) else {
+        return;
+    };
+    with_wave_owner(
+        &owner,
+        || {
+            let mut applied = Vec::with_capacity(staged.len());
+            for (core, wave) in staged {
+                if core.with_inner_edges(|_, e| e.value.terminal) {
+                    continue;
+                }
+                wave_register(&core);
+                let out = core.apply_out(prepare_output(wave));
+                applied.push((core, out));
+            }
+            for (core, out) in &applied {
+                if out.iter().flatten().any(Message::is_settling) {
+                    core.mark_as_source();
+                }
+            }
+            for (core, out) in applied {
+                core.deliver_out(out);
+            }
+        },
+        || {},
+    );
 }
 
 #[derive(Clone)]
@@ -1399,75 +1581,9 @@ struct CoreWeak {
     refs: Weak<Cell<usize>>,
 }
 
-#[derive(Default)]
-struct InWaveDepReceiveAction {
-    emit_dirty: bool,
-    do_invalidate: bool,
-    invalidate_as_invalidate_msg: bool,
-    had_node_data_before_invalidate: bool,
-    clear_undirty_after_invalidate: bool,
-    defer_maybe_run: bool,
-    maybe_run_decision: MaybeRunDecision,
-    down_msgs: Option<Vec<Msg>>,
-    do_settle_after_absorbed_terminal: bool,
-}
-
-impl InWaveDepReceiveAction {
-    fn has_work(&self) -> bool {
-        self.emit_dirty
-            || self.do_invalidate
-            || self.defer_maybe_run
-            || !matches!(self.maybe_run_decision, MaybeRunDecision::Skip)
-            || self.do_settle_after_absorbed_terminal
-            || self.down_msgs.as_ref().is_some_and(|msgs| !msgs.is_empty())
-    }
-
-    fn apply(self, core: &Core) {
-        if self.emit_dirty {
-            core.emit_to_subs(&Message::Pending);
-        }
-        if self.do_invalidate {
-            if self.invalidate_as_invalidate_msg && self.had_node_data_before_invalidate {
-                core.down(vec![Message::Invalidate]);
-            } else {
-                core.invalidate();
-            }
-        }
-        if self.clear_undirty_after_invalidate {
-            if self.had_node_data_before_invalidate {
-                core.with_inner_edges_mut(|_n, e| {
-                    e.wave.emitted_dirty_this_wave = false;
-                });
-            } else {
-                core.down(vec![Message::Resolved]);
-            }
-        }
-        if self.defer_maybe_run {
-            defer_run_until_delivery_boundary(core);
-        }
-        match self.maybe_run_decision {
-            MaybeRunDecision::Skip => {}
-            MaybeRunDecision::Passthrough => core.passthrough_emit(),
-            MaybeRunDecision::Run => {
-                core.run_wave();
-            }
-        }
-        if let Some(msgs) = self.down_msgs {
-            core.down(msgs);
-        }
-        if self.do_settle_after_absorbed_terminal {
-            core.settle_after_absorbed_terminal();
-        }
-    }
-}
-
-enum DownAction {
-    Emit { msg: Msg, subs: SubscriberSnapshot },
-    Invalidate { hooks: Vec<Rc<dyn Fn()>> },
-}
-
 impl CoreWeak {
     #[cfg(test)]
+    #[allow(dead_code)] // kept for pin/refcount probes
     fn counted_core(&self) -> Option<Core> {
         let graph = self.graph.upgrade()?;
         let refs = self.refs.upgrade()?;
@@ -1526,69 +1642,43 @@ impl CoreWeak {
         Some((pin, core))
     }
 
-    fn collect_in_wave_receive_from_dep_action(
-        &self,
-        idx: usize,
-        msg: &Msg,
-    ) -> Option<InWaveDepReceiveAction> {
-        let graph = self.graph.upgrade()?;
-        let refs = self.refs.upgrade()?;
-        let arena_key = ArenaNodeKey {
-            graph: Rc::as_ptr(&graph) as usize,
-            node: self.key,
-        };
-        let registered = WAVE.with(|w| {
-            let mut wave = w.borrow_mut();
-            let Some(scope) = wave.as_mut() else {
-                return false;
-            };
-            scope.pin_once(arena_key, &graph, &refs)
-        });
-        if !registered {
-            return None;
-        }
-        let mut g = graph.borrow_mut();
-        Core::collect_receive_from_dep_action_from_graph(&mut g, self.key, idx, msg)
-    }
-
-    fn apply_in_wave_receive_action(&self, action: InWaveDepReceiveAction) {
-        let graph = match self.graph.upgrade() {
-            Some(graph) => graph,
-            None => return,
-        };
-        let refs = match self.refs.upgrade() {
-            Some(refs) => refs,
-            None => return,
-        };
-        let can_apply = {
-            let g = graph.borrow();
-            g.is_live_key(self.key) && (refs.get() != 0 || g.pin_count(self.key) != 0)
-        };
-        if !can_apply {
-            return;
-        }
-        let core = Core::from_borrowed_parts(graph, self.key.id, self.key.generation, refs);
-        core.apply_receive_from_dep_action(action);
-    }
-
-    fn receive_from_dep(&self, idx: usize, msg: &Msg) {
-        // DR-8/B54 receive policy:
-        // - active wave: use a borrowed arena view; `Core::receive_from_dep` immediately
-        //   enrolls in the arena-pinned touched set before any callback-capable work;
-        // - no active wave: pin first and run through a borrowed owner view, avoiding
-        //   counted churn for ordinary callback delivery and for late cleanup/release
-        //   windows.
+    fn receive_from_dep(&self, idx: usize, msgs: &[Msg]) {
+        // DR-8/B54 receive policy: during a wave, pin through the wave's touched set and
+        // run through a borrowed arena view; outside a wave, pin first.
         if wave_in_flight() {
-            let Some(action) = self.collect_in_wave_receive_from_dep_action(idx, msg) else {
+            let Some(graph) = self.graph.upgrade() else {
                 return;
             };
-            if action.has_work() {
-                self.apply_in_wave_receive_action(action);
+            let Some(refs) = self.refs.upgrade() else {
+                return;
+            };
+            let arena_key = ArenaNodeKey {
+                graph: Rc::as_ptr(&graph) as usize,
+                node: self.key,
+            };
+            let registered = WAVE.with(|w| {
+                let mut wave = w.borrow_mut();
+                let Some(scope) = wave.as_mut() else {
+                    return false;
+                };
+                scope.pin_once(arena_key, &graph, &refs)
+            });
+            if !registered {
+                return;
             }
+            let can_apply = {
+                let g = graph.borrow();
+                g.is_live_key(self.key) && (refs.get() != 0 || g.pin_count(self.key) != 0)
+            };
+            if !can_apply {
+                return;
+            }
+            let core = Core::from_borrowed_parts(graph, self.key.id, self.key.generation, refs);
+            core.receive_from_dep_registered(idx, msgs);
             return;
         }
         if let Some((_pin, core)) = self.pinned_borrowed_core() {
-            core.receive_from_dep_registered(idx, msg);
+            core.receive_from_dep_registered(idx, msgs);
         }
     }
 }
@@ -1626,27 +1716,21 @@ impl DeferredNodeAction {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DeferredDeliveryKind {
-    Run,
-    AbsorbedSettle,
-}
-
+/// A node whose settlement waits until the current delivery has reached every
+/// subscriber, so it settles once on everything its dependencies sent.
 struct DeferredDeliveryAction {
-    kind: DeferredDeliveryKind,
     target: DeferredNodeAction,
 }
 
 impl DeferredDeliveryAction {
-    fn from_core(kind: DeferredDeliveryKind, core: &Core) -> Self {
+    fn from_core(core: &Core) -> Self {
         Self {
-            kind,
             target: DeferredNodeAction::from_core(core),
         }
     }
 
-    fn matches(&self, kind: DeferredDeliveryKind, core: &Core) -> bool {
-        self.kind == kind && self.target.matches(core)
+    fn matches(&self, core: &Core) -> bool {
+        self.target.matches(core)
     }
 
     fn core_for_drain(&self) -> Option<(ArenaNodePin, Core)> {
@@ -1660,10 +1744,7 @@ impl DeferredDeliveryAction {
         if node.with_inner_edges(|_, e| e.value.terminal) {
             return;
         }
-        match self.kind {
-            DeferredDeliveryKind::Run => node.maybe_run(),
-            DeferredDeliveryKind::AbsorbedSettle => node.settle_after_absorbed_terminal(),
-        }
+        node.settle();
     }
 }
 
@@ -1758,7 +1839,7 @@ enum BoundaryTask {
     },
     Down {
         target: CoreToken,
-        msgs: Wave<AnyValue>,
+        frames: Vec<Wave<AnyValue>>,
         committed: Rc<Cell<bool>>,
     },
 }
@@ -1963,23 +2044,11 @@ fn delivery_in_flight() -> bool {
     DELIVERY_DEPTH.with(|depth| depth.get() > 0)
 }
 
-fn current_delivery_id() -> u64 {
-    CURRENT_DELIVERY_ID.with(Cell::get)
-}
-
-fn defer_run_until_delivery_boundary(core: &Core) {
-    defer_delivery_action_until_boundary(core, DeferredDeliveryKind::Run);
-}
-
-fn defer_absorbed_settle_until_delivery_boundary(core: &Core) {
-    defer_delivery_action_until_boundary(core, DeferredDeliveryKind::AbsorbedSettle);
-}
-
-fn defer_delivery_action_until_boundary(core: &Core, kind: DeferredDeliveryKind) {
+fn defer_settle_until_delivery_boundary(core: &Core) {
     DEFERRED_DELIVERY_ACTIONS.with(|actions| {
         let mut actions = actions.borrow_mut();
-        if !actions.iter().any(|action| action.matches(kind, core)) {
-            actions.push(DeferredDeliveryAction::from_core(kind, core));
+        if !actions.iter().any(|action| action.matches(core)) {
+            actions.push(DeferredDeliveryAction::from_core(core));
         }
     });
 }
@@ -2049,15 +2118,8 @@ fn drain_deferred_runs() {
         if actions.is_empty() {
             break;
         }
-        for kind in [
-            DeferredDeliveryKind::Run,
-            DeferredDeliveryKind::AbsorbedSettle,
-        ] {
-            for action in &actions {
-                if action.kind == kind {
-                    action.apply();
-                }
-            }
+        for action in &actions {
+            action.apply();
         }
     }
 }
@@ -2303,12 +2365,12 @@ fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) -> Opti
         }
         BoundaryTask::Down {
             target,
-            msgs,
+            frames,
             committed,
         } => {
             if committed.get() {
                 if let Some(node) = target.pinned_borrowed_core(graph) {
-                    node.core.owned_down(msgs);
+                    node.core.owned_publish(frames);
                 }
             }
         }
@@ -2401,8 +2463,7 @@ impl Core {
             && e.state.pending == 0
             && !e.wave.inside_run_wave
             && !e.wave.in_dep_mutation
-            && !e.wave.rewire_run_pending
-            && !e.wave.batch_dirty_owed
+            && !e.wave.pending
     }
 
     pub(crate) fn is_quiescent_for_release(&self) -> bool {
@@ -2473,10 +2534,11 @@ impl Core {
             e.value.has_data = state.has_data;
             e.value.status = state.status;
             e.value.terminal = state.terminal;
+            e.value.values = e.value.cache.iter().cloned().collect();
             e.wave = NodeWaveState::new();
             e.state = DepState::new(e.unsubs.len());
-            e.restored_activation_handshake =
-                vec![state.has_data || state.has_called_fn_once; e.unsubs.len()];
+            // Restored nodes take their dependencies' snapshots without running.
+            e.wave.in_dep_mutation = true;
             r.has_called_fn_once = state.has_called_fn_once;
             a.activated = should_activate;
             a.state = state.ctx_state;
@@ -2490,6 +2552,10 @@ impl Core {
                 self.subscribe_dep(idx, dep);
             }
         }
+        self.with_inner_edges_mut(|_, e| {
+            e.state.clear_frames();
+            e.wave.in_dep_mutation = false;
+        });
         let mut graph = self.graph.borrow_mut();
         let version_state = graph.get_version_mut(self.key());
         match state.version {
@@ -2566,6 +2632,7 @@ impl Core {
             // R-initial: a provided initial pre-populates the cache.
             if let Some(v) = initial {
                 let (_n, e) = g.get_node_and_edges_mut(NodeKey { id, generation });
+                e.value.values = vec![v.clone()];
                 e.value.cache = Some(v);
                 e.value.has_data = true;
                 e.value.status = Status::Settled;
@@ -2580,53 +2647,33 @@ impl Core {
         }
     }
 
-    // ── subscription (R-push-subscribe) ──
+    // ── subscription (R-subscription) ──
 
-    /// Register a sink, push START/cached state, and lazily activate on first subscriber.
-    /// Records the new subscriber's id into `id_out` **immediately after registration**
-    /// — before the push + activation cascade that may panic. The public [`Node::subscribe`]
-    /// runs this under the wave-owner catch; if `activate()` panics (a feedback cycle),
-    /// the sink is already registered, so the caller can still detach it (the error path
-    /// reconstructs the real unsub from `id_out`) — no orphaned subscriber.
-    fn subscribe_recording_id(&self, sink: Sink, id_out: &Cell<Option<u64>>) -> Unsub {
-        self.subscribe_recording_id_with_kind(sink, SubscriberKind::External, id_out)
-    }
-
+    /// Register a sink and give it one first array: START, then the node's snapshot (the
+    /// DATA values of the last array that carried DATA, then its terminal if it has
+    /// ended). Subscribing activates an inactive node first (R-lifetime), so the snapshot
+    /// carries what its first run produced.
     fn subscribe_recording_id_with_kind(
         &self,
         sink: Sink,
         kind: SubscriberKind,
         id_out: &Cell<Option<u64>>,
     ) -> Unsub {
-        let (id, push) = {
-            self.with_node_state_aux_mut(|_n, _c, _cfg, _r, e, a| {
-                let id = a.next_sub_id;
-                a.next_sub_id += 1;
-                a.subscribers.push(SubscriberEntry {
-                    id,
-                    kind,
-                    sink: sink.clone(),
-                });
-                let push = if e.value.has_data {
-                    Some(Message::Data(
-                        e.value.cache.clone().expect("has_data ⇒ cache present"),
-                    ))
-                } else if e.value.status == Status::Dirty {
-                    Some(Message::Pending)
-                } else {
-                    None
-                };
-                (id, push)
-            })
-        };
-        id_out.set(Some(id));
-        sink(&Message::Start);
-        if let Some(m) = push {
-            sink(&m);
-        }
         if !self.with_aux(|a| a.activated) {
             self.activate();
         }
+        let (id, snapshot) = self.with_inner_edges_aux_mut(|_n, e, a| {
+            let id = a.next_sub_id;
+            a.next_sub_id += 1;
+            a.subscribers.push(SubscriberEntry {
+                id,
+                kind,
+                sink: sink.clone(),
+            });
+            (id, snapshot_array(&e.value))
+        });
+        id_out.set(Some(id));
+        sink(&snapshot);
         let core = self.clone();
         Box::new(move || core.unsubscribe(id))
     }
@@ -2666,8 +2713,12 @@ impl Core {
         })
     }
 
-    // ── activation / deactivation (lazy; R-rom-ram) ──
+    // ── activation / deactivation (lazy; R-lifetime) ──
 
+    /// Activating a computed node acquires its dependencies, activating them, then
+    /// runs its function once on their snapshots (R-lifetime). Nothing subscribes to
+    /// the node yet, so that first output only sets what the new subscriber's START
+    /// snapshot carries.
     fn activate(&self) {
         let deps = self.with_node_state_aux_mut(|n, _c, _cfg, _r, e, a| {
             a.activated = true;
@@ -2677,18 +2728,17 @@ impl Core {
             e.idx_boxes = (0..n.deps.len())
                 .map(|_| Rc::new(Cell::new(-1i64)))
                 .collect();
+            e.state = DepState::new(n.deps.len());
+            e.wave.in_dep_mutation = true;
             n.deps.clone()
         });
-        for (idx, dep) in deps.iter().enumerate() {
-            self.subscribe_dep(idx, dep);
+        {
+            let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
+            for (idx, dep) in deps.iter().enumerate() {
+                self.subscribe_dep(idx, dep);
+            }
         }
-        // Depless producer (fn, no deps): run once on activation.
-        let run = self.with_node_state(|n, c, _cfg, r, _e| {
-            n.deps.is_empty() && c.handle.is_some() && !r.has_called_fn_once
-        });
-        if run {
-            self.run_wave();
-        }
+        self.first_run();
     }
 
     fn subscribe_dep(&self, idx: usize, dep: &Core) {
@@ -2697,18 +2747,18 @@ impl Core {
         // so a surgical reorder reroutes in O(1); -1 means the dep was removed (drain).
         let idx_box: Rc<Cell<i64>> = Rc::new(Cell::new(idx as i64));
         let cb_box = idx_box.clone();
-        let sink: Sink = Rc::new(move |msg: &Msg| {
+        let sink: Sink = Rc::new(move |msgs: &[Msg]| {
             let i = cb_box.get();
             if i < 0 {
                 return; // dep removed — stale in-flight callback drops (drain)
             }
-            weak.receive_from_dep(i as usize, msg);
+            weak.receive_from_dep(i as usize, msgs);
         });
-        // dep.subscribe synchronously pushes START (+ cached DATA) into the sink,
-        // re-entering receive_from_dep — done before we re-borrow self below.
+        // dep.subscribe synchronously pushes its START snapshot into the sink, which
+        // records it as this dependency's input — done before we re-borrow self below.
         let dep_sub_id = Cell::new(None);
         let subscribed = catch_unwind(AssertUnwindSafe(|| {
-            dep.subscribe_recording_id(sink, &dep_sub_id)
+            dep.subscribe_recording_id_with_kind(sink, SubscriberKind::Dependent, &dep_sub_id)
         }));
         let unsub = match subscribed {
             Ok(unsub) => unsub,
@@ -2725,7 +2775,6 @@ impl Core {
         self.with_inner_edges_mut(|_, e| {
             e.unsubs[idx] = Some(unsub);
             e.idx_boxes[idx] = idx_box;
-            e.restored_activation_handshake[idx] = false;
         });
     }
 
@@ -2735,28 +2784,16 @@ impl Core {
             let unsubs: Vec<Unsub> = e.unsubs.drain(..).flatten().collect();
             e.idx_boxes.clear();
             let hooks: Vec<Box<dyn FnOnce()>> = std::mem::take(&mut a.on_deactivation);
-            // RAM: a compute node (fn and/or deps) clears its cache on deactivation;
-            // a depless state node retains it (ROM).
+            // A computed node clears its retained values on deactivation; a state node
+            // keeps them (R-lifetime).
             let is_compute = c.handle.is_some() || !n.deps.is_empty();
-            if is_compute {
-                e.value.cache = None;
-                e.value.has_data = false;
+            if is_compute && !e.value.terminal {
+                e.value.clear_values();
                 e.value.status = Status::Sentinel;
             }
-            for i in 0..n.deps.len() {
-                e.state.batch[i] = None;
-                e.state.batch_waves[i].clear();
-                e.state.batch_wave_id[i] = None;
-                e.state.prev[i] = None;
-                e.state.has_data[i] = false;
-                e.state.dirty[i] = false;
-                e.state.tier[i] = 0;
-                e.state.terminal[i] = None;
-                e.state.terminal_wave[i] = None;
-            }
-            e.restored_activation_handshake.fill(false);
-            e.state.pending = 0;
-            e.wave.emitted_dirty_this_wave = false;
+            e.state = DepState::new(n.deps.len());
+            e.wave.pending = false;
+            e.wave.run_out.clear();
             r.has_called_fn_once = false;
             // Control + INVALIDATE hooks are fresh-lifecycle (R-cleanup-hooks / D28):
             // the next activation re-registers them from the fn body.
@@ -2774,338 +2811,288 @@ impl Core {
         }
     }
 
-    // ── upstream wave receive (two-phase + diamond) ──
+    // ── upstream receive (R-wave) ──
 
-    #[cfg(test)]
-    fn receive_from_dep(&self, idx: usize, msg: &Msg) {
-        // B25: enroll in the wave touched-set so a panic-abort can reset our flags.
-        // DR-8/B54: the internal dep-callback entry may be an uncounted arena view;
-        // under a real wave this generation-keyed touched action pins the node in the
-        // owner arena while borrow-free subscriber callbacks run.
-        wave_register(self);
-        self.receive_from_dep_registered(idx, msg);
-    }
-
-    fn receive_from_dep_registered(&self, idx: usize, msg: &Msg) {
-        let Some(action) = self.collect_receive_from_dep_action(idx, msg) else {
-            return;
-        };
-        if action.has_work() {
-            self.apply_receive_from_dep_action(action);
-        }
-    }
-
-    fn collect_receive_from_dep_action(
-        &self,
-        idx: usize,
-        msg: &Msg,
-    ) -> Option<InWaveDepReceiveAction> {
-        let mut g = self.graph.borrow_mut();
-        Self::collect_receive_from_dep_action_from_graph(&mut g, self.key(), idx, msg)
-    }
-
-    fn decide_maybe_run_from_graph(g: &mut GraphCore, key: NodeKey) -> MaybeRunDecision {
-        let (_n, c, cfg, r, e, _a) = g.get_node_call_config_run_edges_aux_mut(key);
-
-        // R-rewire (D42): an added cached dep's push-on-subscribe lands here mid-mutation.
-        // Defer fn-run to ONE atomic settle after every added dep is wired.
-        if e.wave.in_dep_mutation {
-            e.wave.rewire_run_pending = true;
-            return MaybeRunDecision::Skip;
-        }
-
-        if e.state.pending > 0 {
-            return MaybeRunDecision::Skip;
-        }
-        if c.handle.is_none() {
-            return MaybeRunDecision::Passthrough;
-        }
-        if !(r.has_called_fn_once || cfg.partial || cfg.all_deps_settled(&e.state)) {
-            return MaybeRunDecision::Skip;
-        }
-
-        MaybeRunDecision::Run
-    }
-
-    fn set_maybe_run_action(g: &mut GraphCore, key: NodeKey, action: &mut InWaveDepReceiveAction) {
-        if delivery_in_flight() {
-            action.defer_maybe_run = true;
-        } else {
-            action.maybe_run_decision = Self::decide_maybe_run_from_graph(g, key);
-        }
-    }
-
-    fn apply_receive_from_dep_action(&self, action: InWaveDepReceiveAction) {
-        action.apply(self);
-    }
-
-    fn collect_receive_from_dep_action_from_graph(
-        g: &mut GraphCore,
-        key: NodeKey,
-        idx: usize,
-        msg: &Msg,
-    ) -> Option<InWaveDepReceiveAction> {
-        let (auto_error, auto_complete, terminal_as_real_input) = {
-            let cfg = g.get_config(key);
-            (
-                cfg.error_when_deps_error,
-                cfg.complete_when_deps_complete,
-                cfg.terminal_as_real_input,
-            )
-        };
-        if g.get_node_and_edges_mut(key).1.value.terminal {
-            return None;
-        }
-
-        let mut action = InWaveDepReceiveAction::default();
-        match msg {
-            Message::Start => {}
-            Message::Invalidate => {
-                let (had_data, undirty_no_settle) = {
-                    let (_n, e) = g.get_node_and_edges_mut(key);
-                    e.state.prev[idx] = None;
-                    e.state.has_data[idx] = false;
-                    e.state.batch[idx] = None;
-                    let had_current_projection = e.state.record_wave_sentinel(idx);
-                    if !had_current_projection && !e.state.has_run_triggering_projection() {
-                        e.state.clear_wave_projection(idx);
-                    }
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    (
-                        e.value.has_data,
-                        e.state.pending == 0 && e.wave.emitted_dirty_this_wave,
-                    )
-                };
-                action.had_node_data_before_invalidate = had_data;
-                action.do_invalidate = true;
-                if undirty_no_settle {
-                    if !had_data {
-                        action.down_msgs = Some(vec![Message::Resolved]);
-                    } else {
-                        action.clear_undirty_after_invalidate = true;
-                    }
-                }
-            }
-            Message::Pending => {
-                action.emit_dirty = {
-                    let (_n, e) = g.get_node_and_edges_mut(key);
-                    if e.state.dirty[idx] {
-                        false
-                    } else {
-                        e.state.dirty[idx] = true;
-                        e.state.pending += 1;
-                        e.state.tier[idx] = 2;
-                        if e.wave.emitted_dirty_this_wave {
-                            false
-                        } else {
-                            e.wave.emitted_dirty_this_wave = true;
-                            e.value.status = Status::Dirty;
-                            true
-                        }
-                    }
-                };
-            }
-            Message::Data(v) => {
-                if g.get_node_and_edges_mut(key)
-                    .1
-                    .restored_activation_handshake[idx]
-                {
-                    let (_n, e) = g.get_node_and_edges_mut(key);
-                    e.state.prev[idx] = Some(v.clone());
-                    e.state.has_data[idx] = true;
-                    e.state.tier[idx] = 3;
-                    e.state.batch[idx] = None;
-                    return None;
-                }
-                let pending_drained = {
-                    let (_n, e) = g.get_node_and_edges_mut(key);
-                    match &mut e.state.batch[idx] {
-                        Some(b) => b.push(v.clone()),
-                        none => *none = Some(vec![v.clone()]),
-                    }
-                    e.state.record_wave_data(idx, v.clone());
-                    e.state.has_data[idx] = true;
-                    e.state.tier[idx] = 3;
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    e.state.pending == 0
-                };
-                if pending_drained {
-                    Self::set_maybe_run_action(g, key, &mut action);
-                }
-            }
-            Message::Resolved => {
-                let pending_drained = {
-                    let (_n, e) = g.get_node_and_edges_mut(key);
-                    e.state.record_resolved_wave(idx);
-                    e.state.tier[idx] = 3;
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    e.state.pending == 0
-                };
-                if pending_drained {
-                    Self::set_maybe_run_action(g, key, &mut action);
-                }
-            }
-            m if m.is_terminal() => {
-                // Box<dyn Error> is not Clone and `m` is a borrow (D31): keep the error as its
-                // Display message in the DepTerminal record (Rc<str>, which IS Clone).
-                let dep_term = match m {
-                    Message::Error(e) => DepTerminal::Error(format!("{e}").into()),
-                    _ => DepTerminal::Complete,
-                };
-                let is_error = matches!(dep_term, DepTerminal::Error(_));
-                let all_deps_terminal = {
-                    let (n, e) = g.get_node_and_edges_mut(key);
-                    e.state.terminal[idx] = Some(dep_term.clone());
-                    e.state.terminal_wave[idx] = Some(dep_term.clone());
-                    if e.state.dirty[idx] {
-                        e.state.dirty[idx] = false;
-                        e.state.pending -= 1;
-                    }
-                    !n.deps.is_empty() && e.state.terminal.iter().all(|t| t.is_some())
-                };
-                if is_error && auto_error {
-                    if let DepTerminal::Error(s) = &dep_term {
-                        action.down_msgs = Some(vec![Message::Error(s.to_string().into())]);
-                    }
-                } else if terminal_as_real_input {
-                    Self::set_maybe_run_action(g, key, &mut action);
-                } else if auto_complete && all_deps_terminal {
-                    action.down_msgs = Some(vec![Message::Complete]);
-                } else {
-                    action.do_settle_after_absorbed_terminal = true;
-                }
-            }
-            _ => {}
-        }
-        if action.has_work() {
-            Some(action)
-        } else {
-            None
-        }
-    }
-
-    /// R-terminal-settles-dirty (B35): settle a node whose dirtied dep was released by an
-    /// ABSORBED terminal that is NOT a real input (a plain derived/effect — one of several
-    /// deps completing while others stay live). Runs only when the release drained `pending`
-    /// while the node still owes a downstream settle (it broadcast DIRTY this wave):
-    ///   - some OTHER dep delivered real DATA this wave → recompute (→ DATA);
-    ///   - else no value materialised (or the recompute is gated) → one undirty RESOLVED
-    ///     (R-resolved-undirty), keeping the cache (a terminal, unlike INVALIDATE, leaves it).
-    fn settle_after_absorbed_terminal(&self) {
-        if delivery_in_flight() {
-            defer_absorbed_settle_until_delivery_boundary(self);
+    /// One array from dependency `idx`. A lone `[PENDING]` is the kernel's pending
+    /// mark (it never reaches an external sink); any other array is that dependency's
+    /// published output, recorded whole as this wave's input.
+    fn receive_from_dep_registered(&self, idx: usize, msgs: &[Msg]) {
+        if let [Message::Pending] = msgs {
+            self.receive_mark(idx);
             return;
         }
-        if !self.with_inner_edges(|_, e| e.state.pending == 0 && e.wave.emitted_dirty_this_wave) {
-            return;
-        }
-        // A real value occurred this wave (some OTHER dep delivered DATA) → recompute.
-        // maybe_run runs the fn ONLY if ungated (gate open, not paused); it may emit DATA, a
-        // fn-synthesized undirty RESOLVED, or nothing (gated / gate still holds).
-        let saw_data = self.with_inner_edges(|_n, e| {
-            e.state
-                .batch
-                .iter()
-                .any(|b| b.as_ref().is_some_and(|v| !v.is_empty()))
+        let frame: Vec<InMsg> = msgs.iter().filter_map(InMsg::from_message).collect();
+        let ready = self.with_inner_edges_mut(|_, e| {
+            if e.value.terminal {
+                return false;
+            }
+            let Some(input) = e.state.inputs.get_mut(idx) else {
+                return false;
+            };
+            let settles = input.record(frame);
+            if settles && input.pending {
+                input.pending = false;
+                e.state.pending -= 1;
+            }
+            !e.wave.in_dep_mutation && e.state.pending == 0 && e.state.has_frames()
         });
-        if saw_data {
-            self.maybe_run();
-        }
-        // If the node STILL owes a downstream settle (no DATA occurred, OR the recompute was
-        // gated — e.g. the first-run gate holds because the terminated dep never delivered and
-        // terminal_as_real_input is false), balance the broadcast DIRTY with one undirty
-        // RESOLVED, keeping the cache. Without this fallback a DIRTY-then-terminal-without-DATA
-        // dep on a pre-first-run multi-dep node strands the DIRTY → downstream wedged (the B35
-        // gate-holds corner, C-15(d)). Route through `down` so D64/R-undirty-settle-timing
-        // honors resumeAll and batch timing.
-        let still_owes = self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave);
-        if still_owes {
-            self.down(vec![Message::Resolved]);
+        if ready {
+            self.schedule_settle();
         }
     }
 
-    fn mark_dirty(&self) {
-        let subs = self.with_inner_edges_aux_mut(|_n, e, a| {
+    /// The kernel marks a sender's dependents pending before it delivers (R-wave). A
+    /// quiet node records its pending inputs but passes no mark on (R-wave).
+    fn receive_mark(&self, idx: usize) {
+        let quiet = self.with_config(|cfg| cfg.quiet);
+        let propagate = self.with_inner_edges_mut(|_, e| {
+            if e.value.terminal {
+                return false;
+            }
+            let Some(input) = e.state.inputs.get_mut(idx) else {
+                return false;
+            };
+            if !input.pending {
+                input.pending = true;
+                e.state.pending += 1;
+            }
+            if quiet || e.wave.pending {
+                return false;
+            }
+            e.wave.pending = true;
             e.value.status = Status::Dirty;
-            if !e.wave.emitted_dirty_this_wave {
-                e.wave.emitted_dirty_this_wave = true;
-                snapshot_subscribers(a)
+            true
+        });
+        if propagate {
+            self.mark_dependents();
+        }
+    }
+
+    /// Sends the pending mark to this node's dependents.
+    fn mark_dependents(&self) {
+        let deps = self.with_aux(snapshot_dependents);
+        deliver_subscriber_snapshot(deps, &[vec![Message::Pending]]);
+    }
+
+    /// Marks this node pending as the source of a wave, and its cone with it.
+    fn mark_as_source(&self) {
+        let fresh = self.with_inner_edges_mut(|_, e| {
+            if e.wave.pending {
+                false
             } else {
-                SubscriberSnapshot::Empty
+                e.wave.pending = true;
+                true
             }
         });
-        deliver_subscriber_snapshot(subs, &Message::Pending);
+        if fresh {
+            self.mark_dependents();
+        }
     }
 
-    fn maybe_run(&self) {
+    fn schedule_settle(&self) {
         if delivery_in_flight() {
-            defer_run_until_delivery_boundary(self);
-            return;
-        }
-        let decision = {
-            let mut g = self.graph.borrow_mut();
-            Self::decide_maybe_run_from_graph(&mut g, self.key())
-        };
-        match decision {
-            MaybeRunDecision::Skip => {}
-            MaybeRunDecision::Passthrough => self.passthrough_emit(),
-            MaybeRunDecision::Run => self.run_wave(),
+            defer_settle_until_delivery_boundary(self);
+        } else {
+            self.settle();
         }
     }
 
-    #[cfg(test)]
-    fn try_run(&self) {
-        let (pending, has_handle, has_called, partial, all_settled) =
-            self.with_node_state(|_n, c, cfg, r, e| {
-                (
-                    e.state.pending,
-                    c.handle.is_some(),
-                    r.has_called_fn_once,
-                    cfg.partial,
-                    cfg.all_deps_settled(&e.state),
-                )
+    /// Settles a node once every dependency marked pending in this wave has settled
+    /// (R-wave): a dependency's auto ERROR ends it, an INVALIDATE is applied under the
+    /// auto policy, and the function runs at most once on everything the wave brought.
+    fn settle(&self) {
+        let plan = self.with_node_state_aux_mut(|n, c, cfg, r, e, _a| {
+            if e.value.terminal
+                || e.state.pending != 0
+                || e.wave.in_dep_mutation
+                || !e.state.has_frames()
+            {
+                return None;
+            }
+            let dep_error = e.state.inputs.iter().find_map(|input| {
+                input.frames.iter().flatten().find_map(|m| match m {
+                    InMsg::Error(err) => Some(err.clone()),
+                    _ => None,
+                })
             });
-        if pending > 0 {
-            return;
-        }
-        if !has_handle {
-            self.passthrough_emit();
-            return;
-        }
-        if !has_called {
-            // first-run gate: hold the fn until every dep has settled (R-first-run-gate).
-            if partial || all_settled {
-                self.run_wave();
+            if let (Some(err), true) = (dep_error, cfg.error_when_deps_error) {
+                // An INVALIDATE that reached the node before the ERROR takes effect
+                // first, whatever the INVALIDATE policy (R-terminals).
+                let invalidated_first = e
+                    .state
+                    .inputs
+                    .iter()
+                    .any(|input| input.frames.iter().any(|f| starts_with_invalidate(f)));
+                e.state.clear_frames();
+                return Some(SettlePlan::End {
+                    invalidated_first,
+                    error: err,
+                });
             }
+            // What came before an INVALIDATE on an input is gone; what came after it is
+            // ordinary input (R-invalidation).
+            let mut invalidated = false;
+            for input in &mut e.state.inputs {
+                if let Some(at) = input.frames.iter().rposition(|f| starts_with_invalidate(f)) {
+                    input.frames.drain(..=at);
+                    invalidated = true;
+                }
+            }
+            let values = e
+                .state
+                .inputs
+                .iter()
+                .any(|input| input.frames.iter().flatten().any(InMsg::is_value));
+            let terminal_input = cfg.terminal_as_real_input
+                && e.state.inputs.iter().any(|input| {
+                    input
+                        .frames
+                        .iter()
+                        .flatten()
+                        .any(|m| m.terminal().is_some())
+                });
+            let gate_open = r.has_called_fn_once
+                || cfg.partial
+                || cfg.all_deps_settled(&e.state)
+                || c.handle.is_none();
+            let runs = (values || terminal_input) && gate_open;
+            let all_ended =
+                !n.deps.is_empty() && e.state.inputs.iter().all(|input| input.ended.is_some());
+            Some(SettlePlan::Run {
+                invalidated,
+                runs,
+                auto_complete: cfg.complete_when_deps_complete && all_ended,
+                quiet: cfg.quiet,
+                passthrough: c.handle.is_none(),
+            })
+        });
+        let Some(plan) = plan else {
             return;
+        };
+        match plan {
+            SettlePlan::End {
+                invalidated_first,
+                error,
+            } => {
+                let mut end = Vec::new();
+                if invalidated_first {
+                    end.push(vec![Message::Invalidate]);
+                }
+                end.push(vec![Message::Error(error.to_string().into())]);
+                self.publish(end);
+            }
+            SettlePlan::Run {
+                invalidated,
+                runs,
+                auto_complete,
+                quiet,
+                passthrough,
+            } => {
+                let lead = if invalidated {
+                    self.apply_out(vec![vec![Message::Invalidate]])
+                } else {
+                    Vec::new()
+                };
+                let out = if !runs {
+                    Vec::new()
+                } else if passthrough {
+                    self.passthrough_frames()
+                } else {
+                    self.invoke()
+                };
+                self.with_inner_edges_mut(|_, e| e.state.clear_frames());
+                let postlude = if auto_complete && !out.iter().flatten().any(Message::is_terminal) {
+                    vec![vec![Message::Complete]]
+                } else {
+                    Vec::new()
+                };
+                if quiet {
+                    // What a quiet node outputs is a later wave of its own; only an auto
+                    // INVALIDATE goes on now (R-wave).
+                    if !lead.is_empty() {
+                        self.deliver_out(lead);
+                    }
+                    self.with_inner_edges_mut(|_, e| e.wave.pending = false);
+                    let mut later = out;
+                    later.extend(postlude);
+                    if !later.is_empty() {
+                        self.request_publish_next(later);
+                    }
+                    return;
+                }
+                let mut tail = out;
+                tail.extend(postlude);
+                let mut all = lead;
+                all.extend(self.apply_out(tail));
+                self.deliver_out(all);
+            }
         }
-        self.run_wave();
     }
 
-    fn passthrough_emit(&self) {
-        // Single-dep wire (deps, no fn): relay dep 0's latest DATA downstream.
-        let v = self.with_inner_edges_mut(|_n, e| {
-            let v = e.state.batch[0].as_ref().and_then(|b| b.last().cloned());
-            if let Some(v) = &v {
-                e.state.prev[0] = Some(v.clone());
+    /// A lifetime's first run, on the dependencies' snapshots (R-lifetime). Waiting for
+    /// every dependency to have a value is the Rust first-run gate (sugar).
+    fn first_run(&self) {
+        let plan = self.with_node_state_aux_mut(|n, c, cfg, r, e, _a| {
+            if e.value.terminal {
+                return None;
             }
-            e.state.batch[0] = None;
-            e.state.batch_waves[0].clear();
-            e.state.batch_wave_id[0] = None;
-            v
+            let dep_error = e.state.inputs.iter().find_map(|input| match &input.ended {
+                Some(DepTerminal::Error(err)) => Some(err.clone()),
+                _ => None,
+            });
+            let all_ended =
+                !n.deps.is_empty() && e.state.inputs.iter().all(|input| input.ended.is_some());
+            let restored_producer = n.deps.is_empty() && r.has_called_fn_once;
+            let gate_open = cfg.partial || cfg.all_deps_settled(&e.state);
+            Some((
+                dep_error.filter(|_| cfg.error_when_deps_error),
+                c.handle.is_some() && gate_open && !restored_producer,
+                c.handle.is_none() && !n.deps.is_empty(),
+                cfg.complete_when_deps_complete && all_ended,
+            ))
         });
-        if let Some(v) = v {
-            self.down(vec![Message::Data(v)]);
+        let Some((dep_error, runs, passthrough, auto_complete)) = plan else {
+            return;
+        };
+        let out = if let Some(err) = dep_error {
+            vec![vec![Message::Error(err.to_string().into())]]
+        } else if runs {
+            self.invoke()
+        } else if passthrough {
+            self.passthrough_frames()
+        } else {
+            Vec::new()
+        };
+        self.with_inner_edges_mut(|_, e| e.state.clear_frames());
+        let mut all = out;
+        if auto_complete && !all.iter().flatten().any(Message::is_terminal) {
+            all.push(vec![Message::Complete]);
         }
+        if !all.is_empty() {
+            self.publish(all);
+        }
+    }
+
+    /// A node with dependencies and no function relays dependency 0's DATA, one array
+    /// per array it received.
+    fn passthrough_frames(&self) -> Vec<Wave<AnyValue>> {
+        self.with_inner_edges(|_n, e| {
+            e.state.inputs.first().map_or_else(Vec::new, |input| {
+                input
+                    .frames
+                    .iter()
+                    .map(|f| {
+                        f.iter()
+                            .filter_map(|m| match m {
+                                InMsg::Data(v) => Some(Message::Data(v.clone())),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|f| !f.is_empty())
+                    .collect()
+            })
+        })
     }
 
     // ── runtime topology rewire (R-rewire / D42, C-8) ──
@@ -3252,7 +3239,7 @@ impl Core {
             self,
             BoundaryTask::Down {
                 target: CoreToken::from_core(self),
-                msgs,
+                frames: prepare_output(msgs),
                 committed: active_batch_committed_token()
                     .unwrap_or_else(|| Rc::new(Cell::new(true))),
             },
@@ -3294,369 +3281,117 @@ impl Core {
         }
     }
 
-    /// The surgical Option-C mutation + atomic settle (D42), run under a wave-owner. Kept
-    /// deps keep their subscription + per-dep state + idx-box (rerouted O(1)); removed deps
-    /// drain (box→-1, unsub) + drop their dirty contribution; added deps fresh-subscribe
-    /// (push-on-subscribe). The first-run gate + cache are PRESERVED (Q2/Q7). One atomic
-    /// settle if any added dep delivered data or the sole dirty contributor was removed.
+    /// The surgical Option-C mutation + settle (D42), run under a wave-owner. Kept deps
+    /// keep their subscription, input record and idx-box (rerouted O(1)); removed deps
+    /// drain (box→-1, unsub) and drop their pending mark; added deps are acquired, their
+    /// snapshots recorded as one input wave, and the node settles on them once.
     fn rewire_apply(&self, new_deps: Vec<Core>, fn_: NodeFn) {
         let old_deps = self.borrow().deps.clone();
+        self.with_inner_edges_mut(|_, e| e.wave.in_dep_mutation = true);
+        // QA-F1: clear `in_dep_mutation` on EVERY exit, including a panic unwind during
+        // the mutation (an added dep's activation or a removed dep's cleanup).
+        let mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
+        // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister
+        // the old handle so the rewired-away closure (and its captures) is freed.
+        self.swap_fn_preserving_pool(fn_);
         if same_ordered_deps(&old_deps, &new_deps) {
-            self.with_inner_edges_mut(|_, e| {
-                e.wave.in_dep_mutation = true;
-                e.wave.rewire_run_pending = false;
-            });
-            let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
-            self.swap_fn_preserving_pool(fn_);
-            self.with_inner_edges_mut(|_, e| {
-                e.wave.in_dep_mutation = false;
-            });
-            return;
-        }
-        if old_deps.len() == new_deps.len() && Self::same_graph_no_overlap(&old_deps, &new_deps) {
-            // DR-8/B54 no-kept fast path: full dep replacement (same arity, no shared
-            // identity) keeps this in the same O(n) class as the old keep-path, but bypasses
-            // full O(n²) matching when no dep survives.
-            let n = new_deps.len();
-            self.with_inner_edges_mut(|_, e| {
-                e.wave.in_dep_mutation = true;
-                e.wave.rewire_run_pending = false;
-            });
-            let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
-            let activated = self.with_aux(|a| a.activated);
-            let mut removed_dirty_contributor = false;
-
-            self.swap_fn_preserving_pool(fn_);
-
-            for old_idx in 0..old_deps.len() {
-                let unsub = {
-                    let mut graph = self.graph.borrow_mut();
-                    let (_nn, edges) = graph.get_node_and_edges_mut(self.key());
-                    if edges.state.dirty[old_idx] {
-                        removed_dirty_contributor = true;
-                        edges.state.pending -= 1;
-                    }
-                    if let Some(box_ref) = edges.idx_boxes.get(old_idx) {
-                        box_ref.set(-1);
-                    }
-                    edges.unsubs.get_mut(old_idx).and_then(|u| u.take())
-                };
-                if let Some(unsub) = unsub {
-                    unsub();
-                }
-            }
-
-            let new_batch: Vec<Option<Vec<AnyValue>>> = (0..n).map(|_| None).collect();
-            let new_batch_waves: Vec<Vec<Vec<WaveData>>> = (0..n).map(|_| Vec::new()).collect();
-            let new_batch_wave_id: Vec<Option<u64>> = (0..n).map(|_| None).collect();
-            let new_prev: Vec<Option<AnyValue>> = (0..n).map(|_| None).collect();
-            let new_tier: Vec<u8> = (0..n).map(|_| 0).collect();
-            let new_terminal: Vec<Option<DepTerminal>> = (0..n).map(|_| None).collect();
-            let new_terminal_wave: Vec<Option<DepTerminal>> = (0..n).map(|_| None).collect();
-            let new_has: Vec<bool> = (0..n).map(|_| false).collect();
-            let new_dirty: Vec<bool> = (0..n).map(|_| false).collect();
-            let new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
-            let new_boxes: Vec<Rc<Cell<i64>>> = (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
-            let new_restored_handshake: Vec<bool> = vec![false; n];
-            self.with_inner_edges_mut(|nn, e| {
-                nn.deps = new_deps.clone();
-                e.state.batch = new_batch;
-                e.state.batch_waves = new_batch_waves;
-                e.state.batch_wave_id = new_batch_wave_id;
-                e.state.prev = new_prev;
-                e.state.has_data = new_has;
-                e.state.dirty = new_dirty;
-                e.state.tier = new_tier;
-                e.state.terminal = new_terminal;
-                e.state.terminal_wave = new_terminal_wave;
-                e.unsubs = new_unsubs;
-                e.idx_boxes = new_boxes;
-                e.restored_activation_handshake = new_restored_handshake;
-            });
-
-            if activated {
-                for (idx, dep) in new_deps.iter().enumerate() {
-                    self.subscribe_dep(idx, dep);
-                }
-            }
-            self.notify_topology_deps_changed(&old_deps, &new_deps);
-
-            if self.with_inner_edges(|_, e| e.value.terminal) {
-                return;
-            }
-
-            let should_rewire_settle = self.with_inner_edges(|_, e| {
-                removed_dirty_contributor && e.state.pending == 0 && e.value.status == Status::Dirty
-            });
-            let mut zero_dep_undirty = false;
-            if should_rewire_settle {
-                if n == 0 {
-                    zero_dep_undirty = true;
-                } else {
-                    self.with_inner_edges_mut(|_, e| {
-                        e.wave.rewire_run_pending = true;
-                    });
-                }
-            }
-
-            self.with_inner_edges_mut(|_, e| {
-                e.wave.in_dep_mutation = false;
-            });
-
-            let run_pending =
-                self.with_inner_edges_mut(|_, e| std::mem::take(&mut e.wave.rewire_run_pending));
-            if run_pending {
-                self.settle_rewire();
-            } else if zero_dep_undirty {
-                let emitted = self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave);
-                if emitted {
-                    self.down(vec![Message::Resolved]);
-                } else {
-                    self.with_inner_edges_mut(|_n, e| {
-                        e.value.status = if e.value.has_data {
-                            Status::Settled
-                        } else {
-                            Status::Sentinel
-                        };
-                    });
-                }
-            }
             return;
         }
         let n = new_deps.len();
-        let mut old_to_new: Vec<Option<usize>> = vec![None; old_deps.len()];
         let mut new_to_old: Vec<Option<usize>> = vec![None; n];
-        if old_deps.len().saturating_mul(n) <= 64 {
-            for (old_idx, old_dep) in old_deps.iter().enumerate() {
-                for (new_idx, new_dep) in new_deps.iter().enumerate() {
-                    if old_dep.ptr_eq(new_dep) && new_to_old[new_idx].is_none() {
-                        old_to_new[old_idx] = Some(new_idx);
-                        new_to_old[new_idx] = Some(old_idx);
-                        break;
-                    }
-                }
-            }
-        } else {
-            let mut first_old_by_key: HashMap<ArenaNodeKey, usize> =
-                HashMap::with_capacity(old_deps.len());
-            for (old_idx, old_dep) in old_deps.iter().enumerate() {
-                first_old_by_key
-                    .entry(old_dep.arena_node_key())
-                    .or_insert(old_idx);
-            }
-            for (new_idx, new_dep) in new_deps.iter().enumerate() {
-                if let Some(old_idx) = first_old_by_key.remove(&new_dep.arena_node_key()) {
-                    old_to_new[old_idx] = Some(new_idx);
-                    new_to_old[new_idx] = Some(old_idx);
-                }
+        let mut old_kept = vec![false; old_deps.len()];
+        for (new_idx, new_dep) in new_deps.iter().enumerate() {
+            if let Some(old_idx) = old_deps
+                .iter()
+                .enumerate()
+                .position(|(old_idx, old_dep)| !old_kept[old_idx] && old_dep.ptr_eq(new_dep))
+            {
+                old_kept[old_idx] = true;
+                new_to_old[new_idx] = Some(old_idx);
             }
         }
-        let added: Vec<(usize, Core)> = new_deps
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| new_to_old[*idx].is_none())
-            .map(|(idx, dep)| (idx, dep.clone()))
-            .collect();
-        let removed: Vec<usize> = old_deps
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| old_to_new[*idx].is_none())
-            .map(|(idx, _)| idx)
-            .collect();
-
-        self.with_inner_edges_mut(|_, e| {
-            e.wave.in_dep_mutation = true;
-            e.wave.rewire_run_pending = false;
-        });
-        // QA-F1 (critical): clear `in_dep_mutation` on EVERY exit incl. a panic unwind during
-        // the mutation. A user fn CAN panic in this window — an added dep's activation fn
-        // (subscribe_dep → dep.activate → run_wave) or a removed dep's onDeactivation hook
-        // (u() → deactivate → user closure). The wave-owner catch (with_wave_owner) then runs
-        // reset_wave_flags, which does NOT cover in_dep_mutation and may not even include `self`
-        // in `touched` — so without this guard a caught rewire panic leaves the node permanently
-        // in_dep_mutation=true: every future maybe_run defers (never recomputes) + every future
-        // rewire is rejected as reentrant. Mirrors the TS `finally { _inDepMutation = false }`.
-        let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
         let activated = self.with_aux(|a| a.activated);
-        let mut zero_dep_undirty = false;
-
-        // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister the
-        // old handle so the rewired-away closure (and its captures) is freed and its slot
-        // reused. Register-first keeps `handle` never pointing at a freed slot.
-        self.swap_fn_preserving_pool(fn_);
-
-        // removed deps: clear dirty contribution + drain (box→-1, unsubscribe the edge).
-        let mut removed_dirty_contributor = false;
-        for old_idx in &removed {
-            let old_idx = *old_idx;
+        // removed deps: drop their pending mark, then drain (box→-1, unsubscribe).
+        for (old_idx, _) in old_kept.iter().enumerate().filter(|(_, kept)| !**kept) {
             let unsub = {
                 let mut graph = self.graph.borrow_mut();
                 let (_nn, edges) = graph.get_node_and_edges_mut(self.key());
-                if edges.state.dirty[old_idx] {
-                    removed_dirty_contributor = true;
+                if edges
+                    .state
+                    .inputs
+                    .get(old_idx)
+                    .is_some_and(|input| input.pending)
+                {
                     edges.state.pending -= 1;
                 }
                 if let Some(b) = edges.idx_boxes.get(old_idx) {
-                    b.set(-1); // drain: any stale in-flight callback drops
+                    b.set(-1);
                 }
-                edges.unsubs.get_mut(old_idx).and_then(|u| u.take())
+                edges.unsubs.get_mut(old_idx).and_then(Option::take)
             };
             if let Some(u) = unsub {
-                u(); // stops the removed dep's edge — no further delivery
+                u();
             }
         }
-
-        // rebuild the per-dep parallel arrays in new order; kept deps carry their state +
-        // subscription + idx-box (rerouted to the new index), added deps start fresh.
+        // rebuild the per-dep records in new order; kept deps carry theirs.
         {
             let mut graph = self.graph.borrow_mut();
             let (nn, edges) = graph.get_node_and_edges_mut(self.key());
-            let mut new_batch: Vec<Option<Vec<AnyValue>>> = vec![None; n];
-            let mut new_batch_waves: Vec<Vec<Vec<WaveData>>> = vec![Vec::new(); n];
-            let mut new_batch_wave_id: Vec<Option<u64>> = vec![None; n];
-            let mut new_prev: Vec<Option<AnyValue>> = vec![None; n];
-            let mut new_has = vec![false; n];
-            let mut new_dirty = vec![false; n];
-            let mut new_tier = vec![0u8; n];
-            let mut new_terminal: Vec<Option<DepTerminal>> = vec![None; n];
-            let mut new_terminal_wave: Vec<Option<DepTerminal>> = vec![None; n];
-            let mut new_unsubs: Vec<Option<Unsub>> = (0..n).map(|_| None).collect();
-            let mut new_boxes: Vec<Rc<Cell<i64>>> =
-                (0..n).map(|_| Rc::new(Cell::new(-1i64))).collect();
+            let mut inputs = Vec::with_capacity(n);
+            let mut unsubs: Vec<Option<Unsub>> = Vec::with_capacity(n);
+            let mut boxes: Vec<Rc<Cell<i64>>> = Vec::with_capacity(n);
             for (j, old_idx) in new_to_old.iter().enumerate() {
-                if let Some(old_idx) = *old_idx {
-                    new_batch[j] = edges.state.batch[old_idx].take();
-                    new_batch_waves[j] = std::mem::take(&mut edges.state.batch_waves[old_idx]);
-                    new_batch_wave_id[j] = edges.state.batch_wave_id[old_idx].take();
-                    new_prev[j] = edges.state.prev[old_idx].clone();
-                    new_has[j] = edges.state.has_data[old_idx];
-                    new_dirty[j] = edges.state.dirty[old_idx];
-                    new_tier[j] = edges.state.tier[old_idx];
-                    new_terminal[j] = edges.state.terminal[old_idx].clone();
-                    new_terminal_wave[j] = edges.state.terminal_wave[old_idx].clone();
-                    if let Some(slot) = edges.unsubs.get_mut(old_idx) {
-                        new_unsubs[j] = slot.take();
-                    }
-                    if let Some(b) = edges.idx_boxes.get(old_idx) {
+                match *old_idx {
+                    Some(old_idx) => {
+                        inputs.push(std::mem::take(&mut edges.state.inputs[old_idx]));
+                        unsubs.push(edges.unsubs.get_mut(old_idx).and_then(Option::take));
+                        let b = edges.idx_boxes[old_idx].clone();
                         b.set(j as i64); // O(1) reroute of the kept dep's callback index
-                        new_boxes[j] = b.clone();
+                        boxes.push(b);
+                    }
+                    None => {
+                        inputs.push(DepInput::default());
+                        unsubs.push(None);
+                        boxes.push(Rc::new(Cell::new(-1i64)));
                     }
                 }
             }
             nn.deps = new_deps.clone();
-            edges.state.batch = new_batch;
-            edges.state.batch_waves = new_batch_waves;
-            edges.state.batch_wave_id = new_batch_wave_id;
-            edges.state.prev = new_prev;
-            edges.state.has_data = new_has;
-            edges.state.dirty = new_dirty;
-            edges.state.tier = new_tier;
-            edges.state.terminal = new_terminal;
-            edges.state.terminal_wave = new_terminal_wave;
-            edges.unsubs = new_unsubs;
-            edges.idx_boxes = new_boxes;
-            edges.restored_activation_handshake = vec![false; n];
+            edges.state.inputs = inputs;
+            edges.unsubs = unsubs;
+            edges.idx_boxes = boxes;
         }
-
-        // subscribe added deps — push-on-subscribe delivers a cached dep's DATA (driving
-        // maybe_run, which DEFERS to the atomic settle via in_dep_mutation); a SENTINEL dep
-        // delivers START only. Only when activated (else activation will subscribe later).
         if activated {
-            for (idx, d) in &added {
-                self.subscribe_dep(*idx, d);
-            }
-        }
-        self.notify_topology_deps_changed(&old_deps, &new_deps);
-
-        // D62 / R-rewire-deferred: a terminal owner still drains queued topology intent,
-        // but terminal-is-forever remains an output guard. Apply the dep-set/fn cleanup
-        // above, then skip every post-mutation settle path so no post-terminal DIRTY,
-        // DATA, RESOLVED, INVALIDATE, COMPLETE, or ERROR can escape.
-        if self.with_inner_edges(|_, e| e.value.terminal) {
-            return;
-        }
-
-        // Q6 auto-settle: removing the sole dirty contributor closes the wave. With deps
-        // remaining → request the atomic settle; with zero deps → just un-dirty downstream
-        // (degenerate fn-no-deps). Cache is preserved either way (Q7).
-        {
-            let should_rewire_settle = self.with_inner_edges(|_n, e| {
-                removed_dirty_contributor && e.state.pending == 0 && e.value.status == Status::Dirty
-            });
-            if should_rewire_settle {
-                if new_deps.is_empty() {
-                    zero_dep_undirty = true;
-                } else {
-                    self.with_inner_edges_mut(|_, e| {
-                        e.wave.rewire_run_pending = true;
-                    });
+            for (idx, dep) in new_deps.iter().enumerate() {
+                if new_to_old[idx].is_none() {
+                    self.subscribe_dep(idx, dep);
                 }
             }
         }
-
-        self.with_inner_edges_mut(|_, e| {
-            e.wave.in_dep_mutation = false;
-        });
-
-        // Atomic post-mutation settle (a fresh wave): ONE two-phase DIRTY→DATA if an added
-        // dep delivered data or a sole-dirty dep was removed; else the zero-dep un-dirty.
-        let run_pending =
-            self.with_inner_edges_mut(|_, e| std::mem::take(&mut e.wave.rewire_run_pending));
-        if run_pending {
-            self.settle_rewire();
-        } else if zero_dep_undirty {
-            let emitted = self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave);
-            if emitted {
-                self.down(vec![Message::Resolved]); // un-dirty downstream (pause/batch-safe)
-            } else {
-                self.with_inner_edges_mut(|_n, e| {
-                    e.value.status = if e.value.has_data {
-                        Status::Settled
-                    } else {
-                        Status::Sentinel
-                    };
-                });
-            }
+        self.notify_topology_deps_changed(&old_deps, &new_deps);
+        drop(mut_guard);
+        // D62: a terminal owner still applies queued topology intent, but emits nothing.
+        if self.with_inner_edges(|_, e| e.value.terminal) {
+            return;
         }
+        self.settle_rewire();
     }
 
-    fn same_graph_no_overlap(old_deps: &[Core], new_deps: &[Core]) -> bool {
-        let mut old_ids = HashSet::with_capacity(old_deps.len());
-        for dep in old_deps {
-            old_ids.insert(dep.arena_node_key());
-        }
-        !new_deps
-            .iter()
-            .any(|dep| old_ids.contains(&dep.arena_node_key()))
-    }
-
-    /// R-rewire atomic settle (D42 + the D1 /qa fix): emit ONE proper two-phase
-    /// DIRTY→DATA wave after a rewire that warrants a recompute. Mirrors `try_run`'s
-    /// pause + gate + pending guards, then injects the phase-1 DIRTY the added dep's
-    /// [START,DATA] handshake did not carry (R-dirty-before-data).
+    /// After a rewire: the added dependencies' snapshots are one input wave, so the
+    /// node settles on them; a removed pending input that was the last to settle leaves
+    /// a pending node that sent nothing, which gets the kernel's RESOLVED.
     fn settle_rewire(&self) {
-        let (pending, has_handle, has_called, partial, all_settled) =
-            self.with_node_state(|_n, c, cfg, r, e| {
-                (
-                    e.state.pending,
-                    c.handle.is_some(),
-                    r.has_called_fn_once,
-                    cfg.partial,
-                    cfg.all_deps_settled(&e.state),
-                )
-            });
-        if pending > 0 {
-            return;
+        let (ready, owes_resolved) = self.with_inner_edges(|_, e| {
+            (
+                e.state.pending == 0 && e.state.has_frames(),
+                e.state.pending == 0 && e.wave.pending,
+            )
+        });
+        if ready {
+            self.settle();
+        } else if owes_resolved {
+            self.deliver_out(Vec::new());
         }
-        if !has_handle {
-            self.passthrough_emit();
-            return;
-        }
-        if !(has_called || partial || all_settled) {
-            return; // first-run gate still holds
-        }
-        self.mark_dirty(); // phase 1 (no-op if already dirty, e.g. unsubscribe_dep auto-settle)
-        self.run_wave(); // phase 2: fn → DATA / undirty RESOLVED
     }
 
     fn swap_fn_preserving_pool(&self, fn_: NodeFn) {
@@ -3673,49 +3408,62 @@ impl Core {
         }
     }
 
-    fn run_wave(&self) {
+    /// Runs the node's function once on this wave's input (R-invocation) and returns
+    /// what it sent through `ctx.down`, each call one array, in order. A panic in the
+    /// function is the node's ERROR, and what it sent before the panic is dropped
+    /// (R-failure).
+    fn invoke(&self) -> Vec<Wave<AnyValue>> {
         // B25: enroll in the wave touched-set before any mutation so a panic-abort
         // can reset our flags.
         wave_register(self);
         if self.with_inner_edges(|_, e| e.wave.inside_run_wave) {
             // R-reentrancy (D37): a fn re-driving its own dep mid-wave is the
-            // synchronous feedback cycle. Reject by panicking (the Rust analogue of a
-            // value-level throw) — the wave-owner's catch_unwind converts it to
-            // [[ERROR,e]] on a node ON the cycle (D30 / C-6, see `with_wave_owner`),
-            // rather than recurse to a stack overflow.
+            // synchronous feedback cycle. Reject by panicking — the enclosing run turns
+            // it into ERROR on a node ON the cycle (C-6).
             panic!(
                 "synchronous feedback cycle: node fn re-entered its own wave (R-reentrancy / D37)"
             );
         }
         // Build ctx + call snapshot under one short arena borrow, then invoke
         // borrow-free through the dispatcher (R-dispatch-all / R-sync-core).
-        let (handle, dispatcher, is_async, ctx, old_on_invalidate, old_on_deactivation) = self
+        let (handle, dispatcher, ctx, old_on_invalidate, old_on_deactivation) = self
             .with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
-                let dep_records: Vec<DepRecord> = (0..n.deps.len())
-                    .map(|i| {
-                        let latest = e.state.batch[i]
-                            .as_ref()
-                            .and_then(|b| b.last().cloned())
-                            .or_else(|| e.state.prev[i].clone());
-                        let wave_data = std::mem::take(&mut e.state.batch_waves[i]);
-                        e.state.batch_wave_id[i] = None;
-                        DepRecord {
-                            wave_data,
-                            prev_data: e.state.prev[i].clone(),
-                            latest,
-                            terminal: e.state.terminal_wave[i].take(),
-                        }
+                let dep_records: Vec<DepRecord> = e
+                    .state
+                    .inputs
+                    .iter()
+                    .zip(&n.deps)
+                    .map(|(input, dep)| DepRecord {
+                        dep: CoreIdentity::from_core(dep),
+                        wave_data: input
+                            .frames
+                            .iter()
+                            .filter(|f| f.iter().any(InMsg::is_value))
+                            .map(|f| {
+                                f.iter()
+                                    .filter_map(|m| match m {
+                                        InMsg::Data(v) => Some(v.clone()),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                        prev_data: if input.frames.is_empty() {
+                            input.value.clone()
+                        } else {
+                            input.value_before_wave.clone()
+                        },
+                        latest: input.value.clone(),
+                        terminal: input.frames.iter().flatten().find_map(InMsg::terminal),
                     })
                     .collect();
                 r.has_called_fn_once = true;
                 e.wave.inside_run_wave = true;
-                e.wave.emitted_tier3_this_wave = false;
+                e.wave.run_out.clear();
+                e.wave.emit_open = false;
                 (
-                    c.handle.expect("run_wave ⇒ handle present"),
+                    c.handle.expect("invoke ⇒ handle present"),
                     c.dispatcher.clone(),
-                    c.handle
-                        .map(|h| c.dispatcher.pool_kind(h.pool_id) == PoolKind::Async)
-                        .unwrap_or(false),
                     Ctx::new(self.borrowed_view(), dep_records),
                     std::mem::take(&mut a.on_invalidate),
                     std::mem::take(&mut a.on_deactivation),
@@ -3725,374 +3473,246 @@ impl Core {
         // graph-arena borrow, or the captured handle's `Drop` can re-enter `GraphCore`.
         drop(old_on_invalidate);
         drop(old_on_deactivation);
-        // D30: this is the innermost node whose fn runs — blame it if the fn (or a
-        // re-entry it triggers) panics, so the ERROR lands "nearest the throw" (C-6).
+        // D30: this is the innermost node whose fn runs.
         wave_set_blamed(self);
-        let _guard = WaveGuard(DeferredNodeAction::from_core(self));
-        // borrow-free: the fn calls ctx.down → re-enters this node's _down.
-        dispatcher.invoke(handle, &ctx);
-        drop(_guard); // clears inside_run_wave
-                      // R-resolved-undirty (D49): a node DIRTY'd downstream in phase 1
-                      // that produced NO tier-3 value this run (filter-reject / no-emit
-                      // fn) emits exactly one balancing RESOLVED to clear the downstream
-                      // dirty — the substrate synthesizes it so the operator body stays
-                      // clean (R-primary-api-clean).
-                      // EXEMPT async-pool nodes: an async fn that returns WITHOUT emitting has DEFERRED
-                      // its result (it emits later via a stashed DeferredCtx), NOT rejected — synthesizing
-                      // an undirty RESOLVED here would prematurely settle a still-pending diamond leg
-                      // (R-async-paused / C-4). The eventual deferred emit carries its own DIRTY balance.
-        let undirty = self.with_inner_edges(|_n, e| {
-            // EXEMPT a TERMINAL wave (the fn emitted COMPLETE/ERROR): the terminal IS the settle,
-            // and R-terminal-settles-dirty releases the downstream dirty — synthesizing an undirty
-            // RESOLVED here would overwrite the terminal status + emit a spurious post-terminal
-            // RESOLVED (mirrors the TS `_terminal === undefined` guard, node.ts). Pre-existing
-            // parity gap surfaced by C-11 (a fn emitting a bare COMPLETE).
-            e.wave.emitted_dirty_this_wave
-                && !e.wave.emitted_tier3_this_wave
-                && !e.value.terminal
-                && !is_async
-        });
-        if undirty {
-            // Route the balancing RESOLVED through the normal delivery waist so
-            // resumeAll and batch timing obey R-undirty-settle-timing.
-            self.down(vec![Message::Resolved]);
+        let guard = WaveGuard(DeferredNodeAction::from_core(self));
+        let result = catch_unwind(AssertUnwindSafe(|| dispatcher.invoke(handle, &ctx)));
+        drop(guard); // clears inside_run_wave
+        let out = self.with_inner_edges_mut(|_, e| std::mem::take(&mut e.wave.run_out));
+        match result {
+            Ok(()) => out,
+            Err(payload) => vec![vec![Message::Error(panic_to_error(payload))]],
         }
-        let keep_dirty_for_deferred_undirty = undirty
-            && self.with_inner_edges(|_n, e| {
-                e.wave.batch_dirty_owed || e.wave.emitted_tier3_this_wave
-            });
-
-        // Roll wave-local state forward after the settle path sees this wave's
-        // dirty/tier flags. Subscriber callbacks above run borrow-free.
-        self.with_inner_edges_mut(|_n, e| {
-            for (i, b) in e.state.batch.iter_mut().enumerate() {
-                if let Some(last) = b.as_ref().and_then(|batch| batch.last()).cloned() {
-                    e.state.prev[i] = Some(last);
-                }
-                *b = None;
-            }
-            if !keep_dirty_for_deferred_undirty {
-                e.wave.emitted_dirty_this_wave = false;
-                e.wave.emitted_tier3_this_wave = false;
-            }
-        });
     }
 
-    // ── downstream emission (the unified waist) ──
+    // ── downstream output (R-wave) ──
 
-    /// Emit a wave toward sinks. Synthesizes the leading DIRTY for an external
-    /// tier-3 emit (R-dirty-before-data), updates cache/status, and broadcasts.
-    ///
-    /// D49 (supersedes D15): every value-occurrence is emitted as **DATA** — the
-    /// substrate does NOT substitute DATA→RESOLVED on value-equality and never
-    /// inspects the per-wave DATA count for substitution (dedup is opt-in at the
-    /// operator layer). A RESOLVED reaching here is an explicit operator escape
-    /// hatch; the undirty RESOLVED is synthesized in [`Core::run_wave`].
-    pub(crate) fn down(&self, msgs: Vec<Msg>) {
-        // Terminal-is-forever (D17 / R-terminal): a terminated node emits nothing
-        // further — including a self-emit DATA via `set()` / `ctx.down`. (The
-        // COMPLETE/ERROR arms below also self-guard against a double terminal.)
+    /// One DATA value from the running function (`ctx.emit`). Consecutive emits of one
+    /// run join one array; a `ctx.down` in between closes it. This is Rust sugar
+    /// (graphrefly:D797 (9) leaves the combinators' array rule to each language): an
+    /// operator that emits per value still sends what one run produced as one array.
+    pub(crate) fn emit_value(&self, value: AnyValue) {
         let (terminal, inside) =
             self.with_inner_edges(|_n, e| (e.value.terminal, e.wave.inside_run_wave));
         if terminal {
             return;
         }
-        // B25: enroll in the wave touched-set before any mutation.
-        wave_register(self);
-        let mut sorted = msgs;
-        sorted.sort_by_key(Message::class_rank); // stable: preserves intra-class order
-
-        // R-invalidate-idempotent: collapse repeated INVALIDATE in one wave so the
-        // cleanup hook + downstream broadcast fire at most once.
-        if sorted
-            .iter()
-            .filter(|m| matches!(m, Message::Invalidate))
-            .count()
-            > 1
-        {
-            let mut seen = false;
-            sorted.retain(|m| {
-                if matches!(m, Message::Invalidate) {
-                    let keep = !seen;
-                    seen = true;
-                    keep
-                } else {
-                    true
-                }
-            });
-        }
-
-        let versioning_policy = self.versioning_policy();
-        for m in &sorted {
-            if let Message::Data(value) = m {
-                assert_node_version_data_compatible(&versioning_policy, value)
-                    .unwrap_or_else(|err| panic!("{err}"));
-            }
-        }
-
-        if !inside && collecting_batch() {
-            let (deferred, rest): (Vec<Msg>, Vec<Msg>) =
-                sorted.into_iter().partition(Message::is_settling);
-            if !deferred.is_empty() && defer_to_batch(self, deferred) {
-                if !self.with_inner_edges(|_, e| e.wave.emitted_dirty_this_wave) {
-                    self.emit_dirty_once();
-                }
-                self.with_inner_edges_mut(|_, e| {
-                    e.wave.batch_dirty_owed = true;
-                });
-                return;
-            }
-            sorted = rest;
-            if sorted.is_empty() {
-                return;
-            }
-        }
-
-        let mut data_count = 0usize;
-        let mut has_resolved = false;
-        let mut has_tier3 = false;
-        for m in &sorted {
-            match m {
-                Message::Data(_) => {
-                    data_count += 1;
-                    has_tier3 = true;
-                }
-                Message::Resolved => {
-                    has_resolved = true;
-                    has_tier3 = true;
-                }
-                _ => {}
-            }
-        }
-        // tier-3 exclusivity (R-resolved-undirty / D49): a wave's tier-3 slot is
-        // ≥1 DATA XOR 1 RESOLVED (occurrence vs undirty), never mixed.
-        assert!(
-            !(data_count >= 1 && has_resolved),
-            "down: a wave cannot mix DATA and RESOLVED (tier-3 exclusivity, R-resolved-undirty / D49)"
-        );
-
-        // Synthesize a leading PENDING for an EXTERNAL value emit.
-        if has_tier3 && !inside {
-            self.emit_dirty_once();
-        }
-
-        with_delivery_scope(|| {
-            for m in sorted {
-                if let Some(action) = self.collect_down_action(m) {
-                    self.apply_down_action(action);
-                }
-            }
-        });
-
         if !inside {
+            self.down(vec![Message::Data(value)]);
+            return;
+        }
+        self.with_inner_edges_mut(|_, e| {
+            if e.wave.emit_open {
+                if let Some(last) = e.wave.run_out.last_mut() {
+                    last.push(Message::Data(value));
+                    return;
+                }
+            }
+            e.wave.run_out.push(vec![Message::Data(value)]);
+            e.wave.emit_open = true;
+        });
+    }
+
+    /// One submitted array from this node: from its running function (`ctx.down`),
+    /// from the host, or as later output. The array keeps its written order, a
+    /// terminal must be last, and it is split at its last INVALIDATE (R-wave). Called
+    /// while the function runs, it joins that run's output, published after the
+    /// function returns; otherwise it is a wave of its own (or staged in a batch).
+    pub(crate) fn down(&self, msgs: Vec<Msg>) {
+        let (terminal, inside) =
+            self.with_inner_edges(|_n, e| (e.value.terminal, e.wave.inside_run_wave));
+        if terminal {
+            return;
+        }
+        let frames = prepare_output(msgs);
+        if inside {
             self.with_inner_edges_mut(|_, e| {
-                e.wave.emitted_dirty_this_wave = false;
-                e.wave.emitted_tier3_this_wave = false;
+                e.wave.emit_open = false;
+                e.wave.run_out.extend(frames);
             });
+            return;
         }
-    }
-
-    fn collect_down_action(&self, msg: Msg) -> Option<DownAction> {
-        let next_version = if let Message::Data(value) = &msg {
-            let (policy, current) = {
-                let graph = self.graph.borrow();
-                let version = graph.get_version(self.key());
-                (version.policy.clone(), version.value.clone())
-            };
-            Some(
-                advance_node_version(current.as_ref(), &policy, value)
-                    .unwrap_or_else(|err| panic!("{err}")),
-            )
+        if frames.is_empty() {
+            return;
+        }
+        let frames = if collecting_batch() {
+            let flat: Wave<AnyValue> = frames.into_iter().flatten().collect();
+            if defer_to_batch(self, flat) {
+                return;
+            }
+            unreachable!("defer_to_batch accepts output while a batch is collecting")
         } else {
-            None
+            frames
         };
-        let mut g = self.graph.borrow_mut();
-        Self::collect_down_action_from_graph(&mut g, self.key(), msg, next_version)
+        wave_register(self);
+        self.publish(frames);
     }
 
-    fn apply_down_action(&self, action: DownAction) {
-        match action {
-            DownAction::Emit { msg, subs } => deliver_subscriber_snapshot(subs, &msg),
-            DownAction::Invalidate { hooks } => {
-                // Invalidate hooks may unsubscribe current observers. Preserve the
-                // existing hook-before-subscriber-snapshot order (R-cleanup-hooks).
-                for f in hooks {
-                    f();
+    /// Applies arrays to this node, then delivers what remains (R-wave).
+    fn publish(&self, frames: Vec<Wave<AnyValue>>) {
+        let out = self.apply_out(frames);
+        self.deliver_out(out);
+    }
+
+    /// Writes the node's own output into what it holds (values, invalidation,
+    /// terminal) and returns the arrays that remain to be sent. An INVALIDATE at a node
+    /// that retains no value is dropped (R-invalidation); nothing follows a terminal
+    /// (R-terminals).
+    fn apply_out(&self, frames: Vec<Wave<AnyValue>>) -> Vec<Wave<AnyValue>> {
+        let mut out = Vec::new();
+        for frame in frames {
+            if self.with_inner_edges(|_, e| e.value.terminal) {
+                break;
+            }
+            let mut kept = Vec::with_capacity(frame.len());
+            let mut values = Vec::new();
+            let mut invalidate_hooks: Vec<Rc<dyn Fn()>> = Vec::new();
+            for m in frame {
+                match &m {
+                    Message::Data(value) => {
+                        let next_version = self.next_version(value);
+                        let mut g = self.graph.borrow_mut();
+                        g.get_version_mut(self.key()).value = next_version;
+                        let (_n, e) = g.get_node_and_edges_mut(self.key());
+                        e.value.cache = Some(value.clone());
+                        e.value.has_data = true;
+                        e.value.status = Status::Settled;
+                        values.push(value.clone());
+                    }
+                    Message::Resolved => {
+                        self.with_inner_edges_mut(|_, e| {
+                            e.value.status = if e.value.has_data {
+                                Status::Resolved
+                            } else {
+                                Status::Sentinel
+                            };
+                        });
+                    }
+                    Message::Invalidate => {
+                        let hooks = self.with_inner_edges_aux_mut(|_, e, a| {
+                            if !e.value.has_data {
+                                return None;
+                            }
+                            e.value.clear_values();
+                            e.value.status = Status::Sentinel;
+                            Some(a.on_invalidate.clone())
+                        });
+                        let Some(hooks) = hooks else {
+                            continue;
+                        };
+                        values.clear();
+                        invalidate_hooks.extend(hooks);
+                    }
+                    Message::Complete | Message::Error(_) => {
+                        let ended = match &m {
+                            Message::Error(err) => DepTerminal::Error(format!("{err}").into()),
+                            _ => DepTerminal::Complete,
+                        };
+                        self.with_inner_edges_mut(|_, e| {
+                            e.value.terminal = true;
+                            e.value.status = if matches!(ended, DepTerminal::Error(_)) {
+                                Status::Errored
+                            } else {
+                                Status::Completed
+                            };
+                            e.value.ended = Some(ended);
+                        });
+                    }
+                    Message::Start | Message::Pending => continue,
                 }
-                self.emit_to_subs(&Message::Invalidate);
+                kept.push(m);
+            }
+            // Invalidate hooks run borrow-free, before the INVALIDATE goes out
+            // (R-cleanup-hooks).
+            for f in invalidate_hooks {
+                f();
+            }
+            if !values.is_empty() {
+                self.with_inner_edges_mut(|_, e| e.value.values = values);
+            }
+            if !kept.is_empty() {
+                out.push(kept);
             }
         }
+        out
     }
 
-    fn collect_down_action_from_graph(
-        g: &mut GraphCore,
-        key: NodeKey,
-        msg: Msg,
-        next_version: Option<Option<NodeVersion>>,
-    ) -> Option<DownAction> {
-        match msg {
-            Message::Pending => {
-                let (_n, e, a) = g.get_node_edges_aux_mut(key);
-                if e.wave.emitted_dirty_this_wave {
-                    return None;
-                }
-                e.wave.emitted_dirty_this_wave = true;
-                e.value.status = Status::Dirty;
-                Some(DownAction::Emit {
-                    msg: Message::Pending,
-                    subs: snapshot_subscribers(a),
-                })
-            }
-            Message::Data(v) => {
-                // D49: every occurrence is DATA — no equals-substitution.
-                {
-                    let version = g.get_version_mut(key);
-                    version.value =
-                        next_version.expect("DATA precomputed next node runtime version");
-                }
-                let (_n, e, a) = g.get_node_edges_aux_mut(key);
-                e.value.cache = Some(v.clone());
-                e.value.has_data = true;
-                e.value.status = Status::Settled;
-                e.wave.emitted_tier3_this_wave = true;
-                Some(DownAction::Emit {
-                    msg: Message::Data(v),
-                    subs: snapshot_subscribers(a),
-                })
-            }
-            Message::Resolved => {
-                // Explicit operator escape hatch (D49); the substrate-synthesized
-                // undirty RESOLVED usually goes through run_wave. Dirty-balance paths
-                // that must honor pause/batch timing also route through here, so keep
-                // the no-cache case at SENTINEL while still emitting RESOLVED.
-                let (_n, e, a) = g.get_node_edges_aux_mut(key);
-                e.value.status = if e.value.has_data {
-                    Status::Resolved
+    fn next_version(&self, value: &AnyValue) -> Option<NodeVersion> {
+        let (policy, current) = {
+            let graph = self.graph.borrow();
+            let version = graph.get_version(self.key());
+            (version.policy.clone(), version.value.clone())
+        };
+        assert_node_version_data_compatible(&policy, value).unwrap_or_else(|err| panic!("{err}"));
+        advance_node_version(current.as_ref(), &policy, value).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Delivers arrays already applied to this node (R-wave). A pending node that ends
+    /// up with nothing settling gets exactly one RESOLVED from the kernel. A node that
+    /// sends without being pending marks its own cone first. Every array that carries
+    /// DATA, RESOLVED, INVALIDATE, COMPLETE or ERROR gets the PENDING prefix. All arrays
+    /// go to one subscriber before the next.
+    fn deliver_out(&self, mut out: Vec<Wave<AnyValue>>) {
+        let pending = self.with_inner_edges(|_, e| e.wave.pending);
+        if pending && !out.iter().flatten().any(Message::is_settling) {
+            out.extend(self.apply_out(vec![vec![Message::Resolved]]));
+        }
+        if out.is_empty() {
+            return;
+        }
+        if !pending && out.iter().flatten().any(Message::is_settling) {
+            self.mark_as_source();
+        }
+        self.with_inner_edges_mut(|_, e| e.wave.pending = false);
+        let out: Vec<Wave<AnyValue>> = out
+            .into_iter()
+            .map(|f| {
+                if f.iter().any(Message::is_settling) {
+                    let mut prefixed = Vec::with_capacity(f.len() + 1);
+                    prefixed.push(Message::Pending);
+                    prefixed.extend(f);
+                    prefixed
                 } else {
-                    Status::Sentinel
-                };
-                e.wave.emitted_tier3_this_wave = true;
-                Some(DownAction::Emit {
-                    msg: Message::Resolved,
-                    subs: snapshot_subscribers(a),
-                })
-            }
-            Message::Invalidate => {
-                // Honor the invalidate-request: clear cache → SENTINEL, fire
-                // onInvalidate, broadcast downstream (idempotent, no-op if unpopulated).
-                let (_n, e, a) = g.get_node_edges_aux_mut(key);
-                if !e.value.has_data {
-                    return None;
+                    f
                 }
-                e.value.cache = None;
-                e.value.has_data = false;
-                e.value.status = Status::Sentinel;
-                Some(DownAction::Invalidate {
-                    hooks: a.on_invalidate.clone(),
-                })
-            }
-            Message::Complete => {
-                let (_n, e, a) = g.get_node_edges_aux_mut(key);
-                if e.value.terminal {
-                    return None;
-                }
-                e.value.terminal = true;
-                e.value.status = Status::Completed;
-                Some(DownAction::Emit {
-                    msg: Message::Complete,
-                    subs: snapshot_subscribers(a),
-                })
-            }
-            Message::Error(e) => {
-                let (_n, edges, a) = g.get_node_edges_aux_mut(key);
-                if edges.value.terminal {
-                    return None;
-                }
-                edges.value.terminal = true;
-                edges.value.status = Status::Errored;
-                Some(DownAction::Emit {
-                    msg: Message::Error(e),
-                    subs: snapshot_subscribers(a),
-                })
-            }
-            Message::Start => None,
-        }
+            })
+            .collect();
+        let subs = self.with_aux(snapshot_subscribers);
+        with_delivery_scope(|| deliver_subscriber_snapshot(subs, &out));
     }
 
     /// External deferred emit — the async-pool late-emit path used by
-    /// [`crate::ctx::DeferredCtx`] (R-sync-core: async lives in the fn body, the emit
-    /// serializes back onto the single thread). Establishes a FRESH wave-owner boundary
-    /// (like [`Node::down`]) so a panic in the cascade becomes `[[ERROR,e]]` (D30) and the
-    /// leading DIRTY is synthesized (`inside_run_wave` is false here). Nested under a live
-    /// wave-owner (e.g. a deferred emit fired during a RESUME cascade) it just runs.
+    /// [`crate::ctx::DeferredCtx`]: a FRESH wave from this node, under its own
+    /// wave-owner boundary (D30).
     pub(crate) fn owned_down(&self, msgs: Wave<AnyValue>) {
         with_wave_owner(self, || self.down(msgs), || {});
     }
 
-    pub(crate) fn commit_batched_wave(&self, wave: Wave<AnyValue>) {
-        self.with_inner_edges_mut(|_, e| {
-            e.wave.batch_dirty_owed = false;
-        });
-        self.owned_down(wave);
-    }
-
-    pub(crate) fn rollback_batched(&self) {
-        let should_balance = self.with_inner_edges_mut(|_, e| {
-            if e.wave.batch_dirty_owed {
-                e.wave.batch_dirty_owed = false;
-                true
-            } else {
-                false
-            }
-        });
-        if should_balance {
-            self.owned_down(vec![Message::Resolved]);
-        }
-    }
-
-    fn emit_dirty_once(&self) {
-        let subs = self.with_inner_edges_aux_mut(|_n, e, a| {
-            if !e.wave.emitted_dirty_this_wave {
-                e.wave.emitted_dirty_this_wave = true;
-                e.value.status = Status::Dirty;
-                snapshot_subscribers(a)
-            } else {
-                SubscriberSnapshot::Empty
-            }
-        });
-        deliver_subscriber_snapshot(subs, &Message::Pending);
-    }
-
-    fn emit_to_subs(&self, msg: &Msg) {
-        // Clone the sink handles out, drop the borrow, then deliver — guards against
-        // subscribe/unsubscribe (and any re-entry) during iteration. The 0/1-sink
-        // cases avoid allocating a Vec while preserving the same snapshot boundary.
-        let subs = self.with_aux(snapshot_subscribers);
-        deliver_subscriber_snapshot(subs, msg);
-    }
-
-    /// R-invalidate-idempotent: clear cache → SENTINEL, flush onInvalidate, broadcast
-    /// INVALIDATE downstream. A no-op if nothing is cached (never-populated /
-    /// already-reset are observationally equivalent — prevents double-cleanup).
-    fn invalidate(&self) {
-        let hooks = {
-            self.with_inner_edges_aux_mut(|_n, e, a| {
-                if !e.value.has_data {
-                    return None; // idempotent no-op
+    /// Publishes arrays as one wave of their own, under a fresh wave owner.
+    fn owned_publish(&self, frames: Vec<Wave<AnyValue>>) {
+        with_wave_owner(
+            self,
+            || {
+                if !self.with_inner_edges(|_, e| e.value.terminal) {
+                    wave_register(self);
+                    self.publish(frames);
                 }
-                e.value.cache = None;
-                e.value.has_data = false;
-                e.value.status = Status::Sentinel;
-                Some(a.on_invalidate.clone()) // re-callable; clone out so we fire borrow-free
-            })
-        };
-        let Some(hooks) = hooks else {
-            return;
-        };
-        for f in hooks {
-            f();
-        }
-        self.emit_to_subs(&Message::Invalidate);
+            },
+            || {},
+        );
+    }
+
+    /// Queues arrays as a later wave from this node, after the current one.
+    fn request_publish_next(&self, frames: Vec<Wave<AnyValue>>) {
+        defer_boundary(
+            self,
+            BoundaryTask::Down {
+                target: CoreToken::from_core(self),
+                frames,
+                committed: active_batch_committed_token()
+                    .unwrap_or_else(|| Rc::new(Cell::new(true))),
+            },
+        );
     }
 
     // ── ctx.state + hooks (called from Ctx) ──
@@ -4113,6 +3733,11 @@ impl Core {
         self.with_aux_mut(|a| a.on_invalidate.push(f));
     }
 
+    /// A state node: no function and no dependencies.
+    pub(crate) fn is_state(&self) -> bool {
+        self.with_call(|c| c.handle.is_none()) && self.borrow().deps.is_empty()
+    }
+
     pub(crate) fn subscriber_count(&self) -> usize {
         self.with_aux(|a| a.subscribers.len())
     }
@@ -4122,22 +3747,13 @@ impl Core {
     }
 }
 
-fn reset_wave_flags_inner(n: &mut NodeTopologySlot, e: &mut DepEdges) {
+fn reset_wave_flags_inner(_n: &mut NodeTopologySlot, e: &mut DepEdges) {
     e.wave.inside_run_wave = false;
-    e.wave.emitted_dirty_this_wave = false;
-    e.wave.emitted_tier3_this_wave = false;
-    e.state.pending = 0;
-    for i in 0..n.deps.len() {
-        e.state.batch[i] = None;
-        e.state.batch_waves[i].clear();
-        e.state.batch_wave_id[i] = None;
-        e.state.terminal_wave[i] = None;
-        e.state.dirty[i] = false;
-    }
-    // `dep_terminal` is intentionally NOT reset here: it is a PERSISTED cross-wave fact
-    // (the dep really did COMPLETE/ERROR — terminal-is-forever, D17), not a wave-transient
-    // like `dep_dirty`/`dep_batch`. `deactivate`/`rewire_apply` refresh it on a fresh
-    // lifecycle; a panic-aborted wave must leave a terminated dep marked terminal.
+    e.wave.pending = false;
+    e.wave.run_out.clear();
+    e.state.clear_frames();
+    // A dependency's recorded value and terminal are cross-wave facts (the dep really
+    // did deliver or end), not wave transients; a panic-aborted wave keeps them.
 }
 
 /// Is `target` reachable upstream from `from` (following deps)? The rewire cycle-
@@ -4214,9 +3830,9 @@ pub struct Node<T> {
 
 impl<T: 'static> Node<T> {
     /// A state node pre-populated with `initial`; a new subscriber gets `[DATA]`
-    /// (R-initial). Manual source — push new values with [`Node::set`].
-    pub fn state(initial: T) -> Node<T> {
-        Self::state_in_arena(&GraphArena::default(), initial)
+    /// (R-initial). The host writes it through the returned [`State`].
+    pub fn state(initial: T) -> State<T> {
+        State::from_node(Self::state_in_arena(&GraphArena::default(), initial))
     }
 
     pub(crate) fn state_in_arena(arena: &GraphArena, initial: T) -> Node<T> {
@@ -4250,9 +3866,9 @@ impl<T: 'static> Node<T> {
         }
     }
 
-    /// A SENTINEL state node — no value until the first [`Node::set`].
-    pub fn state_empty() -> Node<T> {
-        Self::state_empty_in_arena(&GraphArena::default())
+    /// A state node with no value until the first [`State::set`].
+    pub fn state_empty() -> State<T> {
+        State::from_node(Self::state_empty_in_arena(&GraphArena::default()))
     }
 
     pub(crate) fn state_empty_in_arena(arena: &GraphArena) -> Node<T> {
@@ -4411,21 +4027,26 @@ impl<T: 'static> Node<T> {
         node
     }
 
-    /// Push a new value from a state node (one DATA wave). Always emits DATA — the
-    /// substrate never absorbs to RESOLVED on value-equality (D49).
-    pub fn set(&self, v: T) {
+    /// Writes a value as one DATA array: the crate-internal host write behind
+    /// [`State::set`]. Every occurrence stays DATA; the kernel never absorbs an equal
+    /// value (D49).
+    pub(crate) fn set(&self, v: T) {
         self.down(vec![Message::Data(Rc::new(v))]);
     }
 
-    /// Emit a raw array downstream (R-node-iface). The wave-owner boundary for the D30
-    /// catch (a panicking fn the cascade triggers becomes `[[ERROR,e]]`, not an escape).
+    /// Publishes one array from outside any function run, under its own wave owner: the
+    /// crate-internal host input behind [`State`].
     ///
     /// # Panics
     ///
     /// Panics when `msgs` contains PENDING or RESOLVED, which only the kernel sends
     /// (R-wave); nothing of the array is applied.
-    pub fn down(&self, msgs: Wave<AnyValue>) {
+    pub(crate) fn down(&self, msgs: Wave<AnyValue>) {
+        // Rejections reach the caller, before the wave owner would turn them into the
+        // node's ERROR (R-failure).
         reject_kernel_only_output(&msgs);
+        check_output_shape(&msgs);
+        crate::batch::assert_stageable(&self.core, &msgs);
         with_wave_owner(&self.core, || self.core.down(msgs), || {});
     }
 
@@ -4462,15 +4083,15 @@ impl<T: 'static> Node<T> {
     /// Panics (R-terminal / D17): subscribing to a non-resubscribable **terminal** node
     /// is rejected — the stream is permanently over. (Resubscribable opt-in reset is a
     /// later slice.)
-    pub fn subscribe(&self, sink: impl Fn(&Msg) + 'static) -> Unsub {
+    pub fn subscribe(&self, sink: impl Fn(&[Msg]) + 'static) -> Unsub {
         self.subscribe_with_kind(sink, SubscriberKind::External)
     }
 
-    pub(crate) fn subscribe_graph_observer(&self, sink: impl Fn(&Msg) + 'static) -> Unsub {
+    pub(crate) fn subscribe_graph_observer(&self, sink: impl Fn(&[Msg]) + 'static) -> Unsub {
         self.subscribe_with_kind(sink, SubscriberKind::GraphObserver)
     }
 
-    fn subscribe_with_kind(&self, sink: impl Fn(&Msg) + 'static, kind: SubscriberKind) -> Unsub {
+    fn subscribe_with_kind(&self, sink: impl Fn(&[Msg]) + 'static, kind: SubscriberKind) -> Unsub {
         assert!(
             !self.core.with_inner_edges(|_n, e| e.value.terminal),
             "subscribe: node is terminal and non-resubscribable — the stream is permanently over (R-terminal / D17)"
@@ -4548,6 +4169,74 @@ impl<T: 'static> Node<T> {
 /// A cheap handle clone — both `Node`s address the SAME underlying node (the shared
 /// `Rc<RefCell<…>>`), like cloning a [`Core`]. Manual (not `#[derive]`) so it does
 /// NOT require `T: Clone` — the value type need not be cloneable for the handle to be.
+/// A state node's handle, the only host input (R-wave; graphrefly-rs:D3): a wave starts
+/// from `set`, `invalidate`, `complete` or `error` on a state node. Dereferences to its
+/// [`Node`] for subscribing, reading and use as a dependency.
+pub struct State<T> {
+    node: Node<T>,
+}
+
+impl<T: 'static> State<T> {
+    pub(crate) fn from_node(node: Node<T>) -> Self {
+        Self { node }
+    }
+
+    /// The state's node.
+    #[must_use]
+    pub fn node(&self) -> &Node<T> {
+        &self.node
+    }
+
+    /// The state's node, by value.
+    #[must_use]
+    pub fn into_node(self) -> Node<T> {
+        self.node
+    }
+
+    /// Writes `v` as one DATA wave. Every occurrence stays DATA, an equal value
+    /// included (D49).
+    pub fn set(&self, v: T) {
+        self.node.set(v);
+    }
+
+    /// Removes the retained value, if any, as one INVALIDATE wave (R-invalidation).
+    pub fn invalidate(&self) {
+        self.node.down(vec![Message::Invalidate]);
+    }
+
+    /// Ends the state with COMPLETE (R-terminals).
+    pub fn complete(&self) {
+        self.node.down(vec![Message::Complete]);
+    }
+
+    /// Ends the state with ERROR carrying `error` (R-terminals).
+    pub fn error(&self, error: impl Into<GraphError>) {
+        self.node.down(vec![Message::Error(error.into())]);
+    }
+}
+
+impl<T> Clone for State<T> {
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+        }
+    }
+}
+
+impl<T> From<State<T>> for Node<T> {
+    fn from(state: State<T>) -> Self {
+        state.node
+    }
+}
+
+impl<T> std::ops::Deref for State<T> {
+    type Target = Node<T>;
+
+    fn deref(&self) -> &Node<T> {
+        &self.node
+    }
+}
+
 impl<T> Clone for Node<T> {
     fn clone(&self) -> Self {
         Node {
@@ -4565,10 +4254,15 @@ mod tests {
     use serde_json::json;
 
     /// Collect a subscriber's message-kind tags into a shared Vec for shape asserts.
-    fn recorder() -> (Rc<RefCell<Vec<String>>>, impl Fn(&Msg) + 'static) {
+    type KindLog = Rc<RefCell<Vec<String>>>;
+
+    fn recorder() -> (KindLog, impl Fn(&[Msg]) + 'static) {
         let log = Rc::new(RefCell::new(Vec::new()));
         let l2 = log.clone();
-        (log, move |m: &Msg| l2.borrow_mut().push(format!("{m:?}")))
+        (log, move |msgs: &[Msg]| {
+            l2.borrow_mut()
+                .extend(msgs.iter().map(|m| format!("{m:?}")));
+        })
     }
 
     #[test]
@@ -4597,7 +4291,9 @@ mod tests {
     }
 
     #[test]
-    fn batch_commits_last_settle_and_rollback_balances_dirty() {
+    fn batch_commits_one_array_and_rollback_delivers_nothing() {
+        // R-request-order: a batch delivers nothing before its commit, and its writes
+        // to one node commit as one array; a rollback drops them with nothing to undo.
         let s = Node::<i32>::state(0);
         let (log, sink) = recorder();
         let _u = s.subscribe(sink);
@@ -4606,19 +4302,19 @@ mod tests {
         crate::batch::batch(|_| {
             s.set(1);
             s.set(2);
-            assert_eq!(*log.borrow(), vec!["PENDING"]);
+            assert!(log.borrow().is_empty());
             assert_eq!(s.cache(), Some(0));
         });
-        assert_eq!(*log.borrow(), vec!["PENDING", "DATA"]);
+        assert_eq!(*log.borrow(), vec!["PENDING", "DATA", "DATA"]);
         assert_eq!(s.cache(), Some(2));
 
         log.borrow_mut().clear();
         crate::batch::batch(|bctx| {
             s.set(3);
             bctx.rollback();
-            assert_eq!(*log.borrow(), vec!["PENDING"]);
+            assert!(log.borrow().is_empty());
         });
-        assert_eq!(*log.borrow(), vec!["PENDING", "RESOLVED"]);
+        assert!(log.borrow().is_empty());
         assert_eq!(s.cache(), Some(2));
     }
 
@@ -4641,186 +4337,6 @@ mod tests {
     }
 
     #[test]
-    fn d49_filter_no_emit_synthesizes_undirty_resolved() {
-        // R-resolved-undirty (D49): a derived fn DIRTY'd in phase 1 that returns
-        // WITHOUT emitting (filter-reject) → the substrate synthesizes exactly one
-        // RESOLVED to clear the downstream dirty (no wedge).
-        let a = Node::<i32>::state_empty();
-        let evens: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            let v = *ctx.data::<i32>(0).unwrap();
-            if v % 2 == 0 {
-                ctx.emit(v);
-            } // odd → emit nothing (filter-reject)
-        });
-        let (log, sink) = recorder();
-        let seen_refs = Rc::new(RefCell::new(Vec::<usize>::new()));
-        let evens_refs = evens.core.refs.clone();
-        let seen_ref_count = seen_refs.clone();
-        let _u = evens.subscribe({
-            move |m| {
-                if matches!(m, Message::Resolved) {
-                    seen_ref_count.borrow_mut().push(evens_refs.get());
-                }
-                sink(m)
-            }
-        });
-        let base_refs = evens.core.refs.get();
-        assert_eq!(*log.borrow(), vec!["START"]); // first-run gate holds (a SENTINEL)
-
-        a.set(3); // odd → fn runs, no emit → substrate undirties with one RESOLVED
-        assert_eq!(*log.borrow(), vec!["START", "PENDING", "RESOLVED"]);
-        assert_eq!(evens.cache(), None); // filtered → never valued
-        assert_eq!(evens.status(), Status::Sentinel);
-        assert!(
-            seen_refs.borrow().iter().all(|count| *count == base_refs),
-            "post-run RESOLVED must not promote a counted owner Core"
-        );
-        let (prev, batch) = evens.core.with_inner_edges(|_n, e| {
-            (
-                e.state.prev[0]
-                    .as_ref()
-                    .and_then(|v| v.downcast_ref::<i32>().copied()),
-                e.state.batch[0].is_none(),
-            )
-        });
-        assert_eq!(prev, Some(3));
-        assert!(batch);
-
-        a.set(4); // even → real DATA (downstream was NOT wedged by the prior RESOLVED)
-        assert_eq!(
-            *log.borrow(),
-            vec!["START", "PENDING", "RESOLVED", "PENDING", "DATA"]
-        );
-        assert_eq!(evens.cache(), Some(4));
-        assert_eq!(evens.status(), Status::Settled);
-        let prev = evens.core.with_inner_edges(|_n, e| {
-            e.state.prev[0]
-                .as_ref()
-                .and_then(|v| v.downcast_ref::<i32>().copied())
-        });
-        assert_eq!(prev, Some(4));
-
-        a.set(5); // odd → filter; node KEEPS its value 4, status → Resolved (no new occurrence)
-        assert_eq!(
-            *log.borrow(),
-            vec!["START", "PENDING", "RESOLVED", "PENDING", "DATA", "PENDING", "RESOLVED"]
-        );
-        assert_eq!(evens.cache(), Some(4));
-        assert_eq!(evens.status(), Status::Resolved);
-        let (seen_refs, prev_batch) = evens.core.with_inner_edges(|_n, e| {
-            (
-                seen_refs.borrow().clone(),
-                e.state.prev[0]
-                    .as_ref()
-                    .and_then(|v| v.downcast_ref::<i32>().copied()),
-            )
-        });
-        assert_eq!(
-            seen_refs,
-            vec![base_refs, base_refs],
-            "RESOLVED callbacks should not increment counted Core refs"
-        );
-        assert_eq!(prev_batch, Some(5));
-    }
-
-    #[test]
-    fn run_wave_post_dispatch_resolved_is_borrow_free_and_rolls_dep_state() {
-        // DR-8/B54 owner-execution: post-dispatch run_wave cleanup should route the
-        // synthesized undirty RESOLVED through the delivery waist, deliver callbacks
-        // borrow-free, and then roll dep state without counted owner promotion.
-        let arena = GraphArena::new();
-        let source = Node::<i32>::state_in_arena(&arena, 2);
-        type SeenRuns = Rc<RefCell<Vec<(Option<i32>, Vec<i32>)>>>;
-        let seen: SeenRuns = Rc::new(RefCell::new(Vec::new()));
-        let evens: Node<i32> =
-            Node::derived_opts_in_arena(&arena, vec![source.erased()], NodeOpts::default(), {
-                let seen = seen.clone();
-                move |ctx| {
-                    let prev = ctx.dep_records()[0]
-                        .prev_data
-                        .as_ref()
-                        .and_then(|v| v.downcast_ref::<i32>().copied());
-                    let batch = ctx
-                        .batch::<i32>(0)
-                        .into_iter()
-                        .map(|v| *v)
-                        .collect::<Vec<_>>();
-                    seen.borrow_mut().push((prev, batch));
-                    let v = *ctx.data::<i32>(0).unwrap();
-                    if v % 2 == 0 {
-                        ctx.emit(v);
-                    }
-                }
-            });
-        let held: Rc<RefCell<Option<Node<i32>>>> =
-            Rc::new(RefCell::new(Some(Node::<i32>::state_in_arena(&arena, 99))));
-        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
-        let resolved_refs = Rc::new(Cell::new(usize::MAX));
-        let _u = evens.subscribe({
-            let held = held.clone();
-            let refs_slot = refs_slot.clone();
-            let resolved_refs = resolved_refs.clone();
-            move |msg| {
-                if matches!(msg, Message::Resolved) {
-                    if let Some(refs) = refs_slot.borrow().as_ref() {
-                        resolved_refs.set(refs.get());
-                    }
-                    let _ = held.borrow_mut().take();
-                }
-            }
-        });
-        *refs_slot.borrow_mut() = Some(evens.core.refs.clone());
-        let refs_before = evens.core.refs.get();
-
-        assert_eq!(
-            &*seen.borrow(),
-            &[(None, vec![2])],
-            "activation run sees the cached source wave once"
-        );
-        source.set(3);
-
-        assert!(held.borrow().is_none(), "RESOLVED callback ran borrow-free");
-        assert_eq!(
-            resolved_refs.get(),
-            refs_before,
-            "post-run RESOLVED delivery must not temporarily promote the owner Core"
-        );
-        assert_eq!(evens.cache(), Some(2));
-        assert_eq!(evens.status(), Status::Resolved);
-
-        source.set(4);
-        assert_eq!(
-            &*seen.borrow(),
-            &[(None, vec![2]), (Some(2), vec![3]), (Some(3), vec![4])],
-            "the rejected odd wave must still roll dep prev_data before the next run"
-        );
-        assert_eq!(evens.cache(), Some(4));
-        let (res_refs, rolled_prev) = evens.core.with_inner_edges(|_n, e| {
-            (
-                resolved_refs.get(),
-                e.state.prev[0]
-                    .as_ref()
-                    .and_then(|v| v.downcast_ref::<i32>().copied()),
-            )
-        });
-        assert_eq!(
-            rolled_prev,
-            Some(4),
-            "run_wave should carry latest settled data forward in prev"
-        );
-        assert!(
-            evens
-                .core
-                .with_inner_edges(|_n, e| e.state.batch[0].is_none()),
-            "post-wave state must clear batch"
-        );
-        assert_eq!(
-            res_refs, refs_before,
-            "post-run RESOLVED delivery should remain borrow-free and ref-neutral"
-        );
-    }
-
-    #[test]
     fn run_wave_post_dispatch_panic_keeps_wave_guard() {
         // DR-8/B54: if a synthesized RESOLVED callback panics, WaveGuard must
         // clear `inside_run_wave` on unwind so D30 recovery can proceed.
@@ -4830,12 +4346,19 @@ mod tests {
         let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
             let _ = ctx.data::<i32>(0).unwrap();
         });
-        let _u = derived.subscribe(move |msg| {
-            if matches!(msg, Message::Resolved) {
-                resolved_flag.set(true);
-                panic!("resolved callback panic");
-            }
-        });
+        let _u = derived.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(msg, Message::Resolved) {
+                        resolved_flag.set(true);
+                        panic!("resolved callback panic");
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            },
+        );
 
         source.set(1);
 
@@ -4915,85 +4438,16 @@ mod tests {
         b.set(4); // both settled → first run, sum = 7
         assert_eq!(runs.get(), 1);
         assert_eq!(sum.cache(), Some(7));
-        assert_eq!(*log.borrow(), vec!["START", "PENDING", "DATA"]);
+        // The first write marked `sum` pending while the gate (Rust sugar) held, so the
+        // kernel settled it with RESOLVED (R-wave).
+        assert_eq!(
+            *log.borrow(),
+            vec!["START", "PENDING", "RESOLVED", "PENDING", "DATA"]
+        );
 
         a.set(10); // recompute (gate already passed), sum = 14
         assert_eq!(runs.get(), 2);
         assert_eq!(sum.cache(), Some(14));
-    }
-
-    #[test]
-    fn data_waits_while_another_dep_is_pending() {
-        let a = Node::<i32>::state_empty();
-        let b = Node::<i32>::state_empty();
-        let runs = Rc::new(Cell::new(0usize));
-        let r2 = runs.clone();
-        let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
-            r2.set(r2.get() + 1);
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-        });
-        let (log, sink) = recorder();
-        let _u = sum.subscribe(sink);
-        assert_eq!(*log.borrow(), vec!["START"]);
-
-        with_wave_owner(
-            &a.core,
-            || sum.core.receive_from_dep(0, &Message::Pending),
-            || {},
-        );
-        with_wave_owner(
-            &b.core,
-            || sum.core.receive_from_dep(1, &Message::Pending),
-            || {},
-        );
-        assert_eq!(*log.borrow(), vec!["START", "PENDING"]);
-
-        with_wave_owner(
-            &a.core,
-            || sum.core.receive_from_dep(0, &Message::Data(Rc::new(3i32))),
-            || {},
-        );
-        assert_eq!(runs.get(), 0, "dep 1 is still pending");
-
-        with_wave_owner(
-            &b.core,
-            || sum.core.receive_from_dep(1, &Message::Data(Rc::new(4i32))),
-            || {},
-        );
-        assert_eq!(runs.get(), 1);
-        assert_eq!(sum.cache(), Some(7));
-        assert_eq!(*log.borrow(), vec!["START", "PENDING", "DATA"]);
-    }
-
-    #[test]
-    fn data_without_prior_dirty_still_satisfies_first_run_gate() {
-        let a = Node::<i32>::state_empty();
-        let b = Node::<i32>::state_empty();
-        let runs = Rc::new(Cell::new(0usize));
-        let r2 = runs.clone();
-        let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
-            r2.set(r2.get() + 1);
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-        });
-        let (log, sink) = recorder();
-        let _u = sum.subscribe(sink);
-        assert_eq!(*log.borrow(), vec!["START"]);
-
-        with_wave_owner(
-            &a.core,
-            || sum.core.receive_from_dep(0, &Message::Data(Rc::new(3i32))),
-            || {},
-        );
-        assert_eq!(runs.get(), 0, "first-run gate still waits for dep 1");
-
-        with_wave_owner(
-            &b.core,
-            || sum.core.receive_from_dep(1, &Message::Data(Rc::new(4i32))),
-            || {},
-        );
-        assert_eq!(runs.get(), 1);
-        assert_eq!(sum.cache(), Some(7));
-        assert_eq!(*log.borrow(), vec!["START", "DATA"]);
     }
 
     #[test]
@@ -5067,10 +4521,10 @@ mod tests {
 
         s.down(vec![Message::Complete]); // S terminal
         assert_eq!(s.status(), Status::Completed);
-        assert_eq!(*log.borrow(), vec!["START", "DATA", "COMPLETE"]);
+        assert_eq!(*log.borrow(), vec!["START", "DATA", "PENDING", "COMPLETE"]);
 
         s.set(5); // self-emit after terminal → no-op (no DATA, value unchanged)
-        assert_eq!(*log.borrow(), vec!["START", "DATA", "COMPLETE"]);
+        assert_eq!(*log.borrow(), vec!["START", "DATA", "PENDING", "COMPLETE"]);
         assert_eq!(s.cache(), Some(1));
         assert_eq!(s.status(), Status::Completed);
     }
@@ -5172,11 +4626,18 @@ mod tests {
             Rc::new(RefCell::new(Some(Node::<i32>::producer(|_| {}))));
         let source = Node::<i32>::state_empty();
         let h = held.clone();
-        let _u = source.subscribe(move |m| {
-            if matches!(m, Message::Data(_)) {
-                let _ = h.borrow_mut().take();
-            }
-        });
+        let _u = source.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(m, Message::Data(_)) {
+                        let _ = h.borrow_mut().take();
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
 
         source.set(1);
 
@@ -5289,65 +4750,9 @@ mod tests {
         );
 
         // A stale weak dep-callback entry is a no-op and must not disturb the new node.
-        old_weak.receive_from_dep(0, &Message::Start);
+        old_weak.receive_from_dep(0, &[Message::Start]);
         assert_eq!(second.cache(), Some(2));
         assert_eq!(second.status(), Status::Settled);
-    }
-
-    #[test]
-    fn deferred_delivery_actions_do_not_pin_core_while_queued() {
-        // DR-8/B54: delivery-boundary queues carry generation-keyed weak arena actions,
-        // not counted Core clones. The wave touched-set owns the in-wave pin; the queued
-        // action should not add hot-path refcount churn while it waits for the boundary.
-        let source = Node::<i32>::state(1);
-        let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + 1)
-        });
-        let _u = derived.subscribe(|_| {});
-        let refs_before = derived.core.refs.get();
-
-        with_delivery_scope(|| {
-            defer_run_until_delivery_boundary(&derived.core);
-            defer_run_until_delivery_boundary(&derived.core);
-            defer_absorbed_settle_until_delivery_boundary(&derived.core);
-            defer_absorbed_settle_until_delivery_boundary(&derived.core);
-
-            assert_eq!(
-                derived.core.refs.get(),
-                refs_before,
-                "queued delivery-boundary actions must not hold counted Core refs"
-            );
-            DEFERRED_DELIVERY_ACTIONS.with(|actions| {
-                let actions = actions.borrow();
-                assert_eq!(
-                    actions.len(),
-                    2,
-                    "delivery-boundary actions dedupe by arena key and action kind"
-                );
-                assert_eq!(
-                    actions
-                        .iter()
-                        .filter(|action| action.kind == DeferredDeliveryKind::Run)
-                        .count(),
-                    1,
-                    "run actions dedupe by arena key"
-                );
-                assert_eq!(
-                    actions
-                        .iter()
-                        .filter(|action| action.kind == DeferredDeliveryKind::AbsorbedSettle)
-                        .count(),
-                    1,
-                    "absorbed-settle actions dedupe by arena key"
-                );
-            });
-        });
-
-        assert_eq!(
-            derived.core.refs.get(),
-            refs_before,
-            "delivery-boundary drain does not retain queued counted Core refs"
-        );
     }
 
     #[test]
@@ -5383,126 +4788,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_delivery_drains_run_before_absorbed_settle() {
-        // DR-8/B54: delivery boundary actions must process Run before AbsorbedSettle
-        // so a deferred recompute is not starved behind its follow-up settle.
-        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
-        let derived: Node<i32> = Node::derived(vec![], {
-            let events = events.clone();
-            move |_ctx| {
-                events.borrow_mut().push("run");
-            }
-        });
-        let _u = derived.subscribe({
-            let events = events.clone();
-            move |msg| {
-                if let Message::Resolved = msg {
-                    events.borrow_mut().push("resolved");
-                }
-            }
-        });
-        events.borrow_mut().clear();
-
-        // Seed settle eligibility for the same wave as an absorbed terminal path would do.
-        derived
-            .core
-            .with_inner_edges_mut(|_n, e| e.wave.emitted_dirty_this_wave = true);
-
-        with_delivery_scope(|| {
-            defer_run_until_delivery_boundary(&derived.core);
-            defer_absorbed_settle_until_delivery_boundary(&derived.core);
-        });
-
-        assert_eq!(
-            &*events.borrow(),
-            &["run", "resolved"],
-            "deferred Run must drain before AbsorbedSettle"
-        );
-    }
-
-    #[test]
-    fn deferred_delivery_outside_wave_run_does_not_increment_refs() {
-        // DR-8/B54: when a queued delivery-boundary run drains outside a wave, the
-        // borrowed pin is used for execution, so no temporary counted ref is added.
-        let source = Node::<i32>::state(1);
-        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
-        let observed_refs = Rc::new(Cell::new(usize::MAX));
-        let run_count = Rc::new(Cell::new(0usize));
-
-        let derived: Node<i32> = Node::derived_opts(
-            vec![source.erased()],
-            NodeOpts {
-                partial: true,
-                ..NodeOpts::default()
-            },
-            {
-                let refs_slot = refs_slot.clone();
-                let observed_refs = observed_refs.clone();
-                let run_count = run_count.clone();
-                move |_ctx| {
-                    if let Some(refs) = refs_slot.borrow().as_ref() {
-                        observed_refs.set(refs.get());
-                    }
-                    run_count.set(run_count.get() + 1);
-                }
-            },
-        );
-
-        *refs_slot.borrow_mut() = Some(derived.core.refs.clone());
-        let before = derived.core.refs.get();
-
-        with_delivery_scope(|| {
-            defer_run_until_delivery_boundary(&derived.core);
-        });
-
-        assert_eq!(
-            run_count.get(),
-            1,
-            "queued delivery-boundary run must execute"
-        );
-        assert_eq!(
-            observed_refs.get(),
-            before,
-            "outside-wave delivery-boundary run must execute from a borrowed pin"
-        );
-    }
-
-    #[test]
-    fn stale_deferred_delivery_action_does_not_run_after_slot_free() {
-        // DR-8/B54: once a node's slot is released, queued deferred actions must be
-        // generation-checked and become inert, even before the slot is reused.
-        DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
-
-        let arena = GraphArena::new();
-        let old = Node::<i32>::state_in_arena(&arena, 1);
-        let old_key = old.core.key();
-        let weak = old.core.downgrade();
-        let stale_run = DeferredDeliveryAction::from_core(DeferredDeliveryKind::Run, &old.core);
-        let stale_settle =
-            DeferredDeliveryAction::from_core(DeferredDeliveryKind::AbsorbedSettle, &old.core);
-
-        drop(old);
-
-        assert!(
-            weak.borrowed_core().is_none(),
-            "old slot is not live after drop"
-        );
-        assert_eq!(weak.key.generation, old_key.generation);
-
-        DEFERRED_DELIVERY_ACTIONS.with(|actions| {
-            let mut actions = actions.borrow_mut();
-            actions.push(stale_run);
-            actions.push(stale_settle);
-        });
-        drain_deferred_runs();
-
-        assert!(
-            weak.borrowed_core().is_none(),
-            "freed slot remains out-of-scope for stale deferred work"
-        );
-    }
-
-    #[test]
     fn weak_borrowed_core_uses_arena_pin_after_external_death() {
         // DR-8/B54: a wave pin, not the counted Core refcount, owns liveness for
         // in-wave borrowed execution. This must fail closed once the pin releases.
@@ -5530,10 +4815,9 @@ mod tests {
     }
 
     #[test]
-    fn deferred_delivery_run_skips_same_wave_terminalized_target() {
-        // R-terminal: a DATA may queue a delivery-boundary run, then a later terminal in
-        // the same upstream wave can complete the target before that boundary drains.
-        // The stale run must not invoke user code after terminal-is-forever seals output.
+    fn same_array_data_then_complete_runs_once_then_completes() {
+        // R-terminals (auto COMPLETE): the node runs once on the DATA its dependency sent
+        // with COMPLETE in one array, then completes after that run (C-36).
         let source = Node::<i32>::state_empty();
         let runs = Rc::new(Cell::new(0usize));
         let derived: Node<i32> = Node::derived(vec![source.erased()], {
@@ -5547,46 +4831,8 @@ mod tests {
 
         source.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
 
-        assert_eq!(
-            runs.get(),
-            0,
-            "queued delivery-boundary run must not execute after same-wave terminal"
-        );
+        assert_eq!(runs.get(), 1, "the run sees the DATA before the COMPLETE");
         assert_eq!(derived.status(), Status::Completed);
-    }
-
-    #[test]
-    fn stale_deferred_delivery_action_does_not_target_reused_slot() {
-        // A queued weak arena action may outlive the original slot after an unwind/drop.
-        // Rehydration must check the generation and old ref token, so a later occupant of
-        // the same slot is a no-op target, not a run/settle target.
-        DEFERRED_DELIVERY_ACTIONS.with(|actions| actions.borrow_mut().clear());
-
-        let arena = GraphArena::new();
-        let old = Node::<i32>::state_in_arena(&arena, 1);
-        let stale_run = DeferredDeliveryAction::from_core(DeferredDeliveryKind::Run, &old.core);
-        let stale_settle =
-            DeferredDeliveryAction::from_core(DeferredDeliveryKind::AbsorbedSettle, &old.core);
-        let old_key = old.core.key();
-        drop(old);
-
-        let reused = Node::<i32>::state_in_arena(&arena, 2);
-        assert_eq!(old_key.id, reused.core.key().id);
-        assert_ne!(old_key.generation, reused.core.key().generation);
-
-        DEFERRED_DELIVERY_ACTIONS.with(|actions| {
-            let mut actions = actions.borrow_mut();
-            actions.push(stale_run);
-            actions.push(stale_settle);
-        });
-        drain_deferred_runs();
-
-        assert_eq!(reused.cache(), Some(2));
-        assert_eq!(
-            reused.status(),
-            Status::Settled,
-            "stale deferred generation must not disturb the reused slot occupant"
-        );
     }
 
     #[test]
@@ -5606,11 +4852,18 @@ mod tests {
             }
         });
         let _d_sub = d.subscribe(|_| {});
-        let _panic_sub = source.subscribe(|m| {
-            if matches!(m, Message::Data(_)) {
-                panic!("subscriber aborts delivery after dep callback queued run");
-            }
-        });
+        let _panic_sub = source.subscribe(
+            |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(m, Message::Data(_)) {
+                        panic!("subscriber aborts delivery after dep callback queued run");
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
 
         source.set(1);
 
@@ -5666,214 +4919,9 @@ mod tests {
     }
 
     #[test]
-    fn internal_dep_callback_entry_uses_borrowed_pin_outside_wave() {
-        // DR-8/B54: the off-wave weak dep callback path should also use a temporary
-        // arena pin + borrowed Core, not a counted Core promotion.
-        let arena = GraphArena::new();
-        let source = Node::<i32>::state_in_arena(&arena, 1);
-        let derived: Node<i32> = Node::derived_opts_in_arena(
-            &arena,
-            vec![source.erased()],
-            NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
-        );
-        let weak = derived.core.downgrade();
-        let refs_before = derived.core.refs.get();
-
-        weak.receive_from_dep(0, &Message::Start);
-        assert_eq!(
-            derived.core.refs.get(),
-            refs_before,
-            "outside a wave, weak dep entry must not promote a counted Core"
-        );
-    }
-
-    #[test]
-    fn internal_dep_callback_entry_outside_wave_uses_pinned_borrow_when_refcount_dead() {
-        // DR-8/B54: when a node is already arena-pinned (eg. by a temporary
-        // batch/closure token) and `refs == 0`, we can process an off-wave dep callback
-        // without creating a temporary counted Core clone.
-        let arena = GraphArena::new();
-        let source = Node::<i32>::state_in_arena(&arena, 1);
-        let derived: Node<i32> = Node::derived_opts_in_arena(
-            &arena,
-            vec![source.erased()],
-            NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
-        );
-        let weak = derived.core.downgrade();
-        let borrowed = derived.core.borrowed_view();
-        let pin = ArenaNodePin::from_core(&derived.core).expect("node must be pinnable while live");
-        let refs = derived.core.refs.clone();
-
-        drop(derived);
-        assert_eq!(
-            refs.get(),
-            0,
-            "setup drops the final public node handle so receive path is stress-tested with no counted refs"
-        );
-
-        weak.receive_from_dep(0, &Message::Data(Rc::new(4i32)));
-        assert_eq!(
-            refs.get(),
-            0,
-            "pinned receive should not promote a counted Core when the slot is already externally dead"
-        );
-        assert_eq!(
-            borrowed
-                .cache_any()
-                .and_then(|v| v.downcast_ref::<i32>().copied()),
-            Some(4),
-            "borrowed owner execution should still run the dep callback while pinned"
-        );
-
-        with_wave_owner(
-            &source.core,
-            || weak.receive_from_dep(0, &Message::Data(Rc::new(5i32))),
-            || {},
-        );
-        assert_eq!(
-            refs.get(),
-            0,
-            "in-wave pinned receive should also avoid counted Core promotion"
-        );
-        assert_eq!(
-            borrowed
-                .cache_any()
-                .and_then(|v| v.downcast_ref::<i32>().copied()),
-            Some(5),
-            "in-wave collect/apply must not half-apply dep bookkeeping then skip the action"
-        );
-        drop(pin);
-    }
-
-    #[test]
-    fn internal_dep_callback_entry_run_decision_executes_from_borrowed_action() {
-        // A precomputed in-wave Run decision must execute from the borrowed action
-        // path and avoid perturbing the owner Core refcount during fn execution.
-        let arena = GraphArena::new();
-        let source = Node::<i32>::state_empty_in_arena(&arena);
-        let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
-        let observed_refs_in_fn = Rc::new(Cell::new(usize::MAX));
-        let run_count = Rc::new(Cell::new(0usize));
-
-        let derived = Node::<i32>::derived_opts_in_arena(
-            &arena,
-            vec![source.erased()],
-            NodeOpts::default(),
-            {
-                let refs_slot = refs_slot.clone();
-                let observed_refs_in_fn = observed_refs_in_fn.clone();
-                let run_count = run_count.clone();
-                move |ctx| {
-                    run_count.set(run_count.get() + 1);
-                    let refs = refs_slot
-                        .borrow()
-                        .as_ref()
-                        .expect("test installed ref counter before run")
-                        .clone();
-                    observed_refs_in_fn.set(refs.get());
-                    ctx.emit(*ctx.data::<i32>(0).unwrap());
-                }
-            },
-        );
-        *refs_slot.borrow_mut() = Some(derived.core.refs.clone());
-        let _u = derived.subscribe(|_| {});
-        let baseline_refs = derived.core.refs.get();
-        assert_eq!(
-            run_count.get(),
-            0,
-            "first-run gate should hold before source DATA"
-        );
-
-        let weak = derived.core.downgrade();
-        let action = with_wave_owner(
-            &source.core,
-            || {
-                weak.collect_in_wave_receive_from_dep_action(0, &Message::Data(Rc::new(4i32)))
-                    .expect("in-wave receive should collect a runnable action")
-            },
-            InWaveDepReceiveAction::default,
-        );
-
-        assert!(
-            matches!(action.maybe_run_decision, MaybeRunDecision::Run),
-            "first in-wave settle for a ready dep should materialize as Run"
-        );
-
-        weak.apply_in_wave_receive_action(action);
-
-        assert_eq!(
-            run_count.get(),
-            1,
-            "borrowed in-wave action must still execute one fn run"
-        );
-        assert_eq!(
-            observed_refs_in_fn.get(),
-            baseline_refs,
-            "fn execution from borrowed action must not re-count owner refs"
-        );
-        assert_eq!(derived.cache(), Some(4));
-    }
-
-    #[test]
-    fn stale_in_wave_receive_action_is_generation_checked() {
-        // A collected in-wave action is still keyed by the generation-scoped weak token.
-        // Once the slot is reused, rehydrating the stale action must be a no-op.
-        let arena = GraphArena::new();
-        let source = Node::<i32>::state_in_arena(&arena, 1);
-        let run_count = Rc::new(Cell::new(0usize));
-
-        let (weak, old_key, action) = {
-            let derived = Node::<i32>::derived_opts_in_arena(
-                &arena,
-                vec![source.erased()],
-                NodeOpts::default(),
-                {
-                    let run_count = run_count.clone();
-                    move |ctx| {
-                        run_count.set(run_count.get() + 1);
-                        ctx.emit(*ctx.data::<i32>(0).unwrap() + 1);
-                    }
-                },
-            );
-            let old_key = derived.core.key();
-            let weak = derived.core.downgrade();
-            let action = with_wave_owner(
-                &source.core,
-                || {
-                    weak.collect_in_wave_receive_from_dep_action(0, &Message::Data(Rc::new(9i32)))
-                        .expect("in-wave receive should collect a runnable action")
-                },
-                InWaveDepReceiveAction::default,
-            );
-            (weak, old_key, action)
-        };
-
-        let replacement = Node::<i32>::state_in_arena(&arena, 2);
-        assert_eq!(old_key.id, replacement.core.key().id);
-        assert_ne!(old_key.generation, replacement.core.key().generation);
-
-        weak.apply_in_wave_receive_action(action);
-
-        assert_eq!(
-            run_count.get(),
-            0,
-            "stale in-wave action must not execute after generation drift"
-        );
-        assert_eq!(
-            replacement.cache(),
-            Some(2),
-            "reused slot should keep its own initial cache when action is stale"
-        );
-    }
-
-    #[test]
-    fn in_flight_passthrough_decision_waits_for_delivery_boundary() {
-        // R-diamond/D77: a single upstream msgs array may carry multiple DATA
-        // occurrences. A no-fn passthrough must wait until the delivery boundary so
-        // it relays the wave's latest DATA once instead of clearing its dep batch on
-        // the first occurrence.
+    fn passthrough_relays_every_data_of_an_array_in_order() {
+        // R-wave: the kernel delivers every DATA unchanged and in order and never
+        // merges or drops it, so a no-fn passthrough relays the whole array.
         let arena = GraphArena::new();
         let source = Node::<i32>::state_empty_in_arena(&arena);
         let wire = Node::<i32>::from_core(Core::new_in_arena(
@@ -5886,13 +4934,20 @@ mod tests {
         ));
         let seen = Rc::new(RefCell::new(Vec::<i32>::new()));
         let seen_sink = seen.clone();
-        let _u = wire.subscribe(move |msg| {
-            if let Message::Data(v) = msg {
-                seen_sink
-                    .borrow_mut()
-                    .push(*v.downcast_ref::<i32>().expect("wire emits i32"));
-            }
-        });
+        let _u = wire.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if let Message::Data(v) = msg {
+                        seen_sink
+                            .borrow_mut()
+                            .push(*v.downcast_ref::<i32>().expect("wire emits i32"));
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            },
+        );
 
         source.down(vec![
             Message::Data(Rc::new(1i32)),
@@ -5901,116 +4956,10 @@ mod tests {
 
         assert_eq!(
             seen.borrow().as_slice(),
-            &[2],
-            "passthrough must coalesce one upstream wave to its latest DATA"
+            &[1, 2],
+            "passthrough relays both occurrences"
         );
         assert_eq!(wire.cache(), Some(2));
-    }
-
-    #[test]
-    fn internal_dep_callback_entry_out_of_wave_does_not_inflate_live_refcount() {
-        // When the target is still publicly owned, a borrowed owner execution should be used
-        // without increasing the temporary Core refcount visible to user callbacks.
-        let arena = GraphArena::new();
-        let source = Node::<i32>::state_empty_in_arena(&arena);
-        let observed_refs = Rc::new(Cell::new(0usize));
-        let derived: Node<i32> = Node::derived_opts_in_arena(
-            &arena,
-            vec![source.erased()],
-            NodeOpts::default(),
-            |ctx| {
-                if let Some(v) = ctx.data::<i32>(0) {
-                    ctx.emit(*v);
-                }
-            },
-        );
-        let weak = derived.core.downgrade();
-
-        let _sub = derived.subscribe({
-            let observed_refs = observed_refs.clone();
-            let live_refs = derived.core.refs.clone();
-            move |msg| {
-                if matches!(msg, Message::Data(_)) {
-                    observed_refs.set(live_refs.get());
-                }
-            }
-        });
-        let live_refs = derived.core.refs.clone();
-        let baseline = live_refs.get();
-
-        weak.receive_from_dep(0, &Message::Data(Rc::new(7i32)));
-
-        assert_eq!(
-            observed_refs.get(),
-            baseline,
-            "out-of-wave receive should not promote/ref-bump while still borrowed by arena pin"
-        );
-        assert_eq!(derived.cache(), Some(7));
-        assert_eq!(
-            derived.core.refs.get(),
-            baseline,
-            "out-of-wave borrowed execution should preserve live counted handle count"
-        );
-    }
-
-    #[test]
-    fn internal_dep_callback_entry_out_of_wave_refcount_dead_pin_stays_fail_closed() {
-        // DR-8/B54 pin-first execution should work with refcount-dead live pins,
-        // then fail closed once that temporary pin is released.
-        let arena = GraphArena::new();
-        let graph = arena.0.clone();
-        let source = Node::<i32>::state_in_arena(&arena, 1);
-        let derived: Node<i32> = Node::derived_opts_in_arena(
-            &arena,
-            vec![source.erased()],
-            NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
-        );
-        let weak = derived.core.downgrade();
-        let key = derived.core.key();
-        let refs = derived.core.refs.clone();
-        let borrowed = derived.core.borrowed_view();
-        let pin = ArenaNodePin::from_core(&derived.core).expect("node must be pinnable while live");
-
-        drop(derived);
-
-        assert_eq!(
-            refs.get(),
-            0,
-            "setup leaves no counted owner so this only exercises fail-closed pin behavior"
-        );
-        weak.receive_from_dep(0, &Message::Data(Rc::new(4i32)));
-        assert_eq!(
-            borrowed
-                .cache_any()
-                .and_then(|v| v.downcast_ref::<i32>().copied()),
-            Some(4),
-            "pinned borrowed receive should still execute while the slot is temporarily alive"
-        );
-
-        drop(pin);
-        assert!(
-            !graph.borrow().is_live_key(key),
-            "pin release should allow slot cleanup"
-        );
-        assert!(
-            weak.counted_core().is_none(),
-            "fail-closed should not revive a dead counted handle after pin release"
-        );
-        assert!(
-            weak.borrowed_core().is_none(),
-            "fail-closed should not rehydrate from dead refs with no pin"
-        );
-        assert!(
-            weak.pinned_borrowed_core().is_none(),
-            "fail-closed should not construct a borrowed pin path after release"
-        );
-        weak.receive_from_dep(0, &Message::Data(Rc::new(5i32)));
-        assert_eq!(
-            refs.get(),
-            0,
-            "receive from a dead slot must not resurrect refs"
-        );
     }
 
     #[test]
@@ -6024,11 +4973,18 @@ mod tests {
         let refs = source.core.refs.clone();
         let seen_refs = Rc::new(Cell::new(0usize));
         let seen = seen_refs.clone();
-        let _u = source.subscribe(move |m| {
-            if matches!(m, Message::Data(_)) {
-                seen.set(refs.get());
-            }
-        });
+        let _u = source.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(m, Message::Data(_)) {
+                        seen.set(refs.get());
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
 
         source.set(1);
 
@@ -6147,15 +5103,22 @@ mod tests {
         let saw_boundary = Rc::new(Cell::new(false));
         let saw = saw_boundary.clone();
         let graph_for_sink = graph.clone();
-        let _u = owner.subscribe(move |m| {
-            if matches!(m, Message::Invalidate) {
-                saw.set(true);
-                assert!(
-                    !graph_for_sink.borrow().is_live_key(victim_key),
-                    "touched pins must release before committed-boundary tasks run"
-                );
-            }
-        });
+        let _u = owner.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(m, Message::Invalidate) {
+                        saw.set(true);
+                        assert!(
+                            !graph_for_sink.borrow().is_live_key(victim_key),
+                            "touched pins must release before committed-boundary tasks run"
+                        );
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
         let owner_core = owner.core.clone();
 
         with_wave_owner(
@@ -6273,34 +5236,6 @@ mod tests {
             "run state reset re-arms the depless producer on the next activation"
         );
         assert_eq!(p.cache(), Some(2));
-    }
-
-    #[test]
-    fn config_slot_partial_gate_runs_with_sentinel_dep() {
-        // DR-8/B54 next slice: first-run config moved out of NodeInner. The partial
-        // flag still opens the gate for a SENTINEL dep once the node is asked to run;
-        // without config-slot wiring this derived node would wait for source DATA.
-        let source = Node::<i32>::state_empty();
-        let d: Node<i32> = Node::derived_opts(
-            vec![source.erased()],
-            NodeOpts {
-                partial: true,
-                ..NodeOpts::default()
-            },
-            |ctx| {
-                assert!(ctx.data::<i32>(0).is_none());
-                ctx.emit(7i32);
-            },
-        );
-        assert!(d.core.with_config(|cfg| cfg.partial));
-
-        let _u = d.subscribe(|_| {});
-        d.core.try_run();
-
-        assert_eq!(d.cache(), Some(7));
-        assert!(d
-            .core
-            .with_node_state(|_n, _c, _cfg, r, _e| r.has_called_fn_once));
     }
 
     #[test]
@@ -6717,11 +5652,18 @@ mod tests {
             });
         let _inner_sub = inner.subscribe(|_| {});
         let inner_src_for_outer = inner_src.clone();
-        let _outer_sub = outer.subscribe(move |m| {
-            if matches!(m, Message::Data(_)) {
-                inner_src_for_outer.set(1);
-            }
-        });
+        let _outer_sub = outer.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(m, Message::Data(_)) {
+                        inner_src_for_outer.set(1);
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
 
         outer.set(1);
         assert_eq!(inner.cache(), Some(1));
@@ -7125,11 +6067,18 @@ mod tests {
             });
         let _inner_sub = inner.subscribe(|_| {});
         let inner_src_for_commit = inner_src.clone();
-        let _outer_sub = outer.subscribe(move |m| {
-            if matches!(m, Message::Data(_)) {
-                inner_src_for_commit.set(1);
-            }
-        });
+        let _outer_sub = outer.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(m, Message::Data(_)) {
+                        inner_src_for_commit.set(1);
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
 
         crate::batch::batch(|_| {
             outer.set(1);
@@ -7239,47 +6188,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_owner_rewire_drains_topology_without_post_terminal_settle() {
-        // D62: terminal drains queued topology but terminal-is-forever still seals output.
-        // Force the old hazard shape: a terminal owner also has a stale dirty contribution
-        // from a dep being removed. The rewire must apply cleanup but skip settle_rewire /
-        // zero-dep undirty so no post-terminal DIRTY/RESOLVED/DATA escapes.
-        let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let (log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        log.borrow_mut().clear();
-
-        d.core.with_inner_edges_mut(|_n, e| {
-            e.value.terminal = true;
-            e.value.status = Status::Completed;
-            e.wave.emitted_dirty_this_wave = true;
-            e.state.dirty[0] = true;
-            e.state.pending = 1;
-        });
-
-        d.core
-            .apply_rewire_next(RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(999i32))));
-
-        assert_eq!(d.status(), Status::Completed);
-        assert!(
-            log.borrow().is_empty(),
-            "terminal-owner topology drain must not emit post-terminal messages: {:?}",
-            *log.borrow()
-        );
-        assert!(
-            d.core.borrow().deps.is_empty(),
-            "queued topology still drains on the terminal owner"
-        );
-        assert!(
-            !d.core.with_inner_edges(|_, e| e.wave.in_dep_mutation),
-            "terminal-owner early return must still clear the dep-mutation guard"
-        );
-    }
-
-    #[test]
     fn wave_scope_blamed_does_not_add_ref_pin() {
         // DR-8/B54 next slice: `blamed` is a generation-keyed arena reference rather
         // than another counted Core clone. The touched-set now pins live nodes in the
@@ -7328,21 +6236,31 @@ mod tests {
         let log = Rc::new(RefCell::new(Vec::<String>::new()));
         let h = held.clone();
         let l = log.clone();
-        let _u = derived.subscribe(move |m| {
-            l.borrow_mut().push(format!("{m:?}"));
-            if matches!(m, Message::Data(_)) {
-                let _ = h.borrow_mut().take();
-            }
-        });
+        let _u = derived.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    l.borrow_mut().push(format!("{m:?}"));
+                    if matches!(m, Message::Data(_)) {
+                        let _ = h.borrow_mut().take();
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
 
         source.set(1);
 
-        assert!(held.borrow().is_none());
+        // R-failure: a panic in the function is the node's ERROR, and what it sent
+        // before the panic is dropped, so the subscriber sees no DATA.
+        assert!(held.borrow().is_some());
         assert_eq!(derived.status(), Status::Errored);
         assert!(
             log.borrow().iter().any(|k| k == "ERROR"),
-            "panic recovery should emit ERROR on the generation-keyed blamed node"
+            "a panicking function ends its node with ERROR"
         );
+        assert!(!log.borrow().iter().any(|k| k == "DATA"));
     }
 
     #[test]
@@ -7402,11 +6320,18 @@ mod tests {
         assert_ne!(outer.core.arena_node_key(), panicker.core.arena_node_key());
 
         let p = panicker.clone();
-        let _u = outer.subscribe(move |m| {
-            if matches!(m, Message::Data(_)) {
-                let _ = p.subscribe(|_| {});
-            }
-        });
+        let _u = outer.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if matches!(m, Message::Data(_)) {
+                        let _ = p.subscribe(|_| {});
+                    }
+                };
+                for m in msgs {
+                    handle(m);
+                }
+            },
+        );
 
         outer.set(1);
 
@@ -7546,52 +6471,6 @@ mod tests {
     }
 
     #[test]
-    fn rewire_same_order_deps_swaps_fn_without_rebuilding_dep_state() {
-        // DR-8/B54: same-ordered deps are a fn swap only. Option-C state and
-        // subscriber transport stay untouched; the next dep wave uses the new fn.
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(2);
-        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-        assert_eq!(d.cache(), Some(3));
-        assert_eq!(a.core.subscriber_count(), 1);
-        assert_eq!(b.core.subscriber_count(), 1);
-
-        d.core.with_inner_edges_mut(|_, e| {
-            e.state.prev[0] = Some(Rc::new(11i32));
-            e.state.prev[1] = Some(Rc::new(22i32));
-        });
-
-        d.replace_deps(vec![a.erased(), b.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * *ctx.data::<i32>(1).unwrap())
-        });
-
-        assert_eq!(a.core.subscriber_count(), 1);
-        assert_eq!(b.core.subscriber_count(), 1);
-        d.core.with_inner_edges(|_, e| {
-            assert_eq!(
-                e.state.prev[0]
-                    .as_ref()
-                    .and_then(|v| v.downcast_ref::<i32>())
-                    .copied(),
-                Some(11),
-            );
-            assert_eq!(
-                e.state.prev[1]
-                    .as_ref()
-                    .and_then(|v| v.downcast_ref::<i32>())
-                    .copied(),
-                Some(22),
-            );
-        });
-
-        a.set(3);
-        assert_eq!(d.cache(), Some(66)); // new fn: dep0=3, dep1=22
-    }
-
-    #[test]
     fn rewire_same_order_fn_swap_rejects_reentrant_rewire_from_old_fn_drop() {
         struct ReenterOnDrop {
             target: Rc<RefCell<Option<Node<i32>>>>,
@@ -7637,58 +6516,6 @@ mod tests {
             "DepMutationGuard must clear the fast-path mutation guard after panic"
         );
         *holder.borrow_mut() = None;
-    }
-
-    #[test]
-    fn rewire_precompute_keeps_first_duplicate_old_dep_slot() {
-        // Public construction may still contain duplicate old deps while rewire
-        // dedups the new dep list. The precomputed index map must preserve the
-        // old `.position()` behavior: keep the first old slot's DepRecord/idx-box,
-        // and drain the duplicate old edge.
-        let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived(vec![a.erased(), a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-        assert_eq!(
-            a.core.subscriber_count(),
-            2,
-            "duplicate old deps install two internal edges before rewire"
-        );
-
-        d.core.with_inner_edges_mut(|_, e| {
-            e.state.prev[0] = Some(Rc::new(11i32));
-            e.state.prev[1] = Some(Rc::new(22i32));
-            e.state.has_data[0] = true;
-            e.state.has_data[1] = true;
-        });
-
-        d.replace_deps(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-
-        d.core.with_inner_edges(|n, e| {
-            assert_eq!(n.deps.len(), 1);
-            assert_eq!(e.state.prev.len(), 1);
-            assert_eq!(
-                e.state.prev[0]
-                    .as_ref()
-                    .and_then(|v| v.downcast_ref::<i32>())
-                    .copied(),
-                Some(11),
-                "rewire should keep the first old duplicate dep slot"
-            );
-            assert_eq!(
-                e.idx_boxes[0].get(),
-                0,
-                "kept first duplicate edge should reroute to new index 0"
-            );
-        });
-        assert_eq!(
-            a.core.subscriber_count(),
-            1,
-            "the duplicate old edge is drained during rewire"
-        );
     }
 
     #[test]
@@ -7989,11 +6816,10 @@ mod tests {
         let boom = Node::<i32>::producer(|_ctx| panic!("boom on activation"));
         d.subscribe_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
 
-        assert_eq!(
-            boom.core.subscriber_count(),
-            0,
-            "failed added-dep activation rolls back the partially registered subscriber"
-        );
+        // R-failure: the panic in boom's first run is boom's ERROR; nothing unwinds into
+        // the rewire, and boom stays d's (ended) dependency.
+        assert_eq!(boom.status(), Status::Errored);
+        assert_eq!(boom.core.subscriber_count(), 1);
 
         // d is NOT terminal; the QA-F1 guard cleared in_dep_mutation on the unwind so
         // d is not wedged.

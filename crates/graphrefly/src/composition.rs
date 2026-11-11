@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use crate::ctx::{Ctx, DepTerminal};
 use crate::graph::{Graph, GraphNodeOpts};
-use crate::node::{Node, NodeOpts};
+use crate::node::{Node, NodeOpts, State};
 use crate::operators::Operator;
 use crate::protocol::Message;
 
@@ -19,7 +19,8 @@ pub struct Pipe<T> {
 }
 
 /// Creates or computes `pipe`.
-pub fn pipe<T: 'static>(graph: &Graph, source: Node<T>) -> Pipe<T> {
+pub fn pipe<T: 'static>(graph: &Graph, source: impl Into<Node<T>>) -> Pipe<T> {
+    let source: Node<T> = source.into();
     Pipe {
         graph: graph.clone(),
         current: source,
@@ -100,7 +101,7 @@ impl Default for StratifyOptions {
 /// `Stratified` data container.
 pub struct Stratified<T, R> {
     /// `rules` field for rules.
-    pub rules: Node<Vec<StratifyRule<R>>>,
+    pub rules: State<Vec<StratifyRule<R>>>,
     /// `branches` field for branches.
     pub branches: BTreeMap<String, Node<T>>,
 }

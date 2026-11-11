@@ -242,11 +242,18 @@ mod tests {
             );
             let errors = Rc::new(RefCell::new(Vec::new()));
             let errors_sink = errors.clone();
-            let _sub = worker.subscribe(move |msg| {
-                if let Message::Error(error) = msg {
-                    errors_sink.borrow_mut().push(error.to_string());
-                }
-            });
+            let _sub = worker.subscribe(
+                move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                    let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                        if let Message::Error(error) = msg {
+                            errors_sink.borrow_mut().push(error.to_string());
+                        }
+                    };
+                    for msg in msgs {
+                        handle(msg);
+                    }
+                },
+            );
 
             source.set(1);
 
@@ -272,11 +279,18 @@ mod tests {
             );
             let errors = Rc::new(RefCell::new(Vec::new()));
             let errors_sink = errors.clone();
-            let _sub = worker.subscribe(move |msg| {
-                if let Message::Error(error) = msg {
-                    errors_sink.borrow_mut().push(error.to_string());
-                }
-            });
+            let _sub = worker.subscribe(
+                move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                    let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                        if let Message::Error(error) = msg {
+                            errors_sink.borrow_mut().push(error.to_string());
+                        }
+                    };
+                    for msg in msgs {
+                        handle(msg);
+                    }
+                },
+            );
 
             source.set(1);
 
@@ -391,11 +405,18 @@ mod tests {
         );
         let errors = Rc::new(RefCell::new(Vec::new()));
         let errors_sink = errors.clone();
-        let _sub = worker.subscribe(move |msg| {
-            if let Message::Error(error) = msg {
-                errors_sink.borrow_mut().push(error.to_string());
-            }
-        });
+        let _sub = worker.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if let Message::Error(error) = msg {
+                        errors_sink.borrow_mut().push(error.to_string());
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            },
+        );
 
         source.set(1);
 
@@ -424,11 +445,18 @@ mod tests {
         );
         let errors = Rc::new(RefCell::new(Vec::new()));
         let errors_sink = errors.clone();
-        let _sub = worker.subscribe(move |msg| {
-            if let Message::Error(error) = msg {
-                errors_sink.borrow_mut().push(error.to_string());
-            }
-        });
+        let _sub = worker.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if let Message::Error(error) = msg {
+                        errors_sink.borrow_mut().push(error.to_string());
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            },
+        );
 
         source.set(1);
 
@@ -484,11 +512,18 @@ mod tests {
         );
         let errors = Rc::new(RefCell::new(Vec::new()));
         let errors_sink = errors.clone();
-        let _sub = worker.subscribe(move |msg| {
-            if let Message::Error(error) = msg {
-                errors_sink.borrow_mut().push(error.to_string());
-            }
-        });
+        let _sub = worker.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if let Message::Error(error) = msg {
+                        errors_sink.borrow_mut().push(error.to_string());
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            },
+        );
 
         source.set(1);
 

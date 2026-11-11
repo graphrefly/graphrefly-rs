@@ -764,7 +764,7 @@ fn agentic_memory_bundle_surfaces_solution_errors_and_preserves_retrieval_errors
     );
     let bundle = agentic_memory_bundle(
         &g,
-        AgenticMemoryBundleOptions::new(records, query.clone()).named("memory"),
+        AgenticMemoryBundleOptions::new(records.clone(), query.clone()).named("memory"),
     );
     let _context = bundle.context.subscribe(|_| {});
     let _errors = bundle.errors.subscribe(|_| {});
@@ -832,7 +832,7 @@ fn agentic_memory_bundle_surfaces_solution_errors_and_preserves_retrieval_errors
     query.set(MemoryRetrievalQuery::default());
     let mut all_invalid = record("", "all-invalid");
     all_invalid.fragment.confidence = f64::NAN;
-    bundle.records_input.set(vec![all_invalid]);
+    records.set(vec![all_invalid]);
     assert_eq!(
         bundle.context.cache().unwrap().state,
         AgenticMemoryStatusState::Error,
@@ -1288,8 +1288,12 @@ fn agentic_memory_context_packing_is_deterministic_and_projection_only() {
     );
     let packing = agentic_memory_context_packing_bundle(
         &g,
-        AgenticMemoryContextPackingBundleOptions::new(memory.context.clone(), texts, policy)
-            .named("packing"),
+        AgenticMemoryContextPackingBundleOptions::new(
+            memory.context.clone(),
+            texts,
+            policy.clone(),
+        )
+        .named("packing"),
     );
     let described = g.describe();
     assert!(described
@@ -1316,7 +1320,7 @@ fn agentic_memory_context_packing_is_deterministic_and_projection_only() {
         AgenticMemoryStatusState::Partial
     );
 
-    packing.policy_input.set(AgenticMemoryContextPackingPolicy {
+    policy.set(AgenticMemoryContextPackingPolicy {
         max_chars: Some(5),
         separator: " | ".to_owned(),
         include_fragment_ids: true,
@@ -1445,8 +1449,8 @@ fn knowledge_graph_reducer_materializes_entities_and_errors() {
     );
     let bundle = knowledge_graph_reducer_bundle(
         &g,
-        KnowledgeGraphReducerBundleOptions::new(assertions)
-            .with_policy(policy)
+        KnowledgeGraphReducerBundleOptions::new(assertions.node().clone())
+            .with_policy(policy.node().clone())
             .named("kg"),
     );
     let described = g.describe();

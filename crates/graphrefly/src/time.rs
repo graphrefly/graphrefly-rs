@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
-use crate::ctx::{Ctx, DepTerminal, WaveData};
+use crate::ctx::{Ctx, DepTerminal};
 use crate::higher_order::{merge_map_with_ctx, switch_map_with_ctx};
 use crate::node::{Core, Node, NodeOpts};
 use crate::operators::Operator;
@@ -387,6 +387,14 @@ fn run_timeout_body<S: Clone + 'static>(
             timer: Some(initial_timer.clone()),
         });
 
+    // A failed clock (no driver) ends the helper before anything is forwarded: at a
+    // first run the clock's ERROR and the source's snapshot arrive together.
+    if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+        ctx.state_set(TimeoutState { timer: None });
+        ctx.down(vec![Message::Error(error.to_string().into())]);
+        return;
+    }
+
     let source_batch = ctx.batch::<S>(1);
     for value in &source_batch {
         ctx.down(vec![Message::Data(Rc::new((**value).clone()))]);
@@ -420,12 +428,6 @@ fn run_timeout_body<S: Clone + 'static>(
         } else {
             ctx.rewire_next_subscribe_dep(next, rewire_body(body_cell));
         }
-        return;
-    }
-
-    if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
-        ctx.state_set(TimeoutState { timer: None });
-        ctx.down(vec![Message::Error(error.to_string().into())]);
         return;
     }
 
@@ -569,12 +571,9 @@ fn rewire_body(body_cell: &BodyCell) -> impl Fn(&Ctx) + 'static {
 }
 
 fn dep_has_data(ctx: &Ctx, dep: usize) -> bool {
-    ctx.wave_data().get(dep).is_some_and(|waves| {
-        waves
-            .iter()
-            .flatten()
-            .any(|v| matches!(v, WaveData::Data(_)))
-    })
+    ctx.wave_data()
+        .get(dep)
+        .is_some_and(|waves| waves.iter().any(|wave| !wave.is_empty()))
 }
 
 fn is_complete(term: Option<&DepTerminal>) -> bool {

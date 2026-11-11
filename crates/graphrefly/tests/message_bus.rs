@@ -177,7 +177,7 @@ fn main() {
     let _ = sub.seek(1, None);
     let _ = sub.close(None);
 
-    bus.commands.down(vec![]);
+    let _commands = &bus.commands;
 }
 "#,
     );

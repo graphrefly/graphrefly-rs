@@ -5,7 +5,7 @@
 //! (R-messages): there is no `up`. Values cross erased as [`AnyValue`]; the typed
 //! `data`/`emit` helpers downcast.
 //!
-//! Slice scope: `down` (DATA/INVALIDATE/terminal; PENDING and RESOLVED are the
+//! Slice scope: `down` (DATA/INVALIDATE/terminal; START, PENDING and RESOLVED are the
 //! kernel's and are rejected), typed `data`/`emit`, `state`, and the cleanup hooks
 //! (`on_deactivation` + `on_invalidate`). See `CLEAN-SLATE.md`.
 
@@ -33,37 +33,17 @@ pub enum DepTerminal {
     Error(Rc<str>),
 }
 
-/// One raw ctx wave-data projection item (R-ctx-wave-data / D77).
-#[derive(Clone)]
-pub enum WaveData {
-    /// A legal DATA payload.
-    Data(AnyValue),
-    /// The protocol SENTINEL marker used for INVALIDATE inside `ctx.wave_data`.
-    Sentinel,
-}
-
-impl WaveData {
-    /// Typed read of a DATA payload; returns `None` for SENTINEL or type mismatch.
-    pub fn data<U: 'static>(&self) -> Option<Rc<U>> {
-        match self {
-            Self::Data(v) => v.clone().downcast::<U>().ok(),
-            Self::Sentinel => None,
-        }
-    }
-
-    /// True iff this item is the protocol SENTINEL marker.
-    pub fn is_sentinel(&self) -> bool {
-        matches!(self, Self::Sentinel)
-    }
-}
-
 /// Internal per-dependency snapshot backing Ctx helpers. Raw ctx exposes only
 /// `wave_data` + `terminal` as public dep-input surfaces (R-fn-contract / D77);
 /// latest/prev helpers are derived reads over this snapshot and node-owned cache.
 #[derive(Clone)]
 pub(crate) struct DepRecord {
-    /// Per-upstream-wave projections delivered to this fn invocation.
-    pub(crate) wave_data: Vec<Vec<WaveData>>,
+    /// Which node this dependency is (R-invocation: ctx.deps[i] gives its id).
+    pub(crate) dep: crate::node::CoreIdentity,
+    /// The arrays this dependency delivered to this invocation, each as its DATA
+    /// payloads in order (a RESOLVED array is empty), keeping array boundaries
+    /// (R-invocation).
+    pub(crate) wave_data: Vec<Vec<AnyValue>>,
     /// Last committed DATA before the current batch; `None` = SENTINEL (never emitted DATA) —
     /// the canonical never-emitted detector (R-sentinel).
     pub(crate) prev_data: Option<AnyValue>,
@@ -90,8 +70,10 @@ impl Ctx {
         &self.dep_records
     }
 
-    /// Raw dep-value input surface (R-ctx-wave-data / D77): dep -> waves -> values/SENTINEL.
-    pub fn wave_data(&self) -> Vec<&[Vec<WaveData>]> {
+    /// The raw input surface (R-invocation): per dependency, the arrays it delivered
+    /// to this invocation, each as its DATA payloads in order. A RESOLVED array is
+    /// empty; what came before an INVALIDATE is not shown.
+    pub fn wave_data(&self) -> Vec<&[Vec<AnyValue>]> {
         self.dep_records
             .iter()
             .map(|record| record.wave_data.as_slice())
@@ -101,6 +83,13 @@ impl Ctx {
     /// Terminal metadata for dep `i`, separate from `wave_data` (R-fn-contract / D77).
     pub fn terminal(&self, i: usize) -> Option<&DepTerminal> {
         self.dep_records.get(i).and_then(|r| r.terminal.as_ref())
+    }
+
+    /// Whether dependency `i` of this invocation is `node` (R-invocation: each input
+    /// says which dependency it is).
+    #[must_use]
+    pub fn dep_is(&self, i: usize, node: &Core) -> bool {
+        self.dep_records.get(i).is_some_and(|r| r.dep.matches(node))
     }
 
     /// Number of declared deps in this fn invocation.
@@ -130,7 +119,11 @@ impl Ctx {
             .map(|r| {
                 r.wave_data
                     .iter()
-                    .map(|wave| wave.iter().filter_map(WaveData::data::<U>).collect())
+                    .map(|wave| {
+                        wave.iter()
+                            .filter_map(|v| v.clone().downcast::<U>().ok())
+                            .collect()
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -142,19 +135,27 @@ impl Ctx {
         self.batches(i).into_iter().flatten().collect()
     }
 
-    /// Emit one typed DATA downstream — the value-level sugar (R-primary-api-clean):
-    /// the PENDING prefix is the kernel's (R-wave).
+    /// Emit one typed DATA downstream — the value-level sugar (R-primary-api-clean).
+    /// Consecutive emits of one run join one array, closed by any `down` (Rust sugar;
+    /// graphrefly:D797 (9)); the PENDING prefix is the kernel's (R-wave).
     pub fn emit<T: 'static>(&self, v: T) {
-        self.node.down(vec![Message::Data(Rc::new(v))]);
+        self.node.emit_value(Rc::new(v));
+    }
+
+    /// Emits each of `values`, as [`Ctx::emit`] does: they join the run's open array.
+    pub fn emit_all<T: 'static>(&self, values: impl IntoIterator<Item = T>) {
+        for v in values {
+            self.node.emit_value(Rc::new(v));
+        }
     }
 
     /// Emit a raw array downstream toward sinks (the ctx-level power surface, DR-1).
     ///
     /// # Panics
     ///
-    /// Panics when `msgs` contains PENDING or RESOLVED, which only the kernel sends
-    /// (R-wave, R-failure); nothing of the array is applied. Uncaught, the panic is
-    /// the node's ERROR.
+    /// Panics when `msgs` contains START, PENDING or RESOLVED, which only the kernel
+    /// sends (R-subscription, R-wave, R-failure); nothing of the array is applied.
+    /// Uncaught, the panic is the node's ERROR.
     pub fn down(&self, msgs: Wave<AnyValue>) {
         reject_kernel_only_output(&msgs);
         self.node.down(msgs);
@@ -273,8 +274,8 @@ pub struct DeferredCtx {
 }
 
 impl DeferredCtx {
-    /// Raw dep-value input surface captured at defer time (R-ctx-wave-data / D77).
-    pub fn wave_data(&self) -> Vec<&[Vec<WaveData>]> {
+    /// The raw input surface captured at defer time (R-invocation).
+    pub fn wave_data(&self) -> Vec<&[Vec<AnyValue>]> {
         self.dep_records
             .iter()
             .map(|record| record.wave_data.as_slice())
@@ -301,7 +302,11 @@ impl DeferredCtx {
             .map(|r| {
                 r.wave_data
                     .iter()
-                    .map(|wave| wave.iter().filter_map(WaveData::data::<U>).collect())
+                    .map(|wave| {
+                        wave.iter()
+                            .filter_map(|v| v.clone().downcast::<U>().ok())
+                            .collect()
+                    })
                     .collect()
             })
             .unwrap_or_default()

@@ -12,10 +12,10 @@ use std::rc::Rc;
 
 use crate::batch::{batch as run_batch, BatchCtx};
 use crate::checkpoint::GraphCheckpointJson;
-use crate::ctx::{Ctx, DepRecord, DepTerminal, WaveData};
+use crate::ctx::{Ctx, DepRecord, DepTerminal};
 use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn};
 use crate::environment::EnvironmentDrivers;
-use crate::node::{Core, GraphArena, Node, NodeOpts, Status};
+use crate::node::{Core, GraphArena, Node, NodeOpts, State, Status};
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, Message};
 use crate::versioning::{NodeVersion, NodeVersioningPolicy};
@@ -249,26 +249,26 @@ impl TopologyGroup {
         self.track_node(self.inner.graph.node_opts(deps, f, opts))
     }
 
-    /// Updates or reads `state`.
-    pub fn state<T: 'static>(&self, initial: T) -> Node<T> {
+    /// A group-owned state node with an initial value.
+    pub fn state<T: 'static>(&self, initial: T) -> State<T> {
         self.state_opts(initial, GraphNodeOpts::default())
     }
 
-    /// Updates or reads `state_opts`.
-    pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> Node<T> {
+    /// A group-owned state node with an initial value and options.
+    pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> State<T> {
         self.assert_live();
-        self.track_node(self.inner.graph.state_opts(initial, opts))
+        State::from_node(self.track_node(self.inner.graph.state_opts(initial, opts).into_node()))
     }
 
-    /// Updates or reads `state_empty`.
-    pub fn state_empty<T: 'static>(&self) -> Node<T> {
+    /// A group-owned state node with no value yet.
+    pub fn state_empty<T: 'static>(&self) -> State<T> {
         self.state_empty_opts(GraphNodeOpts::default())
     }
 
-    /// Updates or reads `state_empty_opts`.
-    pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> Node<T> {
+    /// A group-owned state node with no value yet, with options.
+    pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> State<T> {
         self.assert_live();
-        self.track_node(self.inner.graph.state_empty_opts(opts))
+        State::from_node(self.track_node(self.inner.graph.state_empty_opts(opts).into_node()))
     }
 
     /// Updates or reads `producer`.
@@ -477,34 +477,34 @@ impl Graph {
     }
 
     /// Graph-owned state node with an initial value.
-    pub fn state<T: 'static>(&self, initial: T) -> Node<T> {
+    pub fn state<T: 'static>(&self, initial: T) -> State<T> {
         self.state_opts(initial, GraphNodeOpts::default())
     }
 
-    /// Updates or reads `state_opts`.
-    pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> Node<T> {
+    /// Graph-owned state node with an initial value and options.
+    pub fn state_opts<T: 'static>(&self, initial: T, opts: GraphNodeOpts) -> State<T> {
         let node = Node::state_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             initial,
             self.apply_default_node_opts(opts.node.clone()),
         );
-        self.add(node, "state", opts)
+        State::from_node(self.add(node, "state", opts))
     }
 
-    /// Graph-owned SENTINEL state node.
-    pub fn state_empty<T: 'static>(&self) -> Node<T> {
+    /// Graph-owned state node with no value yet.
+    pub fn state_empty<T: 'static>(&self) -> State<T> {
         self.state_empty_opts(GraphNodeOpts::default())
     }
 
-    /// Updates or reads `state_empty_opts`.
-    pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> Node<T> {
+    /// Graph-owned state node with no value yet, with options.
+    pub fn state_empty_opts<T: 'static>(&self, opts: GraphNodeOpts) -> State<T> {
         let node = Node::state_empty_opts_in_arena_with_dispatcher(
             &self.inner.arena,
             self.inner.dispatcher.clone(),
             self.apply_default_node_opts(opts.node.clone()),
         );
-        self.add(node, "state", opts)
+        State::from_node(self.add(node, "state", opts))
     }
 
     /// ctx-level depless source; runs once on activation.
@@ -1386,15 +1386,19 @@ impl Graph {
             let sink = sink.clone();
             let clock = clock.clone();
             let subscribed = catch_unwind(AssertUnwindSafe(|| {
-                Node::<AnyValue>::from_core(core).subscribe_graph_observer(move |msg| {
-                    let seq = clock.get();
-                    clock.set(seq + 1);
-                    sink(ObserveEvent {
-                        path: path.clone(),
-                        msg: ObserveMessage::from_message(msg),
-                        seq,
-                    });
-                })
+                Node::<AnyValue>::from_core(core).subscribe_graph_observer(
+                    move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                        for msg in msgs {
+                            let seq = clock.get();
+                            clock.set(seq + 1);
+                            sink(ObserveEvent {
+                                path: path.clone(),
+                                msg: ObserveMessage::from_message(msg),
+                                seq,
+                            });
+                        }
+                    },
+                )
             }));
             let unsub = match subscribed {
                 Ok(unsub) => unsub,
@@ -1516,7 +1520,11 @@ impl<'a> Values<'a> {
             .map(|r| {
                 r.wave_data
                     .iter()
-                    .map(|wave| wave.iter().filter_map(WaveData::data::<T>).collect())
+                    .map(|wave| {
+                        wave.iter()
+                            .filter_map(|v| v.clone().downcast::<T>().ok())
+                            .collect()
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1547,6 +1555,16 @@ impl GraphNode {
         self.core.clone()
     }
 
+    /// The state handle of a found state node, the host's way to write it
+    /// (graphrefly-rs:D3); `None` for a computed node. The value type is the caller's
+    /// to know, as with every erased read.
+    #[must_use]
+    pub fn as_state<T: 'static>(&self) -> Option<State<T>> {
+        self.core
+            .is_state()
+            .then(|| State::from_node(Node::from_core(self.core.clone())))
+    }
+
     /// Updates or reads `status`.
     pub fn status(&self) -> Status {
         self.core.status()
@@ -1567,16 +1585,9 @@ impl GraphNode {
         self.core.deps()
     }
 
-    /// Updates or reads `subscribe`.
-    pub fn subscribe(&self, sink: impl Fn(&Message<AnyValue>) + 'static) -> Box<dyn FnOnce()> {
+    /// Subscribes a sink, called once per array (R-wave).
+    pub fn subscribe(&self, sink: impl Fn(&[Message<AnyValue>]) + 'static) -> Box<dyn FnOnce()> {
         Node::<AnyValue>::from_core(self.core.clone()).subscribe(sink)
-    }
-
-    /// Emit a raw erased wave at this graph-registered node boundary.
-    ///
-    /// This mirrors [`Node::down`] for nodes recovered through [`Graph::find`].
-    pub fn down(&self, msgs: Vec<Message<AnyValue>>) {
-        Node::<AnyValue>::from_core(self.core.clone()).down(msgs)
     }
 }
 

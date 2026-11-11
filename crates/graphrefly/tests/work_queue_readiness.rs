@@ -20,11 +20,16 @@ struct Payload {
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                    sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -179,11 +184,11 @@ fn handoff_emits_candidates_but_stale_terminal_ready_does_not_mutate_queue() {
         &g,
         WorkQueueScheduledReadinessOptions::new(vec![queue.records.clone()]),
     );
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let readiness = scheduled_readiness_projector(
         &g,
         ScheduledReadinessOptions::new(vec![translator.readiness_schedules.clone()])
-            .with_clocks(vec![clocks.clone()]),
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let handoff = work_queue_readiness_handoff_projector(
         &g,
@@ -247,11 +252,11 @@ fn later_work_schedule_suppresses_older_ready_until_effective_time() {
         &g,
         WorkQueueScheduledReadinessOptions::new(vec![queue.records.clone()]),
     );
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let readiness = scheduled_readiness_projector(
         &g,
         ScheduledReadinessOptions::new(vec![translator.readiness_schedules.clone()])
-            .with_clocks(vec![clocks.clone()]),
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let handoff = work_queue_readiness_handoff_projector(
         &g,
@@ -306,11 +311,11 @@ fn same_kind_reschedule_ignores_non_active_ready_coordinate() {
         &g,
         WorkQueueScheduledReadinessOptions::new(vec![queue.records.clone()]),
     );
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let readiness = scheduled_readiness_projector(
         &g,
         ScheduledReadinessOptions::new(vec![translator.readiness_schedules.clone()])
-            .with_clocks(vec![clocks.clone()]),
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let handoff = work_queue_readiness_handoff_projector(
         &g,
@@ -373,11 +378,11 @@ fn handoff_keeps_same_work_id_isolated_by_queue() {
             queue_b.records.clone(),
         ]),
     );
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let readiness = scheduled_readiness_projector(
         &g,
         ScheduledReadinessOptions::new(vec![translator.readiness_schedules.clone()])
-            .with_clocks(vec![clocks.clone()]),
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let handoff = work_queue_readiness_handoff_projector(
         &g,
@@ -434,11 +439,11 @@ fn lease_expiration_candidate_lowers_only_to_existing_expire_leases_command() {
         &g,
         WorkQueueScheduledReadinessOptions::new(vec![queue.records.clone()]),
     );
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let readiness = scheduled_readiness_projector(
         &g,
         ScheduledReadinessOptions::new(vec![translator.readiness_schedules.clone()])
-            .with_clocks(vec![clocks.clone()]),
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let handoff = work_queue_readiness_handoff_projector(
         &g,
@@ -483,11 +488,11 @@ fn stale_lease_expiration_candidate_is_pruned_after_release() {
         &g,
         WorkQueueScheduledReadinessOptions::new(vec![queue.records.clone()]),
     );
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let readiness = scheduled_readiness_projector(
         &g,
         ScheduledReadinessOptions::new(vec![translator.readiness_schedules.clone()])
-            .with_clocks(vec![clocks.clone()]),
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let handoff = work_queue_readiness_handoff_projector(
         &g,

@@ -10,11 +10,16 @@ use graphrefly::{
 fn collect_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(v) = value.as_ref().downcast_ref::<T>() {
-                seen_sink.borrow_mut().push(v.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(v) = value.as_ref().downcast_ref::<T>() {
+                    seen_sink.borrow_mut().push(v.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -24,7 +29,7 @@ fn collect_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
 fn pipe_registers_each_operator_through_graph_init_funnel() {
     let g = graph();
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
-    let out = pipe(&g, source.clone())
+    let out = pipe(&g, source.node().clone())
         .through(map::<i32, i32>(|n| n + 1))
         .through(filter::<i32>(|n| *n % 2 == 0))
         .through(map::<i32, String>(|n| format!("v{n}")))
@@ -66,7 +71,7 @@ fn pipe_registers_each_operator_through_graph_init_funnel() {
 fn pipe_zero_steps_returns_the_original_source_node() {
     let g = graph();
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
-    let out = pipe(&g, source.clone()).done();
+    let out = pipe(&g, source.node().clone()).done();
     let seen = collect_data(&out);
 
     source.set(2);
@@ -99,7 +104,8 @@ fn stratify_branch_routes_source_values_through_declared_deps() {
     rules.set(ModRule { modulo: 1 });
     source.set(3);
 
-    assert_eq!(*seen.borrow(), vec![2, 3]);
+    // The first run classifies the source's snapshot, 0 (R-subscription).
+    assert_eq!(*seen.borrow(), vec![0, 2, 3]);
     let snap = g.describe();
     assert!(snap.edges.contains(&DescribeEdge {
         from: "source".to_owned(),
@@ -134,10 +140,10 @@ fn stratify_branch_drops_source_values_while_rules_are_sentinel_until_future_sou
     );
     let seen = collect_data(&branch);
 
-    source.down(vec![
-        Message::Data(Rc::new(1i32)),
-        Message::Data(Rc::new(2i32)),
-    ]);
+    graphrefly::batch(|_| {
+        source.set(1i32);
+        source.set(2i32);
+    });
     rules.set(true);
     source.set(3);
 
@@ -180,7 +186,8 @@ fn stratify_builds_static_named_branches_with_metadata() {
     source.set(3);
     source.set(4);
 
-    assert_eq!(*even_seen.borrow(), vec![2, 3]);
+    // The first run classifies the source's snapshot, 0 (R-subscription).
+    assert_eq!(*even_seen.borrow(), vec![0, 2, 3]);
     assert_eq!(*odd_seen.borrow(), vec![1, 4]);
     let snap = g.describe();
     let even_node = snap
@@ -241,7 +248,8 @@ fn stratify_rules_only_update_does_not_reemit_latest_source_value() {
         .set(vec![StratifyRule::new("even", ModRule { modulo: 0 })]);
     source.set(4);
 
-    assert_eq!(*even_seen.borrow(), vec![2, 4]);
+    // The first run classifies the source's snapshot, 0 (R-subscription).
+    assert_eq!(*even_seen.borrow(), vec![0, 2, 4]);
 }
 
 #[test]

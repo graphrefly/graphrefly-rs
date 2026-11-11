@@ -22,11 +22,16 @@ fn collect_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
 fn collect_data_with_unsub<T: Clone + 'static>(node: &Node<T>) -> DataCollector<T> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(v) = value.as_ref().downcast_ref::<T>() {
-                seen_sink.borrow_mut().push(v.clone());
+    let keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(v) = value.as_ref().downcast_ref::<T>() {
+                    seen_sink.borrow_mut().push(v.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     (seen, keep)
@@ -35,16 +40,21 @@ fn collect_data_with_unsub<T: Clone + 'static>(node: &Node<T>) -> DataCollector<
 fn collect_kinds<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<&'static str>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        seen_sink.borrow_mut().push(match msg {
-            Message::Start => "START",
-            Message::Pending => "PENDING",
-            Message::Data(_) => "DATA",
-            Message::Resolved => "RESOLVED",
-            Message::Invalidate => "INVALIDATE",
-            Message::Complete => "COMPLETE",
-            Message::Error(_) => "ERROR",
-        });
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            seen_sink.borrow_mut().push(match msg {
+                Message::Start => "START",
+                Message::Pending => "PENDING",
+                Message::Data(_) => "DATA",
+                Message::Resolved => "RESOLVED",
+                Message::Invalidate => "INVALIDATE",
+                Message::Complete => "COMPLETE",
+                Message::Error(_) => "ERROR",
+            });
+        };
+        for msg in msgs {
+            handle(msg);
+        }
     });
     seen
 }
@@ -247,16 +257,23 @@ fn reactive_log_incremental_views_follow_delta_backbone() {
     log.append(2);
     log.append(3);
 
-    assert_eq!(*tail_seen.borrow(), vec![vec![1], vec![1, 2], vec![2, 3]]);
-    assert_eq!(*slice_seen.borrow(), vec![vec![], vec![2], vec![2, 3]]);
-    assert_eq!(*sum_seen.borrow(), vec![1, 3, 6]);
+    // Each view runs once at activation on the empty log (R-lifetime).
+    assert_eq!(
+        *tail_seen.borrow(),
+        vec![vec![], vec![1], vec![1, 2], vec![2, 3]]
+    );
+    assert_eq!(
+        *slice_seen.borrow(),
+        vec![vec![], vec![], vec![2], vec![2, 3]]
+    );
+    assert_eq!(*sum_seen.borrow(), vec![0, 1, 3, 6]);
 
     log.trim_head(2);
     assert_eq!(
         *tail_seen.borrow(),
-        vec![vec![1], vec![1, 2], vec![2, 3], vec![3]]
+        vec![vec![], vec![1], vec![1, 2], vec![2, 3], vec![3]]
     );
-    assert_eq!(*sum_seen.borrow(), vec![1, 3, 6, 3]);
+    assert_eq!(*sum_seen.borrow(), vec![0, 1, 3, 6, 3]);
 }
 
 #[test]
@@ -268,9 +285,10 @@ fn reactive_log_scan_recomputes_after_max_size_trimmed_append() {
     log.append_many(vec![1, 2, 3]);
     log.append(4);
 
+    // The scan runs once at activation on the empty log (R-lifetime).
     assert_eq!(
         *sum_seen.borrow(),
-        vec![6, 9],
+        vec![0, 6, 9],
         "scan must include the appended tail value after a ring-buffer head trim"
     );
 }
@@ -1033,7 +1051,8 @@ fn scan_log_helper_delegates_to_reactive_log_scan() {
     log.append(2);
     log.append(3);
 
-    assert_eq!(*seen.borrow(), vec![2, 6]);
+    // The scan runs once at activation on the empty log (R-lifetime).
+    assert_eq!(*seen.borrow(), vec![1, 2, 6]);
 }
 
 #[test]

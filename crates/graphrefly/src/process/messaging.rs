@@ -91,10 +91,12 @@ pub struct ProcessMessagingRecipeOptions<TPayload, TCommand, TEvent> {
 impl<TPayload, TCommand, TEvent> ProcessMessagingRecipeOptions<TPayload, TCommand, TEvent> {
     /// Creates or computes `new`.
     pub fn new(
-        deliveries: Node<MessageBusAvailablePage<TPayload>>,
-        status: Node<ProcessStatus>,
+        deliveries: impl Into<Node<MessageBusAvailablePage<TPayload>>>,
+        status: impl Into<Node<ProcessStatus>>,
         policy: ProcessMessagingPolicy<TPayload, TCommand>,
     ) -> Self {
+        let deliveries: Node<MessageBusAvailablePage<TPayload>> = deliveries.into();
+        let status: Node<ProcessStatus> = status.into();
         Self {
             name: "processMessaging".to_owned(),
             deliveries,
@@ -111,7 +113,8 @@ impl<TPayload, TCommand, TEvent> ProcessMessagingRecipeOptions<TPayload, TComman
     }
 
     /// Updates or reads `with_events`.
-    pub fn with_events(mut self, events: Node<ProcessEvent<TEvent>>) -> Self {
+    pub fn with_events(mut self, events: impl Into<Node<ProcessEvent<TEvent>>>) -> Self {
+        let events: Node<ProcessEvent<TEvent>> = events.into();
         self.events = Some(events);
         self
     }
@@ -309,10 +312,11 @@ fn process_ack_id(delivery: &MessageBusDelivery, reason: &str) -> String {
 /// Creates or computes `process_event_outbox_commands`.
 pub fn process_event_outbox_commands<TEvent: Clone + 'static>(
     graph: &Graph,
-    events: Node<ProcessEvent<TEvent>>,
+    events: impl Into<Node<ProcessEvent<TEvent>>>,
     topic: impl Into<String>,
     name: impl Into<String>,
 ) -> Node<MessageBusCommand<ProcessEvent<TEvent>>> {
+    let events: Node<ProcessEvent<TEvent>> = events.into();
     let topic = topic.into();
     graph.node_opts::<MessageBusCommand<ProcessEvent<TEvent>>, _>(
         vec![events.erased()],

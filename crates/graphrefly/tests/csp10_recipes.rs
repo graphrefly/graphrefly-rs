@@ -27,11 +27,16 @@ use graphrefly::{
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                    sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -74,8 +79,8 @@ fn cqrs_messaging_ack_waits_for_visible_status() {
         &g,
         CqrsMessageAckOptions {
             name: "test/cqrsAck".to_owned(),
-            delivered_commands: delivered.clone(),
-            status: status.clone(),
+            delivered_commands: delivered.node().clone(),
+            status: status.node().clone(),
             issues: None,
             ack_rejected: true,
         },
@@ -127,8 +132,8 @@ fn process_messaging_ack_can_skip_rejected_when_policy_says_so() {
         &g,
         ProcessMessageAckOptions {
             name: "test/processAck".to_owned(),
-            delivered_commands: delivered.clone(),
-            status: status.clone(),
+            delivered_commands: delivered.node().clone(),
+            status: status.node().clone(),
             issues: None,
             ack_rejected: false,
         },
@@ -401,7 +406,7 @@ fn process_work_queue_maps_terminal_record_to_evidence() {
     let records = g.state_empty::<WorkQueueRecord<ProcessQueuedEffectPayload<String>>>();
     let recipe = process_work_queue_recipe(
         &g,
-        ProcessWorkQueueRecipeOptions::new(records.clone()).named("test/processWq"),
+        ProcessWorkQueueRecipeOptions::new(records.node().clone()).named("test/processWq"),
     );
     let evidence = collect_data(&recipe.evidence);
     let effect = ProcessEffectRequest {
@@ -545,7 +550,7 @@ fn messaging_work_queue_and_cqrs_visible_handoff_reaches_queue_disposition() {
         CqrsWorkQueueOutcome::Accepted { status },
         &CqrsWorkQueuePolicy::default(),
     );
-    queue.commands.set(disposition);
+    queue.dispatch(disposition);
 
     assert!(records.borrow().iter().any(|record| matches!(
         record,

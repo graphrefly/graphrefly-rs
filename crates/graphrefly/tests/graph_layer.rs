@@ -1082,16 +1082,22 @@ fn checkpoint_uses_neutral_schema_and_restores_fresh_json_state() {
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _unsub = restored_count.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            seen_sink.borrow_mut().push(
-                value
-                    .as_ref()
-                    .downcast_ref::<GraphCheckpointJson>()
-                    .cloned(),
-            );
-        }
-    });
+    let _unsub =
+        restored_count.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Data(value) = msg {
+                    seen_sink.borrow_mut().push(
+                        value
+                            .as_ref()
+                            .downcast_ref::<GraphCheckpointJson>()
+                            .cloned(),
+                    );
+                }
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
     assert_eq!(*seen.borrow(), vec![Some(json!(2))]);
 }
 
@@ -1283,7 +1289,7 @@ fn observe_cleans_partial_subscriptions_when_later_target_panics() {
     let live = g.state_opts(1i32, GraphNodeOpts::named("live"));
     let terminal = g.state_opts(9i32, GraphNodeOpts::named("terminal"));
     let _keep_terminal_active = terminal.subscribe(|_| {});
-    terminal.down(vec![Message::Complete]);
+    terminal.complete();
 
     let observed = Rc::new(RefCell::new(Vec::new()));
     let observed_sink = observed.clone();
@@ -1362,10 +1368,10 @@ fn derived_values_expose_prev_and_wave_batches_without_raw_ctx_or_sampling_helpe
     assert_eq!(*seen_wave_batches.borrow(), vec![vec![vec![1]]]);
     assert_eq!(*seen_prev.borrow(), vec![None]);
 
-    source.down(vec![
-        Message::Data(Rc::new(2i32)),
-        Message::Data(Rc::new(3i32)),
-    ]);
+    graphrefly::batch(|_| {
+        source.set(2i32);
+        source.set(3i32);
+    });
 
     assert_eq!(sum.cache(), Some(5));
     assert_eq!(
@@ -1410,7 +1416,7 @@ fn state_empty_describe_omits_sentinel_value() {
     assert_eq!(empty.value, None);
     assert_eq!(empty.status, Status::Sentinel);
 
-    state.down(vec![Message::Data(Rc::new(3i32))]);
+    state.set(3i32);
     let snap = g.describe();
     let empty = snap.nodes.iter().find(|n| n.id == "empty").unwrap();
     assert_eq!(empty.value, Some(DescribeValue::I64(3)));
@@ -1829,14 +1835,20 @@ fn first_operator_and_source_slice_is_graph_visible() {
 
     let events = Rc::new(RefCell::new(Vec::new()));
     let event_sink = events.clone();
-    let _keep_alive = distinct.subscribe(move |msg| match msg {
-        Message::Data(value) => {
-            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
-                event_sink.borrow_mut().push(format!("DATA:{v}"));
+    let _keep_alive =
+        distinct.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(value) => {
+                    if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                        event_sink.borrow_mut().push(format!("DATA:{v}"));
+                    }
+                }
+                other => event_sink.borrow_mut().push(format!("{other:?}")),
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-        other => event_sink.borrow_mut().push(format!("{other:?}")),
-    });
+        });
 
     assert_eq!(distinct.cache(), Some(4));
     assert!(events.borrow().contains(&"DATA:4".to_owned()));
@@ -1877,13 +1889,19 @@ fn scan_and_take_preserve_occurrence_semantics() {
     );
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep_alive = first_three.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
-                seen_sink.borrow_mut().push(*v);
+    let _keep_alive =
+        first_three.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Data(value) = msg {
+                    if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                        seen_sink.borrow_mut().push(*v);
+                    }
+                }
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-    });
+        });
 
     assert_eq!(*seen.borrow(), vec![1, 2, 3]);
     assert_eq!(first_three.status(), Status::Completed);
@@ -1902,13 +1920,19 @@ fn operator_caller_opts_do_not_drop_intrinsic_partial_flag() {
     let merged = g.init_node(merge::<i32>(), vec![left.erased(), right.erased()], opts);
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep_alive = merged.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
-                seen_sink.borrow_mut().push(*v);
+    let _keep_alive =
+        merged.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Data(value) = msg {
+                    if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                        seen_sink.borrow_mut().push(*v);
+                    }
+                }
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-    });
+        });
 
     left.set(7);
 

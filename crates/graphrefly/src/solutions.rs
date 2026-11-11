@@ -349,9 +349,11 @@ pub struct AgenticMemoryKgProjectionBundleOptions<T> {
 impl<T> AgenticMemoryKgProjectionBundleOptions<T> {
     /// Creates or computes `new`.
     pub fn new(
-        records: Node<Vec<AgenticMemoryRecord<T>>>,
-        drafts: Node<Vec<AgenticMemoryKgAssertionDraft>>,
+        records: impl Into<Node<Vec<AgenticMemoryRecord<T>>>>,
+        drafts: impl Into<Node<Vec<AgenticMemoryKgAssertionDraft>>>,
     ) -> Self {
+        let records: Node<Vec<AgenticMemoryRecord<T>>> = records.into();
+        let drafts: Node<Vec<AgenticMemoryKgAssertionDraft>> = drafts.into();
         Self {
             name: None,
             records,
@@ -481,9 +483,11 @@ pub struct AgenticMemoryRetentionBundleOptions<T> {
 impl<T> AgenticMemoryRetentionBundleOptions<T> {
     /// Creates or computes `new`.
     pub fn new(
-        records: Node<Vec<AgenticMemoryRecord<T>>>,
-        commands: Node<Vec<AgenticMemoryRetentionCommand>>,
+        records: impl Into<Node<Vec<AgenticMemoryRecord<T>>>>,
+        commands: impl Into<Node<Vec<AgenticMemoryRetentionCommand>>>,
     ) -> Self {
+        let records: Node<Vec<AgenticMemoryRecord<T>>> = records.into();
+        let commands: Node<Vec<AgenticMemoryRetentionCommand>> = commands.into();
         Self {
             name: None,
             records,
@@ -674,9 +678,11 @@ pub struct AgenticMemoryConsolidationBundleOptions<T> {
 impl<T> AgenticMemoryConsolidationBundleOptions<T> {
     /// Creates or computes `new`.
     pub fn new(
-        requests: Node<Vec<AgenticMemoryConsolidationRequest>>,
-        outcomes: Node<Vec<AgenticMemoryConsolidationOutcome<T>>>,
+        requests: impl Into<Node<Vec<AgenticMemoryConsolidationRequest>>>,
+        outcomes: impl Into<Node<Vec<AgenticMemoryConsolidationOutcome<T>>>>,
     ) -> Self {
+        let requests: Node<Vec<AgenticMemoryConsolidationRequest>> = requests.into();
+        let outcomes: Node<Vec<AgenticMemoryConsolidationOutcome<T>>> = outcomes.into();
         Self {
             name: None,
             requests,
@@ -812,10 +818,13 @@ pub struct AgenticMemoryContextPackingBundleOptions<T> {
 impl<T> AgenticMemoryContextPackingBundleOptions<T> {
     /// Creates or computes `new`.
     pub fn new(
-        context: Node<AgenticMemoryContext<T>>,
-        texts: Node<Vec<AgenticMemoryTextProjection>>,
-        policy: Node<AgenticMemoryContextPackingPolicy>,
+        context: impl Into<Node<AgenticMemoryContext<T>>>,
+        texts: impl Into<Node<Vec<AgenticMemoryTextProjection>>>,
+        policy: impl Into<Node<AgenticMemoryContextPackingPolicy>>,
     ) -> Self {
+        let context: Node<AgenticMemoryContext<T>> = context.into();
+        let texts: Node<Vec<AgenticMemoryTextProjection>> = texts.into();
+        let policy: Node<AgenticMemoryContextPackingPolicy> = policy.into();
         Self {
             name: None,
             context,
@@ -923,9 +932,11 @@ pub struct AgenticMemoryBundleOptions<T> {
 impl<T> AgenticMemoryBundleOptions<T> {
     /// Creates or computes `new`.
     pub fn new(
-        records: Node<Vec<AgenticMemoryRecord<T>>>,
-        query: Node<MemoryRetrievalQuery>,
+        records: impl Into<Node<Vec<AgenticMemoryRecord<T>>>>,
+        query: impl Into<Node<MemoryRetrievalQuery>>,
     ) -> Self {
+        let records: Node<Vec<AgenticMemoryRecord<T>>> = records.into();
+        let query: Node<MemoryRetrievalQuery> = query.into();
         Self {
             name: None,
             records,

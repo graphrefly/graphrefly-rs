@@ -38,11 +38,16 @@ fn test_queue(
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                    sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -391,7 +396,7 @@ fn leased_work_cannot_be_scheduled_and_clock_overflow_is_visible_issue() {
         .iter()
         .any(|issue| issue.code == "schedule-conflict"));
 
-    queue.commands.set(graphrefly::WorkQueueCommand::Claim {
+    queue.dispatch(graphrefly::WorkQueueCommand::Claim {
         command_id: "overflow-claim".to_owned(),
         queue_id: None,
         idempotency_key: None,
@@ -417,7 +422,7 @@ fn duplicate_and_wrong_queue_commands_emit_issues_without_records() {
     let issues = collect_data::<DataIssue>(&queue.issues);
     let records = collect_data(&queue.records);
 
-    queue.commands.set(graphrefly::WorkQueueCommand::Claim {
+    queue.dispatch(graphrefly::WorkQueueCommand::Claim {
         command_id: String::new(),
         queue_id: None,
         idempotency_key: None,
@@ -427,7 +432,7 @@ fn duplicate_and_wrong_queue_commands_emit_issues_without_records() {
         lease_duration_ms: None,
         now_ms: None,
     });
-    queue.commands.set(graphrefly::WorkQueueCommand::Cancel {
+    queue.dispatch(graphrefly::WorkQueueCommand::Cancel {
         command_id: "bad-2".to_owned(),
         queue_id: Some("other".to_owned()),
         idempotency_key: None,

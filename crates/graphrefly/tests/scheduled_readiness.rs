@@ -11,11 +11,16 @@ use graphrefly::{
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                    sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -41,11 +46,12 @@ fn source_ref(kind: &str, id: &str) -> SourceRef {
 #[test]
 fn schedule_and_clock_emit_pending_then_ready() {
     let g = graph();
-    let schedules: graphrefly::Node<ScheduledReadinessRequested> = g.node(Vec::new(), |_| {});
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let schedules = g.state_empty::<ScheduledReadinessRequested>();
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let bundle = scheduled_readiness_projector(
         &g,
-        ScheduledReadinessOptions::new(vec![schedules.clone()]).with_clocks(vec![clocks.clone()]),
+        ScheduledReadinessOptions::new(vec![schedules.node().clone()])
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let pending = collect_data(&bundle.pending);
     let ready = collect_data(&bundle.ready);
@@ -81,11 +87,12 @@ fn schedule_and_clock_emit_pending_then_ready() {
 #[test]
 fn deadline_overdue_is_visibility_only_and_ready_still_emits() {
     let g = graph();
-    let schedules: graphrefly::Node<ScheduledReadinessRequested> = g.node(Vec::new(), |_| {});
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let schedules = g.state_empty::<ScheduledReadinessRequested>();
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let bundle = scheduled_readiness_projector(
         &g,
-        ScheduledReadinessOptions::new(vec![schedules.clone()]).with_clocks(vec![clocks.clone()]),
+        ScheduledReadinessOptions::new(vec![schedules.node().clone()])
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let ready = collect_data::<ScheduledReadinessReady>(&bundle.ready);
     let overdue = collect_data(&bundle.overdue);
@@ -108,11 +115,12 @@ fn deadline_overdue_is_visibility_only_and_ready_still_emits() {
 #[test]
 fn duplicate_schedules_are_idempotent_and_conflicts_issue() {
     let g = graph();
-    let schedules: graphrefly::Node<ScheduledReadinessRequested> = g.node(Vec::new(), |_| {});
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let schedules = g.state_empty::<ScheduledReadinessRequested>();
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let bundle = scheduled_readiness_projector(
         &g,
-        ScheduledReadinessOptions::new(vec![schedules.clone()]).with_clocks(vec![clocks.clone()]),
+        ScheduledReadinessOptions::new(vec![schedules.node().clone()])
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let ready = collect_data::<ScheduledReadinessReady>(&bundle.ready);
     let issues = collect_data::<DataIssue>(&bundle.issues);
@@ -137,11 +145,12 @@ fn duplicate_schedules_are_idempotent_and_conflicts_issue() {
 #[test]
 fn duplicate_schedules_compare_canonical_material() {
     let g = graph();
-    let schedules: graphrefly::Node<ScheduledReadinessRequested> = g.node(Vec::new(), |_| {});
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let schedules = g.state_empty::<ScheduledReadinessRequested>();
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let bundle = scheduled_readiness_projector(
         &g,
-        ScheduledReadinessOptions::new(vec![schedules.clone()]).with_clocks(vec![clocks.clone()]),
+        ScheduledReadinessOptions::new(vec![schedules.node().clone()])
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let issues = collect_data::<DataIssue>(&bundle.issues);
     let views = collect_data(&bundle.views);
@@ -197,11 +206,12 @@ fn duplicate_schedules_compare_canonical_material() {
 #[test]
 fn conflicts_with_same_details_remain_distinct_by_source() {
     let g = graph();
-    let schedules: graphrefly::Node<ScheduledReadinessRequested> = g.node(Vec::new(), |_| {});
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let schedules = g.state_empty::<ScheduledReadinessRequested>();
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let bundle = scheduled_readiness_projector(
         &g,
-        ScheduledReadinessOptions::new(vec![schedules.clone()]).with_clocks(vec![clocks.clone()]),
+        ScheduledReadinessOptions::new(vec![schedules.node().clone()])
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let issues = collect_data::<DataIssue>(&bundle.issues);
 
@@ -223,11 +233,12 @@ fn conflicts_with_same_details_remain_distinct_by_source() {
 #[test]
 fn out_of_order_clock_is_visible_issue_and_ignored() {
     let g = graph();
-    let schedules: graphrefly::Node<ScheduledReadinessRequested> = g.node(Vec::new(), |_| {});
-    let clocks: graphrefly::Node<ScheduledReadinessClock> = g.node(Vec::new(), |_| {});
+    let schedules = g.state_empty::<ScheduledReadinessRequested>();
+    let clocks = g.state_empty::<ScheduledReadinessClock>();
     let bundle = scheduled_readiness_projector(
         &g,
-        ScheduledReadinessOptions::new(vec![schedules.clone()]).with_clocks(vec![clocks.clone()]),
+        ScheduledReadinessOptions::new(vec![schedules.node().clone()])
+            .with_clocks(vec![clocks.node().clone()]),
     );
     let issues = collect_data::<DataIssue>(&bundle.issues);
     let status = collect_data::<ScheduledReadinessStatus>(&bundle.status);

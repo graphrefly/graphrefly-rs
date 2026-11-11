@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::ctx::{Ctx, DepTerminal};
 use crate::dispatcher::Dispatcher;
 use crate::node::{Core, GraphArena, Node, NodeOpts};
-use crate::protocol::{AnyValue, Message};
+use crate::protocol::{AnyValue, Message, Wave};
 
 /// A free-standing operator/source definition.
 pub struct Operator<T> {
@@ -98,8 +98,8 @@ pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
 /// map: emit `fn(value)` for every upstream DATA occurrence.
 pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T> {
     Operator::new("map", move |ctx| {
-        for value in ctx.batch::<S>(0) {
-            ctx.emit(f(value.as_ref()));
+        for wave in ctx.batches::<S>(0) {
+            ctx.emit_all(wave.iter().map(|value| f(value.as_ref())));
         }
     })
 }
@@ -107,10 +107,12 @@ pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T>
 /// filter: forward values matching `pred`; skipped waves settle as undirty RESOLVED.
 pub fn filter<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
     Operator::new("filter", move |ctx| {
-        for value in ctx.batch::<S>(0) {
-            if pred(value.as_ref()) {
-                ctx.emit((*value).clone());
-            }
+        for wave in ctx.batches::<S>(0) {
+            ctx.emit_all(
+                wave.iter()
+                    .filter(|value| pred(value.as_ref()))
+                    .map(|value| (**value).clone()),
+            );
         }
     })
 }
@@ -125,9 +127,13 @@ pub fn scan<S: 'static, T: Clone + 'static>(
             .state_get::<T>()
             .map(|v| (*v).clone())
             .unwrap_or_else(|| seed.clone());
-        for value in ctx.batch::<S>(0) {
-            acc = reducer(acc, value.as_ref());
-            ctx.emit(acc.clone());
+        for wave in ctx.batches::<S>(0) {
+            let mut out = Vec::with_capacity(wave.len());
+            for value in wave {
+                acc = reducer(acc, value.as_ref());
+                out.push(acc.clone());
+            }
+            ctx.emit_all(out);
         }
         ctx.state_set(acc);
     })
@@ -144,16 +150,19 @@ pub fn take<S: Clone + 'static>(n: usize) -> Operator<S> {
         if count >= n {
             return;
         }
-        for value in ctx.batch::<S>(0) {
-            if count >= n {
-                break;
+        'waves: for wave in ctx.batches::<S>(0) {
+            let mut out: Wave<AnyValue> = Vec::new();
+            for value in wave {
+                count += 1;
+                out.push(Message::Data(Rc::new((*value).clone())));
+                if count >= n {
+                    out.push(Message::Complete);
+                    ctx.down(out);
+                    break 'waves;
+                }
             }
-            count += 1;
-            let out: AnyValue = Rc::new((*value).clone());
-            if count >= n {
-                ctx.down(vec![Message::Data(out), Message::Complete]);
-            } else {
-                ctx.down(vec![Message::Data(out)]);
+            if !out.is_empty() {
+                ctx.down(out);
             }
         }
         ctx.state_set(count);
@@ -161,17 +170,24 @@ pub fn take<S: Clone + 'static>(n: usize) -> Operator<S> {
 }
 
 /// distinct_until_changed: opt-in dedup at the operator layer (D49).
+///
+/// Equality dedup is Rust sugar, not protocol (graphrefly:D797 (9)): the kernel
+/// delivers every DATA unchanged and never compares values (R-wave).
 pub fn distinct_until_changed<S: Clone + 'static>(
     eq: impl Fn(&S, &S) -> bool + 'static,
 ) -> Operator<S> {
     Operator::new("distinctUntilChanged", move |ctx| {
         let mut last = ctx.state_get::<S>().map(|v| (*v).clone());
-        for value in ctx.batch::<S>(0) {
-            if last.as_ref().is_some_and(|prev| eq(prev, value.as_ref())) {
-                continue;
+        for wave in ctx.batches::<S>(0) {
+            let mut out = Vec::new();
+            for value in wave {
+                if last.as_ref().is_some_and(|prev| eq(prev, value.as_ref())) {
+                    continue;
+                }
+                last = Some((*value).clone());
+                out.push((*value).clone());
             }
-            last = Some((*value).clone());
-            ctx.emit((*value).clone());
+            ctx.emit_all(out);
         }
         if let Some(value) = last {
             ctx.state_set(value);
@@ -189,8 +205,8 @@ pub fn merge<T: Clone + 'static>() -> Operator<T> {
         },
         move |ctx| {
             for i in 0..ctx.dep_len() {
-                for value in ctx.batch::<T>(i) {
-                    ctx.emit((*value).clone());
+                for wave in ctx.batches::<T>(i) {
+                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
                 }
             }
         },
@@ -229,11 +245,15 @@ pub fn reduce<S: 'static, T: Clone + 'static>(
 pub fn pairwise<S: Clone + 'static>() -> Operator<(S, S)> {
     Operator::new("pairwise", move |ctx| {
         let mut prev = ctx.state_get::<S>().map(|v| (*v).clone());
-        for value in ctx.batch::<S>(0) {
-            if let Some(p) = prev.clone() {
-                ctx.emit((p, (*value).clone()));
+        for wave in ctx.batches::<S>(0) {
+            let mut out = Vec::new();
+            for value in wave {
+                if let Some(p) = prev.clone() {
+                    out.push((p, (*value).clone()));
+                }
+                prev = Some((*value).clone());
             }
-            prev = Some((*value).clone());
+            ctx.emit_all(out);
         }
         if let Some(value) = prev {
             ctx.state_set(value);
@@ -245,12 +265,16 @@ pub fn pairwise<S: Clone + 'static>() -> Operator<(S, S)> {
 pub fn skip<S: Clone + 'static>(n: usize) -> Operator<S> {
     Operator::new("skip", move |ctx| {
         let mut count = ctx.state_get::<usize>().map_or(0, |v| *v);
-        for value in ctx.batch::<S>(0) {
-            if count < n {
-                count += 1;
-            } else {
-                ctx.emit((*value).clone());
+        for wave in ctx.batches::<S>(0) {
+            let mut out = Vec::new();
+            for value in wave {
+                if count < n {
+                    count += 1;
+                } else {
+                    out.push((*value).clone());
+                }
             }
+            ctx.emit_all(out);
         }
         ctx.state_set(count);
     })
@@ -259,12 +283,19 @@ pub fn skip<S: Clone + 'static>(n: usize) -> Operator<S> {
 /// take_while: emit while `pred` holds; first failed value completes without emission.
 pub fn take_while<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
     Operator::new("takeWhile", move |ctx| {
-        for value in ctx.batch::<S>(0) {
-            if pred(value.as_ref()) {
-                ctx.emit((*value).clone());
-            } else {
-                ctx.down(vec![Message::Complete]);
-                return;
+        for wave in ctx.batches::<S>(0) {
+            let mut out: Wave<AnyValue> = Vec::new();
+            for value in wave {
+                if pred(value.as_ref()) {
+                    out.push(Message::Data(Rc::new((*value).clone())));
+                } else {
+                    out.push(Message::Complete);
+                    ctx.down(out);
+                    return;
+                }
+            }
+            if !out.is_empty() {
+                ctx.down(out);
             }
         }
     })
@@ -426,6 +457,8 @@ struct SettleState<S> {
 }
 
 /// settle_by: forward DATA and COMPLETE after `quiet_waves` quiet waves or `max_waves`.
+///
+/// Its equality test is Rust sugar, not protocol (graphrefly:D797 (9)).
 pub fn settle_by<S: Clone + 'static>(
     quiet_waves: usize,
     max_waves: Option<usize>,
@@ -560,6 +593,7 @@ fn is_default_node_opts(opts: &NodeOpts) -> bool {
     opts.factory.is_none()
         && opts.pool == Default::default()
         && !opts.partial
+        && !opts.quiet
         && opts.complete_when_deps_complete
         && opts.error_when_deps_error
         && !opts.terminal_as_real_input
@@ -580,6 +614,9 @@ fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
     }
     if caller.partial {
         opts.partial = true;
+    }
+    if caller.quiet {
+        opts.quiet = true;
     }
     if caller.complete_when_deps_complete != default.complete_when_deps_complete {
         opts.complete_when_deps_complete = caller.complete_when_deps_complete;

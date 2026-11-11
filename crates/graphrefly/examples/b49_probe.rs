@@ -96,9 +96,14 @@ fn typed_vs_erased_probe(hops: usize, waves: usize, protocol_waves: usize, runs:
     });
     let sink_count = Rc::new(Cell::new(0u64));
     let sc = sink_count.clone();
-    let _u = derived.subscribe(move |m| {
-        if matches!(m, Message::Data(_)) {
-            sc.set(sc.get().wrapping_add(1));
+    let _u = derived.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |m: &graphrefly::Message<graphrefly::AnyValue>| {
+            if matches!(m, Message::Data(_)) {
+                sc.set(sc.get().wrapping_add(1));
+            }
+        };
+        for m in msgs {
+            handle(m);
         }
     });
     let graph_ms = time_ms(runs, || {
@@ -222,9 +227,14 @@ fn invalidate_probe(fanout: usize, waves: usize, runs: usize) {
             ctx.emit(*ctx.data::<f64>(0).unwrap() + 1.0);
         });
         let c = inv_count.clone();
-        let u = d.subscribe(move |m: &Message<AnyValue>| {
-            if matches!(m, Message::Invalidate) {
-                c.set(c.get() + 1);
+        let u = d.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |m: &graphrefly::Message<graphrefly::AnyValue>| {
+                if matches!(m, Message::Invalidate) {
+                    c.set(c.get() + 1);
+                }
+            };
+            for m in msgs {
+                handle(m);
             }
         });
         leaves.push(d);
@@ -241,7 +251,7 @@ fn invalidate_probe(fanout: usize, waves: usize, runs: usize) {
     let set_plus_invalidate_ms = time_ms(runs, || {
         for i in 0..waves {
             source.set(i as f64);
-            source.down(vec![Message::Invalidate]);
+            source.invalidate();
         }
         black_box(inv_count.get());
     });
@@ -287,9 +297,14 @@ fn diamond_probe(legs: usize, waves: usize, runs: usize) {
     });
     let sink_count = Rc::new(Cell::new(0usize));
     let sc = sink_count.clone();
-    let _u = join.subscribe(move |m| {
-        if matches!(m, Message::Data(_)) {
-            sc.set(sc.get() + 1);
+    let _u = join.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |m: &graphrefly::Message<graphrefly::AnyValue>| {
+            if matches!(m, Message::Data(_)) {
+                sc.set(sc.get() + 1);
+            }
+        };
+        for m in msgs {
+            handle(m);
         }
     });
 

@@ -263,7 +263,8 @@ pub struct KnowledgeGraphReducerBundleOptions {
 
 impl KnowledgeGraphReducerBundleOptions {
     /// Creates or computes `new`.
-    pub fn new(assertions: Node<Vec<KnowledgeAssertion>>) -> Self {
+    pub fn new(assertions: impl Into<Node<Vec<KnowledgeAssertion>>>) -> Self {
+        let assertions: Node<Vec<KnowledgeAssertion>> = assertions.into();
         Self {
             name: None,
             assertions,
@@ -278,7 +279,8 @@ impl KnowledgeGraphReducerBundleOptions {
     }
 
     /// Updates or reads `with_policy`.
-    pub fn with_policy(mut self, policy: Node<KnowledgeGraphPolicy>) -> Self {
+    pub fn with_policy(mut self, policy: impl Into<Node<KnowledgeGraphPolicy>>) -> Self {
+        let policy: Node<KnowledgeGraphPolicy> = policy.into();
         self.policy = Some(policy);
         self
     }
@@ -849,7 +851,12 @@ pub struct MemoryRetrievalBundleOptions<T> {
 
 impl<T> MemoryRetrievalBundleOptions<T> {
     /// Creates or computes `new`.
-    pub fn new(fragments: Node<Vec<MemoryFragment<T>>>, query: Node<MemoryRetrievalQuery>) -> Self {
+    pub fn new(
+        fragments: impl Into<Node<Vec<MemoryFragment<T>>>>,
+        query: impl Into<Node<MemoryRetrievalQuery>>,
+    ) -> Self {
+        let fragments: Node<Vec<MemoryFragment<T>>> = fragments.into();
+        let query: Node<MemoryRetrievalQuery> = query.into();
         Self {
             name: None,
             fragments,

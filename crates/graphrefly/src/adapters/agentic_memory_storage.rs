@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::json::{strict_canonical_json_bytes, strict_json_decode, Codec, JsonValue};
-use crate::node::Node;
+use crate::node::{Node, State};
 use crate::protocol::Message;
 use crate::solutions::{
     agentic_memory_record_frame, agentic_memory_record_frame_codec, AgenticMemoryRecord,
@@ -205,7 +205,7 @@ impl Drop for AgenticMemoryRecordsPersistence {
 /// `OpenPersistentAgenticMemoryRecords` data container.
 pub struct OpenPersistentAgenticMemoryRecords {
     /// `records` field for records.
-    pub records: Node<Vec<AgenticMemoryRecord<JsonValue>>>,
+    pub records: State<Vec<AgenticMemoryRecord<JsonValue>>>,
     /// `persistence` field for persistence.
     pub persistence: AgenticMemoryRecordsPersistence,
     /// `loaded` field for loaded.
@@ -359,21 +359,29 @@ fn persist_agentic_memory_records_with_cursor(
         .unwrap_or(agentic_memory_records_snapshot_key(
             options.storage_prefix.as_deref().unwrap_or(&prefix),
         )?);
-    let ready = graph.state_opts(false, GraphNodeOpts::named(format!("{prefix}.ready")));
-    let status = graph.state_opts(
-        status_json(
-            AgenticMemoryRecordsPersistenceStatus::Starting,
-            0,
-            0,
+    let ready = graph
+        .state_opts(false, GraphNodeOpts::named(format!("{prefix}.ready")))
+        .into_node();
+    let status = graph
+        .state_opts(
+            status_json(
+                AgenticMemoryRecordsPersistenceStatus::Starting,
+                0,
+                0,
+                cursor_json(initial_change_seq, 0, 0),
+            ),
+            GraphNodeOpts::named(format!("{prefix}.status")),
+        )
+        .into_node();
+    let error = graph
+        .state_opts(Value::Null, GraphNodeOpts::named(format!("{prefix}.error")))
+        .into_node();
+    let cursor = graph
+        .state_opts(
             cursor_json(initial_change_seq, 0, 0),
-        ),
-        GraphNodeOpts::named(format!("{prefix}.status")),
-    );
-    let error = graph.state_opts(Value::Null, GraphNodeOpts::named(format!("{prefix}.error")));
-    let cursor = graph.state_opts(
-        cursor_json(initial_change_seq, 0, 0),
-        GraphNodeOpts::named(format!("{prefix}.cursor")),
-    );
+            GraphNodeOpts::named(format!("{prefix}.cursor")),
+        )
+        .into_node();
     let latest = Rc::new(RefCell::new(records.cache().unwrap_or_default()));
     let change_seq = Rc::new(Cell::new(initial_change_seq));
     let snapshot_writes = Rc::new(Cell::new(0usize));
@@ -443,59 +451,72 @@ fn persist_agentic_memory_records_with_cursor(
         let error_count = error_count.clone();
         let failed_write = failed_write.clone();
         let subscribing = subscribing.clone();
-        records.subscribe(move |message| {
-            let Message::Data(next) = message else {
-                return;
-            };
-            let Some(next) = next
-                .as_ref()
-                .downcast_ref::<Vec<AgenticMemoryRecord<JsonValue>>>()
-            else {
-                return;
-            };
-            latest.replace(next.clone());
-            if subscribing.get() {
-                subscribing.set(false);
-                return;
-            }
-            let Some(change_log) = &change_log else {
-                return;
-            };
-            match agentic_memory_record_change_frame(next)
-                .and_then(|frame| change_log.append(frame).map(|entry| entry.seq))
-            {
-                Ok(seq) => {
-                    failed_write.replace(None);
-                    change_seq.set(Some(seq));
-                    change_writes.set(change_writes.get().saturating_add(1));
-                    let cursor_value =
-                        cursor_json(change_seq.get(), snapshot_writes.get(), change_writes.get());
-                    ready.set(true);
-                    status.set(status_json(
-                        AgenticMemoryRecordsPersistenceStatus::Ready,
-                        0,
-                        error_count.get(),
-                        cursor_value.clone(),
-                    ));
-                    error.set(Value::Null);
-                    cursor.set(cursor_value);
+        records.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |message: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    let Message::Data(next) = message else {
+                        return;
+                    };
+                    let Some(next) = next
+                        .as_ref()
+                        .downcast_ref::<Vec<AgenticMemoryRecord<JsonValue>>>()
+                    else {
+                        return;
+                    };
+                    latest.replace(next.clone());
+                    if subscribing.get() {
+                        subscribing.set(false);
+                        return;
+                    }
+                    let Some(change_log) = &change_log else {
+                        return;
+                    };
+                    match agentic_memory_record_change_frame(next)
+                        .and_then(|frame| change_log.append(frame).map(|entry| entry.seq))
+                    {
+                        Ok(seq) => {
+                            failed_write.replace(None);
+                            change_seq.set(Some(seq));
+                            change_writes.set(change_writes.get().saturating_add(1));
+                            let cursor_value = cursor_json(
+                                change_seq.get(),
+                                snapshot_writes.get(),
+                                change_writes.get(),
+                            );
+                            ready.set(true);
+                            status.set(status_json(
+                                AgenticMemoryRecordsPersistenceStatus::Ready,
+                                0,
+                                error_count.get(),
+                                cursor_value.clone(),
+                            ));
+                            error.set(Value::Null);
+                            cursor.set(cursor_value);
+                        }
+                        Err(err) => {
+                            failed_write.replace(Some(err.clone()));
+                            error_count.set(error_count.get().saturating_add(1));
+                            ready.set(false);
+                            let cursor_value = cursor_json(
+                                change_seq.get(),
+                                snapshot_writes.get(),
+                                change_writes.get(),
+                            );
+                            status.set(status_json(
+                                AgenticMemoryRecordsPersistenceStatus::Errored,
+                                0,
+                                error_count.get(),
+                                cursor_value.clone(),
+                            ));
+                            error.set(error_json("change", &err, cursor_value));
+                        }
+                    }
+                };
+                for message in msgs {
+                    handle(message);
                 }
-                Err(err) => {
-                    failed_write.replace(Some(err.clone()));
-                    error_count.set(error_count.get().saturating_add(1));
-                    ready.set(false);
-                    let cursor_value =
-                        cursor_json(change_seq.get(), snapshot_writes.get(), change_writes.get());
-                    status.set(status_json(
-                        AgenticMemoryRecordsPersistenceStatus::Errored,
-                        0,
-                        error_count.get(),
-                        cursor_value.clone(),
-                    ));
-                    error.set(error_json("change", &err, cursor_value));
-                }
-            }
-        })
+            },
+        )
     };
     subscribing.set(false);
     let flush = {

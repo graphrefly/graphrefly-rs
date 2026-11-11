@@ -23,10 +23,10 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::node::{
-    boundary_root_for, clear_deferred_boundary_root, drain_committed_boundary_root, BatchTarget,
-    BoundaryRoot, Core,
+    boundary_root_for, clear_deferred_boundary_root, commit_batched_waves,
+    drain_committed_boundary_root, BatchTarget, BoundaryRoot, Core,
 };
-use crate::protocol::{AnyValue, Wave};
+use crate::protocol::{AnyValue, Message, Wave};
 
 /// Explicit rollback escape hatch for [`batch`] (D12).
 pub struct BatchCtx {
@@ -101,8 +101,15 @@ pub(crate) fn register_boundary_root(target: &Core) {
     });
 }
 
-/// Capture a tier>=3 settle slice into the current collecting batch. Returns false when
-/// there is no open collecting batch (including the commit phase).
+/// Stage a node's output into the current collecting batch, appended to the one array
+/// the node commits (R-request-order). Returns false when there is no open collecting
+/// batch (including the commit phase).
+///
+/// # Panics
+///
+/// Panics, leaving the earlier staging as it was, when the submission would follow a
+/// terminal already staged for the node: a terminal must be the last message of its
+/// array (R-wave).
 pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
     ACTIVE_BATCH.with(|b| {
         let mut active = b.borrow_mut();
@@ -125,9 +132,42 @@ pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
                 index
             }
         };
-        batch.deferred[index] = Some(wave);
+        let staged = batch.deferred[index].get_or_insert_with(Vec::new);
+        assert!(
+            wave.is_empty() || !staged.last().is_some_and(Message::is_terminal),
+            "batch: output staged after a terminal (R-wave)"
+        );
+        staged.extend(wave);
         true
     })
+}
+
+/// Panics, before anything is staged, when `wave` would follow a terminal already
+/// staged for `target` in the collecting batch (R-wave: a terminal is last). A host
+/// input checks this before it enters a wave, so the rejection reaches its caller.
+pub(crate) fn assert_stageable(target: &Core, wave: &[Message<AnyValue>]) {
+    if wave.is_empty() {
+        return;
+    }
+    ACTIVE_BATCH.with(|b| {
+        let active = b.borrow();
+        let Some(batch) = active.as_ref().filter(|batch| batch.collecting) else {
+            return;
+        };
+        let staged_terminal = batch.targets.iter().enumerate().any(|(index, entry)| {
+            entry.matches(target)
+                && batch
+                    .deferred
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|staged| staged.last().is_some_and(Message::is_terminal))
+        });
+        drop(active);
+        assert!(
+            !staged_terminal,
+            "batch: output staged after a terminal (R-wave)"
+        );
+    });
 }
 
 /// Return the active batch's commit token, but only when this target has an
@@ -179,17 +219,13 @@ fn clear_active() {
 }
 
 fn commit(targets: &[BatchTarget], deferred: Vec<Option<Wave<AnyValue>>>) {
-    for (target_index, wave) in deferred.into_iter().enumerate() {
-        if let Some(wave) = wave {
-            targets[target_index].commit_batched_wave(wave);
-        }
-    }
-}
-
-fn rollback(targets: &[BatchTarget], order: Vec<usize>) {
-    for target_index in order {
-        targets[target_index].rollback_batched();
-    }
+    commit_batched_waves(
+        deferred
+            .into_iter()
+            .enumerate()
+            .filter_map(|(target_index, wave)| wave.map(|wave| (&targets[target_index], wave)))
+            .collect(),
+    );
 }
 
 fn boundary_graph_roots(
@@ -290,13 +326,14 @@ fn rollback_and_cleanup(
     order: Vec<usize>,
     mut task_roots: Vec<BoundaryRoot>,
 ) -> std::thread::Result<()> {
+    // Nothing was delivered before the commit, so a rollback only drops what was
+    // staged (R-request-order): there is nothing to undo or balance.
     let core_roots = boundary_graph_roots(&targets, &order, &[]);
-    let result = catch_unwind(AssertUnwindSafe(|| rollback(&targets, order)));
     let late_roots = take_late_boundary_roots();
     append_boundary_roots(&mut task_roots, &core_roots, late_roots);
     clear_active();
     clear_boundary_for_roots(&core_roots, &task_roots);
-    result
+    Ok(())
 }
 
 /// Run `f` as a declarative batch (D12): success commits, panic/rollback discards.

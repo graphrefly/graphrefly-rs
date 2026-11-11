@@ -12,7 +12,7 @@ use std::rc::Rc;
 use super::bridge_protobuf::{
     CanonicalWireEdgeFrame, CanonicalWireEdgeKind, WireBridgeProtobufDataBody,
 };
-use crate::ctx::{Ctx, DepTerminal, WaveData};
+use crate::ctx::{Ctx, DepTerminal};
 use crate::graph::{Graph, GraphNodeOpts, TopologyGroup, TopologyGroupOptions};
 use crate::identity::{canonical_tuple_key, compound_tuple_key};
 use crate::node::{Core, Node, NodeOpts};
@@ -1083,8 +1083,8 @@ impl<T: Clone + 'static> WireBridgeInbound<T> {
         self.down(vec![Message::Data(Rc::new(envelope))]);
     }
 
-    /// Updates or reads `subscribe`.
-    pub fn subscribe(&self, sink: impl Fn(&Message<AnyValue>) + 'static) -> Box<dyn FnOnce()> {
+    /// Subscribes a sink, called once per array (R-wave).
+    pub fn subscribe(&self, sink: impl Fn(&[Message<AnyValue>]) + 'static) -> Box<dyn FnOnce()> {
         self.node.subscribe(sink)
     }
 
@@ -1129,16 +1129,20 @@ where
     let name = opts.name.clone().unwrap_or_else(|| "wireBridge".to_owned());
     let command_sources = Rc::new(RefCell::new(Vec::new()));
     let inbound_sources = Rc::new(RefCell::new(Vec::new()));
-    let command = graph.state_empty_opts::<WireBridgeCommand<TOutbound>>({
-        let mut opts = GraphNodeOpts::named(format!("{name}/command"));
-        opts.node.partial = true;
-        opts.node.complete_when_deps_complete = false;
-        opts.node.error_when_deps_error = false;
-        opts
-    });
-    let inbound_node = graph.state_empty_opts::<WireBridgeIngress<TInbound>>(GraphNodeOpts::named(
-        format!("{name}/inbound"),
-    ));
+    let command = graph
+        .state_empty_opts::<WireBridgeCommand<TOutbound>>({
+            let mut opts = GraphNodeOpts::named(format!("{name}/command"));
+            opts.node.partial = true;
+            opts.node.complete_when_deps_complete = false;
+            opts.node.error_when_deps_error = false;
+            opts
+        })
+        .into_node();
+    let inbound_node = graph
+        .state_empty_opts::<WireBridgeIngress<TInbound>>(GraphNodeOpts::named(format!(
+            "{name}/inbound"
+        )))
+        .into_node();
     let inbound = WireBridgeInbound {
         node: inbound_node.clone(),
         session_id: opts.session_id.clone(),
@@ -1189,7 +1193,8 @@ impl WireEdgeGroupEdge {
 
     #[must_use]
     /// Creates or computes `outbound`.
-    pub fn outbound(edge_id: impl Into<String>, outbound: Node<Vec<u8>>) -> Self {
+    pub fn outbound(edge_id: impl Into<String>, outbound: impl Into<Node<Vec<u8>>>) -> Self {
+        let outbound: Node<Vec<u8>> = outbound.into();
         Self {
             edge_id: edge_id.into(),
             outbound: Some(outbound),
@@ -1407,10 +1412,12 @@ pub fn wire_edge_group(
         ),
         graph_node_opts(format!("{name}/events"), "wireEdgeGroupEvents"),
     );
-    let release = topology.state_empty_opts::<WireEdgeGroupReleaseCohort>(graph_node_opts(
-        format!("{name}/release"),
-        "wireEdgeGroupReleaseCohort",
-    ));
+    let release = topology
+        .state_empty_opts::<WireEdgeGroupReleaseCohort>(graph_node_opts(
+            format!("{name}/release"),
+            "wireEdgeGroupReleaseCohort",
+        ))
+        .into_node();
     let gate = topology.node_opts::<WireEdgeGroupGate, _>(
         vec![events.erased()],
         wire_edge_group_gate_fn(name.clone(), expected.clone(), release.clone()),
@@ -1688,45 +1695,39 @@ fn wire_edge_group_events_fn(
             let edge = &edges[*edge_index];
             if let Some(waves) = ctx.wave_data().get(dep_index) {
                 for wave in waves.iter() {
-                    for item in wave {
-                        match item {
-                            WaveData::Data(value) => match value.clone().downcast::<Vec<u8>>() {
-                                Ok(value) => {
-                                    let version = edge.outbound.as_ref().and_then(Node::version);
-                                    if wire_edge_group_should_admit_outbound_data(
-                                        &state,
-                                        &edge.edge_id,
-                                        version.as_ref(),
-                                    ) {
-                                        state.borrow_mut().pending.insert(
-                                            edge.edge_id.clone(),
-                                            WireEdgeGroupPendingOutbound {
-                                                value: (*value).clone(),
-                                                version,
-                                            },
-                                        );
-                                        triggered = true;
-                                    }
+                    for value in wave {
+                        match value.clone().downcast::<Vec<u8>>() {
+                            Ok(value) => {
+                                let version = edge.outbound.as_ref().and_then(Node::version);
+                                if wire_edge_group_should_admit_outbound_data(
+                                    &state,
+                                    &edge.edge_id,
+                                    version.as_ref(),
+                                ) {
+                                    state.borrow_mut().pending.insert(
+                                        edge.edge_id.clone(),
+                                        WireEdgeGroupPendingOutbound {
+                                            value: (*value).clone(),
+                                            version,
+                                        },
+                                    );
+                                    triggered = true;
                                 }
-                                Err(_) => {
-                                    ctx.emit(WireEdgeGroupEvent::Issue {
-                                        issue: wire_edge_group_issue(
-                                            WireEdgeGroupIssueCode::MalformedFrame,
-                                            format!(
-                                                "{name}: outbound edge {} must emit Vec<u8> bytes",
-                                                edge.edge_id
-                                            ),
-                                            Some(edge.edge_id.clone()),
-                                            None,
-                                            None,
+                            }
+                            Err(_) => {
+                                ctx.emit(WireEdgeGroupEvent::Issue {
+                                    issue: wire_edge_group_issue(
+                                        WireEdgeGroupIssueCode::MalformedFrame,
+                                        format!(
+                                            "{name}: outbound edge {} must emit Vec<u8> bytes",
+                                            edge.edge_id
                                         ),
-                                    });
-                                    state.borrow_mut().pending.remove(&edge.edge_id);
-                                }
-                            },
-                            WaveData::Sentinel => {
+                                        Some(edge.edge_id.clone()),
+                                        None,
+                                        None,
+                                    ),
+                                });
                                 state.borrow_mut().pending.remove(&edge.edge_id);
-                                triggered = true;
                             }
                         }
                     }
@@ -2409,7 +2410,8 @@ where
 {
     let name = opts.name;
     let timeouts = graph
-        .state_empty_opts::<RemoteCallTimeout>(GraphNodeOpts::named(format!("{name}/timeouts")));
+        .state_empty_opts::<RemoteCallTimeout>(GraphNodeOpts::named(format!("{name}/timeouts")))
+        .into_node();
     let responses =
         remote_call_responses_node(graph, &bridge.command, &bridge.events, &timeouts, &name);
     let results = remote_call_results_node(graph, &responses, &name);
@@ -3885,17 +3887,7 @@ fn install_cleanup<T: Clone + 'static>(ctx: &Ctx, state: Rc<RefCell<BridgeState<
 fn raw_data(ctx: &Ctx, dep: usize) -> Vec<AnyValue> {
     ctx.wave_data()
         .get(dep)
-        .map(|waves| {
-            waves
-                .iter()
-                .flat_map(|wave| {
-                    wave.iter().filter_map(|item| match item {
-                        WaveData::Data(value) => Some(value.clone()),
-                        WaveData::Sentinel => None,
-                    })
-                })
-                .collect()
-        })
+        .map(|waves| waves.iter().flat_map(|wave| wave.iter().cloned()).collect())
         .unwrap_or_default()
 }
 
@@ -5054,13 +5046,21 @@ mod tests {
             wire_bridge::<String, String>(&g, WireBridgeOptions::named("session-a", "bridge"));
         let seen = Rc::new(RefCell::new(Vec::new()));
         let seen_sink = seen.clone();
-        let _events = bridge.events.subscribe(move |msg| {
-            if let Message::Data(value) = msg {
-                if let Some(event) = value.downcast_ref::<WireBridgeEvent<String, String>>() {
-                    seen_sink.borrow_mut().push(event.clone());
+        let _events = bridge.events.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if let Message::Data(value) = msg {
+                        if let Some(event) = value.downcast_ref::<WireBridgeEvent<String, String>>()
+                        {
+                            seen_sink.borrow_mut().push(event.clone());
+                        }
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
                 }
-            }
-        });
+            },
+        );
 
         bridge.inbound.set(envelope(
             "session-b",

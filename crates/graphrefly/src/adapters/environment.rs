@@ -467,9 +467,11 @@ pub fn websocket_session_with_options(
         .clone()
         .unwrap_or_else(|| "websocketSession".to_owned());
     validate_websocket_session_send_policy(&opts.send_policy);
-    let command = graph.state_empty_opts::<WebSocketSessionCommand>(GraphNodeOpts::named(format!(
-        "{name}/command"
-    )));
+    let command = graph
+        .state_empty_opts::<WebSocketSessionCommand>(GraphNodeOpts::named(format!(
+            "{name}/command"
+        )))
+        .into_node();
     let events = websocket_session_events(
         graph,
         &command,
@@ -1693,6 +1695,12 @@ where
     T: Clone + 'static,
     R: Clone + 'static,
 {
+    // The events node may send its last event and its ERROR in one wave; the status
+    // folds that event before ending, so it takes the ERROR as input and ends itself
+    // (the manual ERROR policy of R-terminals).
+    let mut status_opts = GraphNodeOpts::named(format!("{name}/status"));
+    status_opts.node.error_when_deps_error = false;
+    status_opts.node.terminal_as_real_input = true;
     let status = graph.node_opts::<OutboundStatus, _>(
         vec![events.erased()],
         move |ctx| {
@@ -1704,8 +1712,11 @@ where
             }
             ctx.state_set(next.clone());
             ctx.emit(next);
+            if let Some(DepTerminal::Error(error)) = ctx.terminal(0) {
+                ctx.down(vec![Message::Error(error.to_string().into())]);
+            }
         },
-        GraphNodeOpts::named(format!("{name}/status")),
+        status_opts,
     );
     let attempts = graph.node_opts::<u32, _>(
         vec![events.erased()],
@@ -2072,13 +2083,20 @@ mod tests {
     fn collect_node_data<T: Clone + 'static>(node: &Node<T>) -> Rc<RefCell<Vec<T>>> {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let seen_sink = seen.clone();
-        let _keep = node.subscribe(move |msg| {
-            if let Message::Data(value) = msg {
-                if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                    seen_sink.borrow_mut().push(value.clone());
+        let _keep = node.subscribe(
+            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+                let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                    if let Message::Data(value) = msg {
+                        if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                            seen_sink.borrow_mut().push(value.clone());
+                        }
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
                 }
-            }
-        });
+            },
+        );
         seen
     }
 

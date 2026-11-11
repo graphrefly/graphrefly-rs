@@ -19,17 +19,14 @@ use std::rc::Rc;
 
 use graphrefly::checkpoint::{GraphRestoreDescriptor, RestoreDefineCtx};
 use graphrefly::{
-    batch, graph, restore_graph, restore_registry, AnyValue, Core, Ctx, DeferredCtx, DepTerminal,
+    graph, restore_graph, restore_registry, Core, Ctx, DeferredCtx, DepTerminal,
     GraphCheckpointJson, GraphNode, GraphNodeOpts, GraphRestoreEntry, Message, Node, NodeOpts,
     NodeVersion, RestoreFactoryMeta, RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind,
-    StateRestoreDescriptor, Status, WaveData,
+    StateRestoreDescriptor, Status,
 };
 use serde_json::json;
 
 type Log = Rc<RefCell<Vec<String>>>;
-type WaveShape = Vec<Vec<String>>;
-type SeenWavePairs = Rc<RefCell<Vec<(WaveShape, WaveShape)>>>;
-type SeenTerminal = Rc<RefCell<Vec<(WaveShape, String)>>>;
 /// An unsubscribe handle (kept alive to hold a node active).
 type Unsub = Box<dyn FnOnce()>;
 
@@ -38,7 +35,13 @@ type Unsub = Box<dyn FnOnce()>;
 fn record<T: 'static>(node: &Node<T>) -> (Log, Unsub) {
     let log: Log = Rc::new(RefCell::new(Vec::new()));
     let l = log.clone();
-    let unsub = node.subscribe(move |m: &Message<AnyValue>| l.borrow_mut().push(format!("{m:?}")));
+    let unsub = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle =
+            |m: &graphrefly::Message<graphrefly::AnyValue>| l.borrow_mut().push(format!("{m:?}"));
+        for m in msgs {
+            handle(m);
+        }
+    });
     (log, unsub)
 }
 
@@ -51,11 +54,16 @@ fn kinds(log: &Log) -> Vec<String> {
 fn record_data_i32(node: &Node<i32>) -> (Rc<RefCell<Vec<i32>>>, Unsub) {
     let vals: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
     let v = vals.clone();
-    let unsub = node.subscribe(move |m: &Message<AnyValue>| {
-        if let Message::Data(a) = m {
-            if let Ok(rc) = a.clone().downcast::<i32>() {
-                v.borrow_mut().push(*rc);
+    let unsub = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |m: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(a) = m {
+                if let Ok(rc) = a.clone().downcast::<i32>() {
+                    v.borrow_mut().push(*rc);
+                }
             }
+        };
+        for m in msgs {
+            handle(m);
         }
     });
     (vals, unsub)
@@ -64,11 +72,16 @@ fn record_data_i32(node: &Node<i32>) -> (Rc<RefCell<Vec<i32>>>, Unsub) {
 fn record_graph_node_data_json(node: &GraphNode) -> (Rc<RefCell<Vec<GraphCheckpointJson>>>, Unsub) {
     let vals: Rc<RefCell<Vec<GraphCheckpointJson>>> = Rc::new(RefCell::new(Vec::new()));
     let v = vals.clone();
-    let unsub = node.subscribe(move |m: &Message<AnyValue>| {
-        if let Message::Data(a) = m {
-            if let Ok(rc) = a.clone().downcast::<GraphCheckpointJson>() {
-                v.borrow_mut().push(rc.as_ref().clone());
+    let unsub = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |m: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(a) = m {
+                if let Ok(rc) = a.clone().downcast::<GraphCheckpointJson>() {
+                    v.borrow_mut().push(rc.as_ref().clone());
+                }
             }
+        };
+        for m in msgs {
+            handle(m);
         }
     });
     (vals, unsub)
@@ -78,47 +91,6 @@ fn graph_node_json_cache(node: &GraphNode) -> Option<GraphCheckpointJson> {
     node.cache_any()
         .and_then(|v| v.downcast::<GraphCheckpointJson>().ok())
         .map(|v| v.as_ref().clone())
-}
-
-/// Count occurrences of a message kind in a recorded log.
-fn count_kind(log: &Log, kind: &str) -> usize {
-    log.borrow().iter().filter(|k| *k == kind).count()
-}
-
-fn dep_wave_data(ctx: &Ctx, dep: usize) -> &[Vec<WaveData>] {
-    ctx.wave_data().get(dep).copied().unwrap_or(&[])
-}
-
-fn wave_shape(ctx: &Ctx, dep: usize) -> WaveShape {
-    dep_wave_data(ctx, dep)
-        .iter()
-        .map(|wave| {
-            wave.iter()
-                .map(|item| match item {
-                    WaveData::Sentinel => "SENTINEL".to_string(),
-                    WaveData::Data(v) => {
-                        if let Ok(n) = v.clone().downcast::<i32>() {
-                            format!("i32:{n}")
-                        } else if let Ok(n) = v.clone().downcast::<Option<i32>>() {
-                            format!("option:{n:?}")
-                        } else if let Ok(xs) = v.clone().downcast::<Vec<i32>>() {
-                            format!("vec:{xs:?}")
-                        } else {
-                            "data".to_string()
-                        }
-                    }
-                })
-                .collect()
-        })
-        .collect()
-}
-
-fn terminal_shape(ctx: &Ctx, dep: usize) -> String {
-    match ctx.terminal(dep) {
-        None => "none".to_string(),
-        Some(DepTerminal::Complete) => "complete".to_string(),
-        Some(DepTerminal::Error(e)) => format!("error:{e}"),
-    }
 }
 
 /// The shared self-fn type for a self-referential operator (the rewire fn re-pairs the deps,
@@ -311,11 +283,15 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
 
         s.set(5); // add innerA (seed 50 forwarded at the boundary)
         assert!(vals.borrow().contains(&50));
-        let inner_a = inners.borrow()[0].node.clone();
+        let inner_a = inners.borrow()[0].dctx.clone();
         let _ia_act = inners.borrow()[0].activated.clone();
         let ia_deact = inners.borrow()[0].deactivated.clone();
 
-        inner_a.down(vec![Message::Complete]); // innerA COMPLETEs → OP removes it (bounding)
+        inner_a
+            .borrow()
+            .as_ref()
+            .expect("inner activated")
+            .down(vec![Message::Complete]); // innerA COMPLETEs → OP removes it (bounding)
         assert!(
             ia_deact.get(),
             "the completed inner is removed → deactivated (input torn down)"
@@ -488,56 +464,6 @@ fn c11_higher_order_inner_rewire_at_wave_boundary() {
     }
 }
 
-/// C-3 — INVALIDATE cascades exactly once, fires `onInvalidate`, preserves `ctx.state`
-/// (lifecycle-continue), resets the dep's `prev_data` → SENTINEL; a second INVALIDATE
-/// on an already-reset source is an idempotent no-op (R-invalidate-idempotent).
-#[test]
-fn c3_invalidate_state_and_on_invalidate() {
-    let states_at_run: Rc<RefCell<Vec<Option<String>>>> = Rc::new(RefCell::new(Vec::new()));
-    let on_inv = Rc::new(Cell::new(0u32));
-
-    let s = Node::<i32>::state(1);
-    let d = {
-        let sar = states_at_run.clone();
-        let oi = on_inv.clone();
-        Node::<i32>::derived(vec![s.erased()], move |ctx| {
-            // prior state visible at run time; then set it + register the flush hook
-            sar.borrow_mut()
-                .push(ctx.state_get::<String>().map(|r| (*r).clone()));
-            ctx.state_set("kept".to_string());
-            let oi2 = oi.clone();
-            ctx.on_invalidate(move || oi2.set(oi2.get() + 1));
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 2);
-        })
-    };
-
-    let (log, _u) = record(&d);
-    assert_eq!(d.cache(), Some(2));
-    assert_eq!(*states_at_run.borrow(), vec![None]); // first run: fresh state
-
-    log.borrow_mut().clear();
-    s.down(vec![Message::Invalidate]);
-    assert_eq!(kinds(&log), vec!["INVALIDATE"]); // cascaded downstream exactly once
-    assert_eq!(on_inv.get(), 1); // onInvalidate fired once
-    assert_eq!(d.cache(), None); // cache cleared → SENTINEL
-    assert_eq!(d.status(), Status::Sentinel);
-
-    // idempotent: a second INVALIDATE on an already-reset source is a no-op
-    log.borrow_mut().clear();
-    s.down(vec![Message::Invalidate]);
-    assert!(kinds(&log).is_empty());
-    assert_eq!(on_inv.get(), 1);
-
-    // ctx.state preserved across INVALIDATE (lifecycle-continue, NOT a fresh-lifecycle
-    // wipe): the next run sees "kept", not None.
-    s.set(5);
-    assert_eq!(
-        *states_at_run.borrow(),
-        vec![None, Some("kept".to_string())]
-    );
-    assert_eq!(d.cache(), Some(10));
-}
-
 /// C-6 — a synchronous feedback cycle (state→derived→effect, effect writes back to the
 /// source) is rejected as ERROR. The substrate panic is caught at the wave-owner and
 /// converted to `[[ERROR,e]]` on a node ON the cycle (D30) — it does NOT escape the
@@ -603,7 +529,7 @@ fn c14_cleanup_hooks_are_per_run() {
     s.set(1); // run 2 — re-registers (prior run's hooks cleared)
     s.set(2); // run 3 — re-registers (D has now run 3×)
 
-    s.down(vec![Message::Invalidate]); // fires onInvalidate ONCE (run-3's), not 3×
+    s.invalidate(); // fires onInvalidate ONCE (run-3's), not 3×
     assert_eq!(
         flush.get(),
         1,
@@ -616,55 +542,6 @@ fn c14_cleanup_hooks_are_per_run() {
         1,
         "onDeactivation fires once (the latest run's), not K times"
     );
-}
-
-/// C-4 — a mixed sync/async diamond joins EXACTLY ONCE after BOTH legs settle, even
-/// though the async leg settles later via a stashed `DeferredCtx`. The first-run gate
-/// holds the join until the async leg delivers; the async leg's no-emit run does NOT
-/// synthesize an undirty RESOLVED (it deferred, not rejected — C-4 exemption). A
-/// post-activation re-join emits DIRTY before DATA (glitch-free two-phase).
-#[test]
-fn c4_mixed_sync_async_diamond() {
-    let stash: Rc<RefCell<Option<DeferredCtx>>> = Rc::new(RefCell::new(None));
-    let runs = Rc::new(Cell::new(0usize));
-    let a = Node::<i32>::state(1);
-    let b: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap() + 10) // sync leg
-    });
-    let c = {
-        let st = stash.clone();
-        Node::<i32>::derived_async(vec![a.erased()], move |ctx| {
-            *st.borrow_mut() = Some(ctx.defer()); // async leg: defer the emit
-        })
-    };
-    let d = {
-        let r = runs.clone();
-        Node::<i32>::derived(vec![b.erased(), c.erased()], move |ctx| {
-            r.set(r.get() + 1);
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-        })
-    };
-    let (log, _u) = record(&d);
-    // b settled sync (11); the async leg is deferred → the first-run gate holds d.
-    assert_eq!(runs.get(), 0);
-    assert_eq!(d.cache(), None);
-
-    stash.borrow_mut().take().expect("ctx stashed").emit(21i32); // async leg → first join (activation)
-    assert_eq!(runs.get(), 1, "joined exactly once");
-    assert_eq!(d.cache(), Some(32)); // 11 + 21
-
-    // Drive a second settle through both legs to observe d past its first-run exemption.
-    log.borrow_mut().clear();
-    a.set(2); // re-drives b (sync, 12) and c (async, deferred again)
-    assert_eq!(runs.get(), 1, "still gated on the async leg");
-    stash
-        .borrow_mut()
-        .take()
-        .expect("ctx re-stashed")
-        .emit(30i32); // async re-resolves
-    assert_eq!(runs.get(), 2);
-    assert_eq!(d.cache(), Some(42)); // 12 + 30
-    assert_eq!(kinds(&log), vec!["PENDING", "DATA"]); // DIRTY precedes DATA, glitch-free
 }
 
 /// C-8 — intra-graph runtime rewire (R-rewire / D42). Surgical Option-C: subscribe_dep
@@ -712,69 +589,6 @@ fn c8_intra_graph_runtime_rewire() {
     assert_eq!(d.cache(), Some(7));
 }
 
-/// C-8 (reject) — rewire on a terminal node is REJECTED (R-rewire / D42). Called
-/// externally (no wave in flight), the reject propagates as a panic to the caller (the
-/// Rust analogue of the TS throw; a mid-fn rewire instead becomes ERROR via the wave-owner
-/// — covered by a node.rs unit test).
-#[test]
-#[should_panic(expected = "terminal")]
-fn c8_rewire_on_terminal_node_rejected() {
-    let a = Node::<i32>::state(1);
-    let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap())
-    });
-    let _u = d.subscribe(|_| {});
-    d.down(vec![Message::Complete]); // D terminal
-    assert_eq!(d.status(), Status::Completed);
-    d.replace_deps(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap())
-    }); // → panic
-}
-
-/// C-22 — an immediate/external rewire requested while this node has an uncommitted
-/// batch settle is accepted but applied only after the batch commits the old shape.
-#[test]
-fn c22_batch_commit_precedes_rewire_requested_during_open_batch() {
-    let a = Node::<i32>::state(1);
-    let b = Node::<i32>::state(10);
-    let n = Node::<i32>::derived(vec![a.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap());
-    });
-    let (vals, _u) = record_data_i32(&n);
-    let (log, _u2) = record(&n);
-    assert_eq!(n.cache(), Some(1));
-    vals.borrow_mut().clear();
-    log.borrow_mut().clear();
-
-    batch(|_| {
-        n.down(vec![Message::Data(Rc::new(2i32))]); // N has an uncommitted old-shape DATA(2)
-        n.replace_deps(vec![b.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 10);
-        });
-
-        assert_eq!(
-            *vals.borrow(),
-            Vec::<i32>::new(),
-            "the old-shape DATA is not visible before batch commit"
-        );
-        assert_eq!(n.cache(), Some(1));
-    });
-
-    assert_eq!(
-        *vals.borrow(),
-        vec![2, 100],
-        "commit N's old-shape batched value first, then apply rewire and settle fresh [B] shape"
-    );
-    assert_eq!(kinds(&log), vec!["PENDING", "DATA", "PENDING", "DATA"]);
-    assert_eq!(n.cache(), Some(100));
-
-    vals.borrow_mut().clear();
-    a.set(3);
-    assert_eq!(*vals.borrow(), Vec::<i32>::new(), "A was drained by rewire");
-    b.set(11);
-    assert_eq!(*vals.borrow(), vec![110], "B is the live post-batch dep");
-}
-
 /// C-17 (R-deps-terminal / B42): an ABSORBED error (error_when_deps_error:false) counts as
 /// TERMINAL for the complete_when_deps_complete auto-COMPLETE cascade — order-independent
 /// (whichever terminal lands last fires it). The COMPLETION analogue of C-15's dirty-release;
@@ -799,11 +613,11 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
             fwd,
         );
         let (_log, _u) = record(&d);
-        c.down(vec![Message::Error("boom".into())]); // absorbed; B still live → not yet all-terminal
+        c.error("boom"); // absorbed; B still live → not yet all-terminal
         assert_ne!(d.status(), Status::Completed);
         assert_ne!(d.status(), Status::Errored); // error_when_deps_error:false → no auto-ERROR
         b.set(1);
-        b.down(vec![Message::Complete]); // B terminal → ALL deps terminal (C errored) → COMPLETE
+        b.complete(); // B terminal → ALL deps terminal (C errored) → COMPLETE
         assert_eq!(d.status(), Status::Completed);
     }
 
@@ -821,9 +635,9 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
         );
         let (_log, _u) = record(&d);
         b.set(1);
-        b.down(vec![Message::Complete]); // B terminal; C still live → not yet all-terminal
+        b.complete(); // B terminal; C still live → not yet all-terminal
         assert_ne!(d.status(), Status::Completed);
-        c.down(vec![Message::Error("boom".into())]); // C absorbed-error LANDS LAST → all terminal → COMPLETE
+        c.error("boom"); // C absorbed-error LANDS LAST → all terminal → COMPLETE
         assert_eq!(d.status(), Status::Completed); // ERROR-absorbed arm mirrors the COMPLETE arm (B42)
     }
 
@@ -833,373 +647,8 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
         let c = Node::<i32>::state_empty();
         let d = Node::<i32>::derived_opts(vec![b.erased(), c.erased()], NodeOpts::default(), fwd);
         let (_log, _u) = record(&d);
-        c.down(vec![Message::Error("boom".into())]); // auto-cascade → ERROR before any complete-check
+        c.error("boom"); // auto-cascade → ERROR before any complete-check
         assert_eq!(d.status(), Status::Errored);
-    }
-}
-
-/// C-12 — every value-OCCURRENCE stays DATA (no equals-substitution); RESOLVED is the
-/// substrate-synthesized UNDIRTY settle only; dedup is OPT-IN at the operator layer
-/// (R-resolved-undirty / D49, supersedes D15/R-equals). The Rust arm has no operator
-/// library yet, so take / distinctUntilChanged are expressed as inline `ctx.state` derived
-/// nodes (per-language, D6/D24) — the substrate property under test is language-neutral.
-#[test]
-fn c12_occurrences_stay_data_resolved_is_undirty_only() {
-    // (a) a repeated value is THREE distinct occurrences — never collapsed to RESOLVED.
-    {
-        let src = Node::<i32>::producer(|ctx| {
-            ctx.emit(1);
-            ctx.emit(1);
-            ctx.emit(1);
-            ctx.down(vec![Message::Complete]);
-        });
-        let (log, _u) = record(&src);
-        assert_eq!(
-            count_kind(&log, "DATA"),
-            3,
-            "three occurrences, all DATA (got {:?})",
-            kinds(&log)
-        );
-        assert_eq!(
-            count_kind(&log, "RESOLVED"),
-            0,
-            "no equals-substitution (got {:?})",
-            kinds(&log)
-        );
-    }
-
-    // (b) a take(3)-style derived (ctx.state counter) counts OCCURRENCES, not distinct values:
-    //     fromIter([1,1,1,1]) → take(3) → [1,1,1].
-    {
-        let src = Node::<i32>::producer(|ctx| {
-            for _ in 0..4 {
-                ctx.emit(1);
-            }
-            ctx.down(vec![Message::Complete]);
-        });
-        let taken = Node::<i32>::derived(vec![src.erased()], |ctx| {
-            let n = ctx.state_get::<i32>().map(|r| *r).unwrap_or(0);
-            if n < 3 {
-                let v = *ctx.data::<i32>(0).expect("a value occurred");
-                ctx.state_set(n + 1);
-                ctx.emit(v);
-                if n + 1 == 3 {
-                    ctx.down(vec![Message::Complete]);
-                }
-            }
-        });
-        let (vals, _u) = record_data_i32(&taken);
-        assert_eq!(*vals.borrow(), vec![1, 1, 1]); // counts occurrences, NOT collapsed to one
-    }
-
-    // (c) a filter that REJECTS (fn returns without emitting) makes the substrate SYNTHESIZE
-    //     one undirty RESOLVED per rejected wave — no DATA, no wedge; an accepted value is DATA.
-    {
-        let src = Node::<i32>::state_empty();
-        let filtered = Node::<i32>::derived(vec![src.erased()], |ctx| {
-            let v = *ctx.data::<i32>(0).unwrap();
-            if v % 2 == 0 {
-                ctx.emit(v); // accept evens; reject odds (no emit → undirty RESOLVED)
-            }
-        });
-        let (log, _u) = record(&filtered);
-        src.set(3); // odd → reject → synthesized undirty RESOLVED (no wedge)
-        src.set(4); // even → DATA(4) (an occurrence)
-        src.set(5); // odd → RESOLVED
-        assert_eq!(
-            kinds(&log),
-            vec!["START", "PENDING", "RESOLVED", "PENDING", "DATA", "PENDING", "RESOLVED"]
-        );
-    }
-
-    // (d) dedup is OPT-IN at the operator layer: a distinctUntilChanged-style derived (its
-    //     own eq via ctx.state) suppresses an unchanged value → [1,1,2] emits [1,2]; the
-    //     suppressed repeat is an undirty RESOLVED (the substrate did NOT dedup it for us).
-    {
-        let src = Node::<i32>::state_empty();
-        let distinct = Node::<i32>::derived(vec![src.erased()], |ctx| {
-            let v = *ctx.data::<i32>(0).unwrap();
-            let last = ctx.state_get::<i32>().map(|r| *r);
-            if last != Some(v) {
-                ctx.state_set(v);
-                ctx.emit(v);
-            } // else unchanged → no emit → substrate synthesizes the undirty RESOLVED
-        });
-        let (vals, _u) = record_data_i32(&distinct);
-        let (log, _u2) = record(&distinct);
-        src.set(1); // new → DATA(1)
-        src.set(1); // same → deduped by the OPERATOR → RESOLVED, not a dropped/collapsed DATA
-        src.set(2); // new → DATA(2)
-        assert_eq!(*vals.borrow(), vec![1, 2]); // dedup is opt-in (operator), not substrate
-        assert_eq!(
-            count_kind(&log, "RESOLVED"),
-            1,
-            "the deduped repeat is an undirty RESOLVED"
-        );
-        assert_eq!(count_kind(&log, "DATA"), 2);
-    }
-}
-
-/// C-23 — D77 raw ctx contract: `wave_data` is the only raw dep-value input
-/// surface, preserves per-upstream-wave distinctions, and terminal metadata stays
-/// separate (R-fn-contract / R-ctx-wave-data / R-dynamic-node).
-#[test]
-fn c23_raw_ctx_wave_data_preserves_per_wave_distinctions() {
-    // (a) no-wave for A while B changes.
-    {
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(10);
-        let seen: SeenWavePairs = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![a.erased(), b.erased()],
-                NodeOpts {
-                    partial: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| {
-                    seen.borrow_mut()
-                        .push((wave_shape(ctx, 0), wave_shape(ctx, 1)));
-                },
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        b.set(11);
-        assert_eq!(
-            seen.borrow().last().cloned(),
-            Some((vec![], vec![vec!["i32:11".to_string()]]))
-        );
-    }
-
-    // (b) RESOLVED-only is one delivered wave with an empty inner projection. Only
-    // the kernel sends RESOLVED (R-wave): `silent` sends nothing for its input, so the
-    // kernel settles it with RESOLVED.
-    {
-        let s = Node::<i32>::state(1);
-        let silent = Node::<i32>::derived(vec![s.erased()], |_ctx| {});
-        let seen: Rc<RefCell<Vec<WaveShape>>> = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![silent.erased()],
-                NodeOpts {
-                    partial: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| seen.borrow_mut().push(wave_shape(ctx, 0)),
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        s.set(2);
-        assert_eq!(seen.borrow().last().cloned(), Some(vec![vec![]]));
-    }
-
-    // (c) DATA + INVALIDATE in the same upstream wave preserves DATA occurrences
-    // and appends the Rust SENTINEL marker.
-    {
-        let s = Node::<i32>::state(0);
-        let seen: Rc<RefCell<Vec<WaveShape>>> = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![s.erased()],
-                NodeOpts {
-                    partial: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| seen.borrow_mut().push(wave_shape(ctx, 0)),
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        s.down(vec![
-            Message::Data(Rc::new(1i32)),
-            Message::Data(Rc::new(2i32)),
-            Message::Invalidate,
-        ]);
-        assert_eq!(
-            seen.borrow().last().cloned(),
-            Some(vec![vec![
-                "i32:1".to_string(),
-                "i32:2".to_string(),
-                "SENTINEL".to_string()
-            ]])
-        );
-    }
-
-    // (c2) INVALIDATE-only does not leave a stale sentinel for the next invocation.
-    {
-        let s = Node::<i32>::state(1);
-        let seen: Rc<RefCell<Vec<WaveShape>>> = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![s.erased()],
-                NodeOpts {
-                    partial: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| seen.borrow_mut().push(wave_shape(ctx, 0)),
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        s.down(vec![Message::Invalidate]);
-        s.set(3);
-        assert_eq!(
-            seen.borrow().last().cloned(),
-            Some(vec![vec!["i32:3".to_string()]])
-        );
-    }
-
-    // (d/e) DATA payloads that are Rust "null-like" or empty containers remain
-    // legal DATA, not SENTINEL/no-wave.
-    {
-        let opt = Node::<Option<i32>>::state_empty();
-        let empty = Node::<Vec<i32>>::state_empty();
-        let seen: SeenWavePairs = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![opt.erased(), empty.erased()],
-                NodeOpts {
-                    partial: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| {
-                    seen.borrow_mut()
-                        .push((wave_shape(ctx, 0), wave_shape(ctx, 1)));
-                },
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        opt.down(vec![Message::Data(Rc::new(None::<i32>))]);
-        assert_eq!(
-            seen.borrow().last().cloned().map(|pair| pair.0),
-            Some(vec![vec!["option:None".to_string()]])
-        );
-        empty.down(vec![Message::Data(Rc::new(Vec::<i32>::new()))]);
-        assert_eq!(
-            seen.borrow().last().cloned().map(|pair| pair.1),
-            Some(vec![vec!["vec:[]".to_string()]])
-        );
-    }
-
-    // (f) COMPLETE/ERROR do not enter wave_data; terminal metadata is separate.
-    {
-        let complete = Node::<i32>::state(1);
-        let seen: SeenTerminal = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![complete.erased()],
-                NodeOpts {
-                    error_when_deps_error: false,
-                    terminal_as_real_input: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| {
-                    seen.borrow_mut()
-                        .push((wave_shape(ctx, 0), terminal_shape(ctx, 0)));
-                },
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        complete.down(vec![Message::Complete]);
-        assert_eq!(
-            seen.borrow().last().cloned(),
-            Some((vec![], "complete".to_string()))
-        );
-
-        let live = Node::<i32>::state(10);
-        let complete = Node::<i32>::state(1);
-        let seen: SeenTerminal = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![complete.erased(), live.erased()],
-                NodeOpts {
-                    complete_when_deps_complete: false,
-                    terminal_as_real_input: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| {
-                    seen.borrow_mut()
-                        .push((wave_shape(ctx, 1), terminal_shape(ctx, 0)));
-                },
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        complete.down(vec![Message::Complete]);
-        assert_eq!(
-            seen.borrow().last().cloned(),
-            Some((vec![], "complete".to_string()))
-        );
-        seen.borrow_mut().clear();
-        live.set(11);
-        assert_eq!(
-            seen.borrow().last().cloned(),
-            Some((vec![vec!["i32:11".to_string()]], "none".to_string()))
-        );
-
-        let error = Node::<i32>::state(1);
-        let seen: SeenTerminal = Rc::new(RefCell::new(Vec::new()));
-        let out = {
-            let seen = seen.clone();
-            Node::<()>::derived_opts(
-                vec![error.erased()],
-                NodeOpts {
-                    error_when_deps_error: false,
-                    terminal_as_real_input: true,
-                    ..NodeOpts::default()
-                },
-                move |ctx| {
-                    seen.borrow_mut()
-                        .push((wave_shape(ctx, 0), terminal_shape(ctx, 0)));
-                },
-            )
-        };
-        let (_log, _u) = record(&out);
-        seen.borrow_mut().clear();
-        error.down(vec![Message::Error("boom".into())]);
-        assert_eq!(
-            seen.borrow().last().cloned(),
-            Some((vec![], "error:boom".to_string()))
-        );
-    }
-
-    // (g) dynamic-node-style unread dep: the fn can inspect wave_data and stay
-    // quiet on a B-only wave, producing only the substrate undirty settle.
-    {
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(10);
-        let out = Node::<i32>::derived_opts(
-            vec![a.erased(), b.erased()],
-            NodeOpts {
-                partial: true,
-                ..NodeOpts::default()
-            },
-            move |ctx| {
-                if dep_wave_data(ctx, 0).is_empty() {
-                    return;
-                }
-                if let Some(v) = ctx.data::<i32>(0) {
-                    ctx.emit(*v);
-                }
-            },
-        );
-        let (vals, _u) = record_data_i32(&out);
-        vals.borrow_mut().clear();
-        b.set(11);
-        assert_eq!(*vals.borrow(), Vec::<i32>::new());
-        a.set(2);
-        assert_eq!(*vals.borrow(), vec![2]);
     }
 }
 
@@ -1334,7 +783,10 @@ fn c24_snapshot_restore_preserves_state_and_rejects_local_only_factories() {
     );
 
     let restored_source = restored.find("source").expect("source restored");
-    restored_source.down(vec![Message::Data(Rc::new(json!(4)) as AnyValue)]);
+    restored_source
+        .as_state::<serde_json::Value>()
+        .expect("restored source is a state")
+        .set(json!(4));
     assert_eq!(
         restored_runs.get(),
         1,

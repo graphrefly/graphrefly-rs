@@ -1038,7 +1038,7 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
         let backend_state =
             checkpoint_backend_state(&entry.core, &format!("{}.backendState", entry.id))?;
         let non_authoritative_collection_helper =
-            is_non_authoritative_collection_helper(entry.meta.get("kind").map(String::as_str));
+            is_non_authoritative_helper(entry.meta.get("kind").map(String::as_str));
         nodes.push(GraphCheckpointNode {
             id: entry.id.clone(),
             name: entry.name.clone(),
@@ -1118,7 +1118,9 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
     })
 }
 
-fn is_non_authoritative_collection_helper(kind: Option<&str>) -> bool {
+/// Nodes whose value a checkpoint does not record: collection helpers rebuilt from
+/// their backend.
+fn is_non_authoritative_helper(kind: Option<&str>) -> bool {
     matches!(
         kind,
         Some(
@@ -1785,7 +1787,10 @@ mod tests {
             Some(NodeVersion::V0 { counter: 1 })
         );
 
-        restored_source.down(vec![Message::Data(Rc::new(json!(3)))]);
+        restored_source
+            .as_state::<serde_json::Value>()
+            .expect("restored source is a state")
+            .set(json!(3));
         assert_eq!(
             restored_source.version(),
             Some(NodeVersion::V0 { counter: 2 })
@@ -1912,7 +1917,10 @@ mod tests {
                 prev: Some("h:1".to_owned()),
             })
         );
-        restored_source.down(vec![Message::Data(Rc::new(json!(3)))]);
+        restored_source
+            .as_state::<serde_json::Value>()
+            .expect("restored source is a state")
+            .set(json!(3));
         assert_eq!(
             restored_source.version(),
             Some(NodeVersion::V1 {

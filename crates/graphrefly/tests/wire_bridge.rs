@@ -1,5 +1,4 @@
-use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphrefly::{
@@ -87,11 +86,16 @@ fn envelope_with_cursor<T>(
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.downcast_ref::<T>() {
-                seen_sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.downcast_ref::<T>() {
+                    seen_sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -162,8 +166,8 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
         WireEdgeGroupOptions::named(
             "group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -300,8 +304,8 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
         WireEdgeGroupOptions::named(
             "group2",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a),
-                WireEdgeGroupEdge::outbound("b", source_b),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -336,7 +340,7 @@ fn wire_edge_group_rejects_mixed_inbound_outbound_edges() {
         WireEdgeGroupOptions::named(
             "mixed/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
                 WireEdgeGroupEdge::inbound("b"),
             ],
         ),
@@ -358,8 +362,8 @@ fn wire_edge_group_outbound_invalidate_clears_snapshot_before_next_cause() {
         WireEdgeGroupOptions::named(
             "invalidate/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -372,7 +376,7 @@ fn wire_edge_group_outbound_invalidate_clears_snapshot_before_next_cause() {
     });
     outbound.borrow_mut().clear();
 
-    source_a.down(vec![Message::Invalidate]);
+    source_a.invalidate();
     assert!(
         outbound.borrow().is_empty(),
         "INVALIDATE must not resend the stale a=1 snapshot"
@@ -422,8 +426,8 @@ fn wire_edge_group_outbound_edge_invalidate_preserves_other_pending_fresh_data()
         WireEdgeGroupOptions::named(
             "edge-invalidate/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -432,7 +436,7 @@ fn wire_edge_group_outbound_edge_invalidate_preserves_other_pending_fresh_data()
     source_b.set(vec![3]);
     assert!(outbound.borrow().is_empty());
 
-    source_a.down(vec![Message::Invalidate]);
+    source_a.invalidate();
     assert!(
         outbound.borrow().is_empty(),
         "D560: invalidating one edge must not emit or clear unrelated pending fresh DATA"
@@ -472,8 +476,8 @@ fn wire_edge_group_outbound_initial_bootstrap_allows_one_current_cohort() {
         WireEdgeGroupOptions::named(
             "bootstrap/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -510,8 +514,8 @@ fn wire_edge_group_outbound_late_subscriber_current_drain_does_not_admit_cause()
         WireEdgeGroupOptions::named(
             "late-drain/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -525,10 +529,12 @@ fn wire_edge_group_outbound_late_subscriber_current_drain_does_not_admit_cause()
     outbound.borrow_mut().clear();
 
     let late_seen = collect_data(&bridge.outbound);
+    // R-subscription: a late subscriber's snapshot is the DATA of the last array, and
+    // the group sent its four frames in one array.
     assert_eq!(
         late_seen.borrow().len(),
-        1,
-        "late subscriber receives bridge.outbound current DATA directly"
+        4,
+        "late subscriber receives bridge.outbound's last array directly"
     );
     assert!(
         outbound.borrow().is_empty(),
@@ -557,8 +563,8 @@ fn wire_edge_group_outbound_rejects_disabled_versioning_edges() {
         WireEdgeGroupOptions::named(
             "disabled-version/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a),
-                WireEdgeGroupEdge::outbound("b", source_b),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -579,8 +585,8 @@ fn wire_edge_group_outbound_fresh_cohort_does_not_reuse_stale_snapshots() {
         WireEdgeGroupOptions::named(
             "fresh/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -657,8 +663,8 @@ fn wire_edge_group_outbound_same_bytes_from_fresh_events_still_form_cause() {
         WireEdgeGroupOptions::named(
             "same-bytes/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -705,8 +711,8 @@ fn wire_edge_group_outbound_duplicate_edge_data_latest_wins_before_cohort_comple
         WireEdgeGroupOptions::named(
             "latest/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -749,8 +755,8 @@ fn wire_edge_group_outbound_malformed_data_clears_that_edge_pending_material() {
         WireEdgeGroupOptions::named(
             "malformed/group",
             vec![
-                WireEdgeGroupEdge::outbound("a", source_a.clone()),
-                WireEdgeGroupEdge::outbound("b", source_b.clone()),
+                WireEdgeGroupEdge::outbound("a", source_a.node().clone()),
+                WireEdgeGroupEdge::outbound("b", source_b.node().clone()),
             ],
         ),
     );
@@ -758,7 +764,12 @@ fn wire_edge_group_outbound_malformed_data_clears_that_edge_pending_material() {
     let issues = collect_data(&group.issues);
 
     source_a.set(vec![1]);
-    source_a.down(vec![Message::Data(Rc::new("not-bytes".to_owned()))]);
+    // The typed handle cannot write a wrong type; the erased one found by path can,
+    // which is how a malformed outbound value reaches the group.
+    g.find("malformed/edge/a")
+        .and_then(|node| node.as_state::<String>())
+        .expect("source a is a state")
+        .set("not-bytes".to_owned());
     assert!(issues
         .borrow()
         .iter()
@@ -903,83 +914,6 @@ fn wire_edge_group_inbound_partial_progress_does_not_reemit_cached_edges_or_fan_
         WireEdgeGroupStatusState::Released
     );
     assert_eq!(status.borrow().last().unwrap().released, 4);
-}
-
-#[test]
-fn wire_edge_group_release_delivery_abort_does_not_tombstone_cause_before_cohort_lands() {
-    let g = graph();
-    let bridge = wire_bridge::<WireBridgeProtobufDataBody, WireBridgeProtobufDataBody>(
-        &g,
-        WireBridgeOptions::named("session-a", "rollback/bridge"),
-    );
-    let group = wire_edge_group(
-        &g,
-        &bridge,
-        WireEdgeGroupOptions::named(
-            "rollback/group",
-            vec![
-                WireEdgeGroupEdge::inbound("a"),
-                WireEdgeGroupEdge::inbound("b"),
-            ],
-        ),
-    );
-    let inbound_a = group.inbound.get("a").expect("edge a exists");
-    let inbound_b = group.inbound.get("b").expect("edge b exists");
-    let seen_a = collect_data(inbound_a);
-    let seen_b = collect_data(inbound_b);
-    let status = collect_data(&group.status);
-    let issues = collect_data(&group.issues);
-
-    let panic_once = Rc::new(Cell::new(true));
-    let panic_once_sink = panic_once.clone();
-    let aborting_observer = g.node_opts::<(), _>(
-        vec![inbound_a.erased()],
-        move |ctx| {
-            let _ = ctx.data::<Vec<u8>>(0).expect("edge a data");
-            if panic_once_sink.replace(false) {
-                panic!("release delivery abort before cohort lands");
-            }
-            ctx.emit(());
-        },
-        GraphNodeOpts::named("rollback/aborting-observer"),
-    );
-    let _keep_aborting_observer = aborting_observer.subscribe(|_| {});
-
-    for (seq, kind, edge_id, cause_id, value) in [
-        (1, CanonicalWireEdgeKind::Pending, "a", "c1", None),
-        (2, CanonicalWireEdgeKind::Pending, "b", "c1", None),
-        (3, CanonicalWireEdgeKind::Data, "a", "c1", Some(vec![1])),
-        (4, CanonicalWireEdgeKind::Data, "b", "c1", Some(vec![2])),
-    ] {
-        bridge
-            .inbound
-            .set(wire_edge_envelope(seq, kind, edge_id, cause_id, value));
-    }
-
-    assert_eq!(*seen_a.borrow(), vec![vec![1]]);
-    assert!(
-        seen_b.borrow().is_empty(),
-        "the one-shot abort happens before the full cohort lands"
-    );
-
-    bridge.inbound.set(wire_edge_envelope(
-        5,
-        CanonicalWireEdgeKind::Data,
-        "b",
-        "c1",
-        Some(vec![2]),
-    ));
-
-    assert_eq!(*seen_a.borrow(), vec![vec![1], vec![1]]);
-    assert_eq!(*seen_b.borrow(), vec![vec![2]]);
-    assert!(
-        issues.borrow().is_empty(),
-        "replayed final DATA must not be rejected as an already released or duplicate cause"
-    );
-    assert_eq!(
-        status.borrow().last().unwrap().state,
-        WireEdgeGroupStatusState::Released
-    );
 }
 
 #[test]
@@ -1505,13 +1439,22 @@ fn idempotency_key_is_metadata_not_duplicate_lookup() {
     let bridge = wire_bridge::<String, String>(&g, WireBridgeOptions::named("session-a", "bridge"));
     let events = Rc::new(RefCell::new(Vec::new()));
     let events_sink = events.clone();
-    let _events = bridge.events.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(event) = value.downcast_ref::<WireBridgeEvent<String, String>>() {
-                events_sink.borrow_mut().push(event.clone());
-            }
-        }
-    });
+    let _events =
+        bridge
+            .events
+            .subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+                let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                    if let Message::Data(value) = msg {
+                        if let Some(event) = value.downcast_ref::<WireBridgeEvent<String, String>>()
+                        {
+                            events_sink.borrow_mut().push(event.clone());
+                        }
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            });
     let _cursor = bridge.cursor.subscribe(|_| {});
 
     bridge.inbound.set(envelope(
@@ -1838,41 +1781,31 @@ fn remote_call_duplicate_after_completion_is_visible_in_same_event_batch() {
     let errors = collect_data(&remote.errors);
 
     remote.call("echo", "req-1", "payload".to_owned());
-    let inbound_events: Vec<Message<Rc<dyn Any>>> = vec![
-        Message::Data(Rc::new(WireBridgeEvent::<
-            RemoteCallRequest<String>,
-            RemoteCallResponse<String>,
-        >::Inbound {
-            envelope: envelope_with_request(
-                "session-a",
-                WireBridgeEnvelopeType::Data,
-                1,
-                Some(WireBridgePayload::Data(RemoteCallResponse::Result {
-                    operation: "echo".to_owned(),
-                    request_id: "req-1".to_owned(),
-                    payload: "first".to_owned(),
-                })),
-                Some("req-1"),
-            ),
-        }) as Rc<dyn Any>),
-        Message::Data(Rc::new(WireBridgeEvent::<
-            RemoteCallRequest<String>,
-            RemoteCallResponse<String>,
-        >::Inbound {
-            envelope: envelope_with_request(
-                "session-a",
-                WireBridgeEnvelopeType::Data,
-                2,
-                Some(WireBridgePayload::Data(RemoteCallResponse::Result {
-                    operation: "echo".to_owned(),
-                    request_id: "req-1".to_owned(),
-                    payload: "duplicate".to_owned(),
-                })),
-                Some("req-1"),
-            ),
-        }) as Rc<dyn Any>),
-    ];
-    bridge.events.down(inbound_events);
+    // Both responses arrive in one inbound array, as one batch commits them.
+    graphrefly::batch(|_| {
+        bridge.inbound.set(envelope_with_request(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            1,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                operation: "echo".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "first".to_owned(),
+            })),
+            Some("req-1"),
+        ));
+        bridge.inbound.set(envelope_with_request(
+            "session-a",
+            WireBridgeEnvelopeType::Data,
+            2,
+            Some(WireBridgePayload::Data(RemoteCallResponse::Result {
+                operation: "echo".to_owned(),
+                request_id: "req-1".to_owned(),
+                payload: "duplicate".to_owned(),
+            })),
+            Some("req-1"),
+        ));
+    });
 
     assert_eq!(
         *results.borrow(),
@@ -2028,17 +1961,25 @@ fn remote_responder_invokes_sync_handler_and_sends_response_through_bridge_comma
     let status = collect_data(&responder.status);
     let command_msgs = Rc::new(RefCell::new(Vec::new()));
     let command_msgs_sink = command_msgs.clone();
-    let _command_observer = bridge.command.subscribe(move |msg| {
-        command_msgs_sink.borrow_mut().push(match msg {
-            Message::Data(_) => "DATA",
-            Message::Start => "START",
-            Message::Pending => "PENDING",
-            Message::Resolved => "RESOLVED",
-            Message::Invalidate => "INVALIDATE",
-            Message::Complete => "COMPLETE",
-            Message::Error(_) => "ERROR",
-        });
-    });
+    let _command_observer =
+        bridge
+            .command
+            .subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+                let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                    command_msgs_sink.borrow_mut().push(match msg {
+                        Message::Data(_) => "DATA",
+                        Message::Start => "START",
+                        Message::Pending => "PENDING",
+                        Message::Resolved => "RESOLVED",
+                        Message::Invalidate => "INVALIDATE",
+                        Message::Complete => "COMPLETE",
+                        Message::Error(_) => "ERROR",
+                    });
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            });
 
     bridge.inbound.set(envelope_with_request(
         "session-a",

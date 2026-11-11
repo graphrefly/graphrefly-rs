@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::compound_tuple_key;
-use crate::node::Node;
+use crate::node::{Node, State};
 use crate::operators::Operator;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -395,7 +395,7 @@ impl<TCommand, TEvent> CqrsOptions<TCommand, TEvent> {
 /// `CqrsBundle` data container.
 pub struct CqrsBundle<TCommand = crate::protocol::AnyValue, TEvent = crate::protocol::AnyValue> {
     /// `command` field for command.
-    pub command: Node<CqrsCommand<TCommand>>,
+    pub command: State<CqrsCommand<TCommand>>,
     /// `runtime` field for runtime.
     pub runtime: Node<CqrsRuntimeFact<TCommand, TEvent>>,
     /// `events` field for events.
@@ -457,11 +457,10 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
     let now = opts.now;
     let dedupe = opts.dedupe;
 
-    let command = graph.init_node::<CqrsCommand<TCommand>>(
-        Operator::with_opts("cqrsCommand", no_terminal_opts(), |_| {}),
-        Vec::new(),
-        GraphNodeOpts::named(format!("{name}/command")),
-    );
+    // The command input is a state node: the host writes it (`dispatch`), and its
+    // `invalidate` clears the projections below it (graphrefly-rs:D3).
+    let command = graph
+        .state_empty_opts::<CqrsCommand<TCommand>>(GraphNodeOpts::named(format!("{name}/command")));
 
     let runtime_seed = RuntimeState::default().to_json();
     let runtime = graph.init_node::<CqrsRuntimeFact<TCommand, TEvent>>(

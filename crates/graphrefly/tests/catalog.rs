@@ -36,11 +36,16 @@ use graphrefly::{
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(v) = value.as_ref().downcast_ref::<T>() {
-                seen_sink.borrow_mut().push(v.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(v) = value.as_ref().downcast_ref::<T>() {
+                    seen_sink.borrow_mut().push(v.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -49,15 +54,20 @@ fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Ve
 fn collect_shapes<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<String>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| match msg {
-        Message::Data(value) => {
-            if value.as_ref().downcast_ref::<T>().is_some() {
-                seen_sink.borrow_mut().push("DATA".to_owned());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+            Message::Data(value) => {
+                if value.as_ref().downcast_ref::<T>().is_some() {
+                    seen_sink.borrow_mut().push("DATA".to_owned());
+                }
             }
+            Message::Complete => seen_sink.borrow_mut().push("COMPLETE".to_owned()),
+            Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
+            Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+        };
+        for msg in msgs {
+            handle(msg);
         }
-        Message::Complete => seen_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
     seen
 }
@@ -65,9 +75,14 @@ fn collect_shapes<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<
 fn collect_errors<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<String>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let seen_sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Error(error) = msg {
-            seen_sink.borrow_mut().push(error.to_string());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Error(error) = msg {
+                seen_sink.borrow_mut().push(error.to_string());
+            }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -531,6 +546,62 @@ impl<T: Unpin> Stream for VecStream<T> {
     }
 }
 
+/// A producer a test drives through its late-output handle: under the D797 rules a
+/// producer's output after its function returned is a new wave (R-wave), and the host
+/// writes only state nodes. Counts its deactivations in `cleanup`.
+#[derive(Clone)]
+struct ProducerSource {
+    node: Node<i32>,
+    out: Rc<RefCell<Option<graphrefly::DeferredCtx>>>,
+}
+
+impl ProducerSource {
+    fn with_out(&self, f: impl FnOnce(&graphrefly::DeferredCtx)) {
+        let out = self.out.borrow();
+        f(out.as_ref().expect("producer source is active"));
+    }
+
+    fn set(&self, v: i32) {
+        self.with_out(|out| out.emit(v));
+    }
+
+    fn complete(&self) {
+        self.with_out(|out| out.down(vec![Message::Complete]));
+    }
+
+    fn error(&self, e: &str) {
+        let e = e.to_owned();
+        self.with_out(move |out| out.down(vec![Message::Error(e.into())]));
+    }
+}
+
+impl std::ops::Deref for ProducerSource {
+    type Target = Node<i32>;
+
+    fn deref(&self) -> &Node<i32> {
+        &self.node
+    }
+}
+
+fn producer_source(
+    g: &graphrefly::Graph,
+    cleanup: Option<Rc<Cell<usize>>>,
+    opts: GraphNodeOpts,
+) -> ProducerSource {
+    let out: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let slot = out.clone();
+    let node = g.producer_opts(
+        move |ctx| {
+            *slot.borrow_mut() = Some(ctx.defer());
+            if let Some(cleanup) = cleanup.clone() {
+                ctx.on_deactivation(move || cleanup.set(cleanup.get() + 1));
+            }
+        },
+        opts,
+    );
+    ProducerSource { node, out }
+}
+
 #[test]
 fn source_primitives_cover_empty_never_and_throw_error() {
     let g = graph();
@@ -538,15 +609,21 @@ fn source_primitives_cover_empty_never_and_throw_error() {
     let single = g.init_node(of(7i32), vec![], GraphNodeOpts::named("of"));
     let single_events = Rc::new(RefCell::new(Vec::<String>::new()));
     let single_sink = single_events.clone();
-    let _single_sub = single.subscribe(move |msg| match msg {
-        Message::Data(value) => single_sink.borrow_mut().push(format!(
-            "DATA:{}",
-            value.as_ref().downcast_ref::<i32>().expect("of emits i32")
-        )),
-        Message::Complete => single_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-        Message::Error(_) => {}
-    });
+    let _single_sub =
+        single.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(value) => single_sink.borrow_mut().push(format!(
+                    "DATA:{}",
+                    value.as_ref().downcast_ref::<i32>().expect("of emits i32")
+                )),
+                Message::Complete => single_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+                Message::Error(_) => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
     assert_eq!(*single_events.borrow(), vec!["DATA:7", "COMPLETE"]);
     assert_eq!(single.status(), graphrefly::Status::Completed);
 
@@ -557,17 +634,22 @@ fn source_primitives_cover_empty_never_and_throw_error() {
     );
     let iter_events = Rc::new(RefCell::new(Vec::<String>::new()));
     let iter_sink = iter_events.clone();
-    let _iter_sub = iter.subscribe(move |msg| match msg {
-        Message::Data(value) => iter_sink.borrow_mut().push(format!(
-            "DATA:{}",
-            value
-                .as_ref()
-                .downcast_ref::<i32>()
-                .expect("from_iter emits i32")
-        )),
-        Message::Complete => iter_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-        Message::Error(_) => {}
+    let _iter_sub = iter.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+            Message::Data(value) => iter_sink.borrow_mut().push(format!(
+                "DATA:{}",
+                value
+                    .as_ref()
+                    .downcast_ref::<i32>()
+                    .expect("from_iter emits i32")
+            )),
+            Message::Complete => iter_sink.borrow_mut().push("COMPLETE".to_owned()),
+            Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            Message::Error(_) => {}
+        };
+        for msg in msgs {
+            handle(msg);
+        }
     });
     assert_eq!(
         *iter_events.borrow(),
@@ -590,11 +672,17 @@ fn source_primitives_cover_empty_never_and_throw_error() {
     );
     let failed_events = Rc::new(RefCell::new(Vec::<String>::new()));
     let failed_sink = failed_events.clone();
-    let _failed_sub = failed.subscribe(move |msg| {
-        if let Message::Error(error) = msg {
-            failed_sink.borrow_mut().push(format!("ERROR:{error}"));
-        }
-    });
+    let _failed_sub =
+        failed.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Error(error) = msg {
+                    failed_sink.borrow_mut().push(format!("ERROR:{error}"));
+                }
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
     assert_eq!(*failed_events.borrow(), vec!["ERROR:boom"]);
     assert_eq!(failed.status(), graphrefly::Status::Errored);
 }
@@ -969,13 +1057,19 @@ fn from_cron_emits_once_per_matching_minute_and_cleans_up_driver_interval() {
     );
     let seen = Rc::new(RefCell::new(Vec::<String>::new()));
     let seen_sink = seen.clone();
-    let unsubscribe = cron.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(tick) = value.as_ref().downcast_ref::<CronTick>() {
-                seen_sink.borrow_mut().push(tick.timestamp_ns.clone());
+    let unsubscribe =
+        cron.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Data(value) = msg {
+                    if let Some(tick) = value.as_ref().downcast_ref::<CronTick>() {
+                        seen_sink.borrow_mut().push(tick.timestamp_ns.clone());
+                    }
+                }
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-    });
+        });
 
     assert_eq!(*seen.borrow(), vec!["100".to_owned()]);
     driver.tick_intervals();
@@ -1244,13 +1338,19 @@ fn timer_and_interval_use_injected_driver_and_deactivation_cleanup() {
     let ticks = g.init_node(interval(10), vec![], GraphNodeOpts::named("interval"));
     let tick_seen = Rc::new(RefCell::new(Vec::new()));
     let tick_sink = tick_seen.clone();
-    let unsubscribe = ticks.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(v) = value.as_ref().downcast_ref::<u64>() {
-                tick_sink.borrow_mut().push(*v);
+    let unsubscribe =
+        ticks.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Data(value) = msg {
+                    if let Some(v) = value.as_ref().downcast_ref::<u64>() {
+                        tick_sink.borrow_mut().push(*v);
+                    }
+                }
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-    });
+        });
     driver.tick_intervals();
     driver.tick_intervals();
     assert_eq!(*tick_seen.borrow(), vec![0, 1]);
@@ -1275,12 +1375,18 @@ fn time_helpers_cancel_armed_clock_on_unsubscribe() {
     let timed = timeout(&src, 10);
     let timeout_seen = Rc::new(RefCell::new(Vec::<String>::new()));
     let timeout_sink = timeout_seen.clone();
-    let unsubscribe = timed.subscribe(move |msg| match msg {
-        Message::Data(_) => timeout_sink.borrow_mut().push("DATA".to_owned()),
-        Message::Complete => timeout_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => timeout_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        timed.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(_) => timeout_sink.borrow_mut().push("DATA".to_owned()),
+                Message::Complete => timeout_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => timeout_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
     assert_eq!(
         driver
             .sleepers
@@ -1308,12 +1414,18 @@ fn time_helpers_cancel_armed_clock_on_unsubscribe() {
     let buffered = buffer_time(&src, 10);
     let buffer_seen = Rc::new(RefCell::new(Vec::<String>::new()));
     let buffer_sink = buffer_seen.clone();
-    let unsubscribe = buffered.subscribe(move |msg| match msg {
-        Message::Data(_) => buffer_sink.borrow_mut().push("DATA".to_owned()),
-        Message::Complete => buffer_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => buffer_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        buffered.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(_) => buffer_sink.borrow_mut().push("DATA".to_owned()),
+                Message::Complete => buffer_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => buffer_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
     assert_eq!(
         driver
             .intervals
@@ -1509,12 +1621,18 @@ fn process_driver_cancel_suppresses_late_completion() {
     );
     let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
     let shapes_sink = shapes.clone();
-    let unsubscribe = process.subscribe(move |msg| match msg {
-        Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
-        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        process.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
+                Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
 
     unsubscribe();
     assert_eq!(driver.active_count(), 0);
@@ -1578,12 +1696,18 @@ fn http_driver_cancel_suppresses_late_completion() {
     );
     let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
     let shapes_sink = shapes.clone();
-    let unsubscribe = http.subscribe(move |msg| match msg {
-        Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
-        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        http.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
+                Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
 
     unsubscribe();
     driver.finish_next_ignoring_cancel(Ok(HttpResponse {
@@ -1778,17 +1902,23 @@ fn from_sse_http_stream_callback_can_complete_before_cancel_is_returned() {
     let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
     let seen_sink = seen.clone();
     let shapes_sink = shapes.clone();
-    let _subscription = sse.subscribe(move |msg| match msg {
-        Message::Data(value) => {
-            if let Some(event) = value.as_ref().downcast_ref::<SseEvent>() {
-                seen_sink.borrow_mut().push(event.clone());
-                shapes_sink.borrow_mut().push("DATA".to_owned());
+    let _subscription =
+        sse.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(value) => {
+                    if let Some(event) = value.as_ref().downcast_ref::<SseEvent>() {
+                        seen_sink.borrow_mut().push(event.clone());
+                        shapes_sink.borrow_mut().push("DATA".to_owned());
+                    }
+                }
+                Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+        });
 
     assert_eq!(
         canceled.get(),
@@ -2091,12 +2221,18 @@ fn from_webhook_unsubscribe_cancels_registration_and_suppresses_late_events() {
     );
     let shapes = Rc::new(RefCell::new(Vec::<String>::new()));
     let shapes_sink = shapes.clone();
-    let unsubscribe = webhook.subscribe(move |msg| match msg {
-        Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
-        Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        webhook.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(_) => shapes_sink.borrow_mut().push("DATA".to_owned()),
+                Message::Complete => shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => shapes_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
 
     unsubscribe();
     assert_eq!(driver.active_count(), 0);
@@ -2222,12 +2358,18 @@ fn local_future_and_stream_sources_cancel_spawned_work_on_unsubscribe() {
     );
     let future_shapes = Rc::new(RefCell::new(Vec::<String>::new()));
     let future_sink = future_shapes.clone();
-    let unsubscribe = future.subscribe(move |msg| match msg {
-        Message::Data(_) => future_sink.borrow_mut().push("DATA".to_owned()),
-        Message::Complete => future_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => future_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        future.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(_) => future_sink.borrow_mut().push("DATA".to_owned()),
+                Message::Complete => future_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => future_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
     assert_eq!(
         driver
             .futures
@@ -2258,12 +2400,18 @@ fn local_future_and_stream_sources_cancel_spawned_work_on_unsubscribe() {
     );
     let stream_shapes = Rc::new(RefCell::new(Vec::<String>::new()));
     let stream_sink = stream_shapes.clone();
-    let unsubscribe = stream.subscribe(move |msg| match msg {
-        Message::Data(_) => stream_sink.borrow_mut().push("DATA".to_owned()),
-        Message::Complete => stream_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => stream_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        stream.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(_) => stream_sink.borrow_mut().push("DATA".to_owned()),
+                Message::Complete => stream_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => stream_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
     assert_eq!(
         driver
             .futures
@@ -2434,7 +2582,7 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
     let _audit = g.init_node(
         audit::<i32, ()>({
             let notifier = notifier.clone();
-            move |_| notifier.clone()
+            move |_| notifier.node().clone()
         }),
         vec![alias_src.erased()],
         GraphNodeOpts::named("audit"),
@@ -2466,7 +2614,10 @@ fn throttle_waits_for_open_window_before_source_complete() {
     let seen = collect_shapes::<i32>(&throttled);
     let data = collect_data(&throttled);
 
-    src.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
+    graphrefly::batch(|_| {
+        src.set(1i32);
+        src.complete();
+    });
 
     assert_eq!(*data.borrow(), vec![1]);
     assert_eq!(
@@ -2498,20 +2649,29 @@ fn throttle_completion_window_survives_deactivation_without_resubscribing_source
 
     let first_events = Rc::new(RefCell::new(Vec::<String>::new()));
     let first_sink = first_events.clone();
-    let unsubscribe = throttled.subscribe(move |msg| match msg {
-        Message::Data(value) => first_sink.borrow_mut().push(format!(
-            "DATA:{}",
-            value
-                .as_ref()
-                .downcast_ref::<i32>()
-                .expect("throttle emits i32")
-        )),
-        Message::Complete => first_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(error) => first_sink.borrow_mut().push(format!("ERROR:{error}")),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let unsubscribe =
+        throttled.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(value) => first_sink.borrow_mut().push(format!(
+                    "DATA:{}",
+                    value
+                        .as_ref()
+                        .downcast_ref::<i32>()
+                        .expect("throttle emits i32")
+                )),
+                Message::Complete => first_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(error) => first_sink.borrow_mut().push(format!("ERROR:{error}")),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
 
-    src.down(vec![Message::Data(Rc::new(1i32)), Message::Complete]);
+    graphrefly::batch(|_| {
+        src.set(1i32);
+        src.complete();
+    });
     assert_eq!(*first_events.borrow(), vec!["DATA:1"]);
     unsubscribe();
 
@@ -2524,18 +2684,24 @@ fn throttle_completion_window_survives_deactivation_without_resubscribing_source
 
     let second_events = Rc::new(RefCell::new(Vec::<String>::new()));
     let second_sink = second_events.clone();
-    let _second = throttled.subscribe(move |msg| match msg {
-        Message::Data(value) => second_sink.borrow_mut().push(format!(
-            "DATA:{}",
-            value
-                .as_ref()
-                .downcast_ref::<i32>()
-                .expect("throttle emits i32")
-        )),
-        Message::Complete => second_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(error) => second_sink.borrow_mut().push(format!("ERROR:{error}")),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+    let _second =
+        throttled.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(value) => second_sink.borrow_mut().push(format!(
+                    "DATA:{}",
+                    value
+                        .as_ref()
+                        .downcast_ref::<i32>()
+                        .expect("throttle emits i32")
+                )),
+                Message::Complete => second_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(error) => second_sink.borrow_mut().push(format!("ERROR:{error}")),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
+            }
+        });
 
     assert!(
         second_events.borrow().is_empty(),
@@ -2567,7 +2733,7 @@ fn audit_time_flushes_pending_value_on_source_complete() {
     let data = collect_data(&audited);
 
     src.set(7);
-    src.down(vec![Message::Complete]);
+    src.complete();
 
     assert_eq!(*data.borrow(), vec![7]);
     assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
@@ -2590,7 +2756,10 @@ fn audit_flushes_same_wave_source_data_before_complete() {
     let seen = collect_shapes::<i32>(&audited);
     let data = collect_data(&audited);
 
-    src.down(vec![Message::Data(Rc::new(9i32)), Message::Complete]);
+    graphrefly::batch(|_| {
+        src.set(9i32);
+        src.complete();
+    });
 
     assert_eq!(*data.borrow(), vec![9]);
     assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
@@ -2604,7 +2773,7 @@ fn audit_same_wave_notifier_close_uses_pre_wave_latest() {
     let audited = g.init_node(
         audit::<i32, ()>({
             let notifier = notifier.clone();
-            move |_| notifier.clone()
+            move |_| notifier.node().clone()
         }),
         vec![src.erased()],
         GraphNodeOpts::named("audit_same_wave_close"),
@@ -2638,9 +2807,9 @@ fn audit_same_wave_reopen_only_suppresses_the_closed_notifier() {
             let ready_notifier = ready_notifier.clone();
             move |v| {
                 if *v == 1 {
-                    old_notifier.clone()
+                    old_notifier.node().clone()
                 } else {
-                    ready_notifier.clone()
+                    ready_notifier.node().clone()
                 }
             }
         }),
@@ -2672,7 +2841,7 @@ fn audit_selector_panic_errors_and_seals_output() {
             let notifier = notifier.clone();
             move |v| {
                 assert!(*v != 2, "audit selector boom");
-                notifier.clone()
+                notifier.node().clone()
             }
         }),
         vec![src.erased()],
@@ -2732,7 +2901,10 @@ fn timeout_arms_on_subscribe_resets_and_cleans_up() {
     let src = g.state_empty::<i32>();
     let completing = timeout(&src, 10);
     let completing_seen = collect_shapes::<i32>(&completing);
-    src.down(vec![Message::Data(Rc::new(3i32)), Message::Complete]);
+    graphrefly::batch(|_| {
+        src.set(3i32);
+        src.complete();
+    });
     assert_eq!(*completing_seen.borrow(), vec!["DATA", "COMPLETE"]);
     driver.fire_sleepers();
     assert_eq!(
@@ -2788,7 +2960,7 @@ fn timeout_propagates_source_error_and_missing_driver_error() {
     let timed = timeout(&src, 10);
     let seen = collect_shapes::<i32>(&timed);
 
-    src.down(vec![Message::Error("source failed".into())]);
+    src.error("source failed");
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
     driver.fire_sleepers();
     assert_eq!(
@@ -2823,10 +2995,10 @@ fn timeout_same_wave_data_then_error_forwards_data_then_error_and_clears_timer()
     let seen = collect_shapes::<i32>(&timed);
     let data = collect_data(&timed);
 
-    src.down(vec![
-        Message::Data(Rc::new(7i32)),
-        Message::Error("source failed".into()),
-    ]);
+    graphrefly::batch(|_| {
+        src.set(7i32);
+        src.error("source failed");
+    });
 
     assert_eq!(*data.borrow(), vec![7]);
     assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
@@ -2865,7 +3037,10 @@ fn buffer_time_flushes_empty_windows_values_and_terminal_remainder() {
     driver.tick_intervals();
     assert_eq!(*data.borrow(), vec![Vec::<i32>::new(), vec![1, 2]]);
 
-    src.down(vec![Message::Data(Rc::new(3i32)), Message::Complete]);
+    graphrefly::batch(|_| {
+        src.set(3i32);
+        src.complete();
+    });
     assert_eq!(*data.borrow(), vec![Vec::<i32>::new(), vec![1, 2], vec![3]]);
     assert_eq!(*seen.borrow(), vec!["DATA", "DATA", "DATA", "COMPLETE"]);
     driver.tick_intervals();
@@ -2920,7 +3095,7 @@ fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
     let buffered = buffer_time(&src, 10);
     let seen = collect_shapes::<Vec<i32>>(&buffered);
 
-    src.down(vec![Message::Error("source failed".into())]);
+    src.error("source failed");
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
     driver.tick_intervals();
     assert_eq!(*seen.borrow(), vec!["ERROR"]);
@@ -2982,7 +3157,10 @@ fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
     let delayed_seen = collect_shapes::<i32>(&delayed);
     let delayed_data = collect_data(&delayed);
 
-    src.down(vec![Message::Data(Rc::new(7i32)), Message::Complete]);
+    graphrefly::batch(|_| {
+        src.set(7i32);
+        src.complete();
+    });
     assert!(delayed_seen.borrow().is_empty());
     driver.fire_sleepers();
     assert_eq!(*delayed_data.borrow(), vec![7]);
@@ -2993,10 +3171,10 @@ fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
     let buffered_seen = collect_shapes::<Vec<i32>>(&buffered);
     let buffered_data = collect_data(&buffered);
 
-    src.down(vec![
-        Message::Data(Rc::new(9i32)),
-        Message::Error("source failed".into()),
-    ]);
+    graphrefly::batch(|_| {
+        src.set(9i32);
+        src.error("source failed");
+    });
 
     assert_eq!(
         *buffered_data.borrow(),
@@ -3091,14 +3269,19 @@ fn tap_callback_panic_becomes_error_and_seals_output() {
     );
     let events = Rc::new(RefCell::new(Vec::<String>::new()));
     let sink = events.clone();
-    let _sub = tapped.subscribe(move |msg| match msg {
-        Message::Data(value) => sink.borrow_mut().push(format!(
-            "DATA:{}",
-            value.as_ref().downcast_ref::<i32>().expect("tap emits i32")
-        )),
-        Message::Error(error) => sink.borrow_mut().push(format!("ERROR:{error}")),
-        Message::Complete => sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+    let _sub = tapped.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+            Message::Data(value) => sink.borrow_mut().push(format!(
+                "DATA:{}",
+                value.as_ref().downcast_ref::<i32>().expect("tap emits i32")
+            )),
+            Message::Error(error) => sink.borrow_mut().push(format!("ERROR:{error}")),
+            Message::Complete => sink.borrow_mut().push("COMPLETE".to_owned()),
+            Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+        };
+        for msg in msgs {
+            handle(msg);
+        }
     });
 
     assert_eq!(
@@ -3107,8 +3290,8 @@ fn tap_callback_panic_becomes_error_and_seals_output() {
             .iter()
             .map(|event| event.split(':').next().unwrap().to_owned())
             .collect::<Vec<_>>(),
-        vec!["DATA", "ERROR"],
-        "D30 graph-layer catch should convert tap callback panic into terminal ERROR"
+        vec!["ERROR"],
+        "a panicking callback is the node's ERROR; what the run sent before it is dropped (R-failure)"
     );
     assert_eq!(tapped.status(), graphrefly::Status::Errored);
 }
@@ -3302,7 +3485,7 @@ fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
         GraphNodeOpts::named("catch_error"),
     );
     let recovered_seen = collect_data(&recovered);
-    source.down(vec![Message::Error("boom".into())]);
+    source.error("boom");
     assert_eq!(*recovered_seen.borrow(), vec![1, 42]);
     assert_ne!(recovered.status(), graphrefly::Status::Completed);
     assert_ne!(recovered.status(), graphrefly::Status::Errored);
@@ -3356,17 +3539,23 @@ fn scan_and_merge_catalog_symbols_are_directly_pinned() {
     let scan_shapes = Rc::new(RefCell::new(Vec::<String>::new()));
     let scan_data_sink = scan_data.clone();
     let scan_shapes_sink = scan_shapes.clone();
-    let _scan_keep = scanned.subscribe(move |msg| match msg {
-        Message::Data(value) => {
-            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
-                scan_data_sink.borrow_mut().push(*v);
-                scan_shapes_sink.borrow_mut().push("DATA".to_owned());
+    let _scan_keep =
+        scanned.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(value) => {
+                    if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                        scan_data_sink.borrow_mut().push(*v);
+                        scan_shapes_sink.borrow_mut().push("DATA".to_owned());
+                    }
+                }
+                Message::Complete => scan_shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
+                Message::Error(_) => scan_shapes_sink.borrow_mut().push("ERROR".to_owned()),
+                Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-        Message::Complete => scan_shapes_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => scan_shapes_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
-    });
+        });
     assert_eq!(*scan_data.borrow(), vec![1, 3, 6]);
     assert_eq!(
         *scan_shapes.borrow(),
@@ -3415,10 +3604,10 @@ fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
     let recovered_seen = collect_data(&recovered);
     let recovered_shapes = collect_shapes::<i32>(&recovered);
 
-    source.down(vec![
-        Message::Data(Rc::new(7i32)),
-        Message::Error("boom".into()),
-    ]);
+    graphrefly::batch(|_| {
+        source.set(7i32);
+        source.error("boom");
+    });
 
     assert_eq!(*recovered_seen.borrow(), vec![7, 42]);
     assert_eq!(*recovered_shapes.borrow(), vec!["DATA", "DATA"]);
@@ -3433,7 +3622,7 @@ fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
     );
     let shapes = collect_shapes::<i32>(&recovered);
 
-    source.down(vec![Message::Error("boom".into())]);
+    source.error("boom");
 
     assert_eq!(*shapes.borrow(), vec!["ERROR"]);
     assert_eq!(recovered.status(), graphrefly::Status::Errored);
@@ -3480,7 +3669,7 @@ fn side_effect_error_and_gate_operators_are_graph_visible() {
         GraphNodeOpts::named("rescue"),
     );
     let recovered_seen = collect_data(&recovered);
-    source.down(vec![Message::Error("boom".into())]);
+    source.error("boom");
     assert_eq!(*recovered_seen.borrow(), vec![1, 99]);
     assert_ne!(recovered.status(), graphrefly::Status::Completed);
     assert_ne!(recovered.status(), graphrefly::Status::Errored);
@@ -3641,7 +3830,7 @@ fn notifier_combinators_and_race_follow_static_edges() {
     source.set(2);
     notifier.set(());
     source.set(3);
-    source.down(vec![Message::Complete]);
+    source.complete();
     assert_eq!(*buffer_seen.borrow(), vec![vec![1, 2], vec![3]]);
 
     let src = g.init_node(
@@ -3678,8 +3867,8 @@ fn notifier_combinators_and_race_follow_static_edges() {
     );
     let sample_shapes = collect_shapes::<i32>(&sampled);
     batch(|_| {
-        source.down(vec![Message::Complete]);
-        notifier.down(vec![Message::Error("sample notifier failed".into())]);
+        source.complete();
+        notifier.error("sample notifier failed");
     });
     assert_eq!(*sample_shapes.borrow(), vec!["ERROR"]);
 
@@ -3725,7 +3914,10 @@ fn batched_notifier_and_control_ordering_is_pinned() {
     let buffer_seen = collect_data(&buffered);
     batch(|_| {
         source.set(4);
-        notifier.down(vec![Message::Data(Rc::new(())), Message::Data(Rc::new(()))]);
+        graphrefly::batch(|_| {
+            notifier.set(());
+            notifier.set(());
+        });
     });
     assert_eq!(
         *buffer_seen.borrow(),
@@ -3835,9 +4027,11 @@ fn existing_core_catalog_still_composes_after_widening() {
         vec![src.erased()],
         GraphNodeOpts::named("settle"),
     );
+    // from_iter sends its values in one array, so settle sees one wave of three
+    // occurrences and then the source's COMPLETE.
     assert_eq!(
         *collect_shapes::<i32>(&settled).borrow(),
-        vec!["DATA", "DATA", "COMPLETE"]
+        vec!["DATA", "DATA", "DATA", "COMPLETE"]
     );
 
     let src = g.init_node(
@@ -3884,16 +4078,21 @@ fn higher_order_repeat_replays_fresh_factory_rounds_and_completes() {
     let data = Rc::new(RefCell::new(Vec::<i32>::new()));
     let seen_sink = seen.clone();
     let data_sink = data.clone();
-    let _keep = repeated.subscribe(move |msg| match msg {
-        Message::Data(value) => {
-            if let Some(v) = value.as_ref().downcast_ref::<i32>() {
-                data_sink.borrow_mut().push(*v);
-                seen_sink.borrow_mut().push("DATA".to_owned());
+    let _keep = repeated.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+            Message::Data(value) => {
+                if let Some(v) = value.as_ref().downcast_ref::<i32>() {
+                    data_sink.borrow_mut().push(*v);
+                    seen_sink.borrow_mut().push("DATA".to_owned());
+                }
             }
+            Message::Complete => seen_sink.borrow_mut().push("COMPLETE".to_owned()),
+            Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
+            Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
+        };
+        for msg in msgs {
+            handle(msg);
         }
-        Message::Complete => seen_sink.borrow_mut().push("COMPLETE".to_owned()),
-        Message::Error(_) => seen_sink.borrow_mut().push("ERROR".to_owned()),
-        Message::Start | Message::Pending | Message::Resolved | Message::Invalidate => {}
     });
 
     assert_eq!(*data.borrow(), vec![10, 11, 20, 21, 30, 31]);
@@ -3928,7 +4127,7 @@ fn higher_order_repeat_rejects_zero_count() {
 fn higher_order_repeat_inner_error_detaches_and_seals_output() {
     let g = graph();
     let cleanup = Rc::new(Cell::new(0usize));
-    let inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let inners = Rc::new(RefCell::new(Vec::<ProducerSource>::new()));
     let repeated = g.init_node(
         repeat::<i32>(
             {
@@ -3937,14 +4136,10 @@ fn higher_order_repeat_inner_error_detaches_and_seals_output() {
                 let inners = inners.clone();
                 move || {
                     let cleanup = cleanup.clone();
-                    let inner = g.producer(move |ctx| {
-                        ctx.on_deactivation({
-                            let cleanup = cleanup.clone();
-                            move || cleanup.set(cleanup.get() + 1)
-                        });
-                    });
+                    let inner =
+                        producer_source(&g, Some(cleanup.clone()), GraphNodeOpts::default());
                     inners.borrow_mut().push(inner.clone());
-                    inner
+                    inner.node.clone()
                 }
             },
             2,
@@ -3955,15 +4150,15 @@ fn higher_order_repeat_inner_error_detaches_and_seals_output() {
     let shapes = collect_shapes::<i32>(&repeated);
 
     assert_eq!(inners.borrow().len(), 1);
-    inners.borrow()[0].down(vec![Message::Data(Rc::new(1i32))]);
-    inners.borrow()[0].down(vec![Message::Error("inner boom".into())]);
+    inners.borrow()[0].set(1i32);
+    inners.borrow()[0].error("inner boom");
 
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
     assert_eq!(cleanup.get(), 1, "inner ERROR should detach the live round");
     assert_eq!(repeated.status(), graphrefly::Status::Errored);
 
     let after_error = shapes.borrow().len();
-    inners.borrow()[0].down(vec![Message::Data(Rc::new(2i32))]);
+    inners.borrow()[0].set(2i32);
     assert_eq!(
         shapes.borrow().len(),
         after_error,
@@ -4006,7 +4201,7 @@ fn higher_order_repeat_factory_panic_errors_after_cleaning_completed_round() {
 #[test]
 fn higher_order_repeat_live_inner_is_described_and_replaced_per_round() {
     let g = graph();
-    let inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let inners = Rc::new(RefCell::new(Vec::<ProducerSource>::new()));
     let repeated = g.init_node(
         repeat::<i32>(
             {
@@ -4014,10 +4209,13 @@ fn higher_order_repeat_live_inner_is_described_and_replaced_per_round() {
                 let inners = inners.clone();
                 move || {
                     let next = inners.borrow().len() + 1;
-                    let inner = g
-                        .producer_opts(|_| {}, GraphNodeOpts::named(format!("repeat_live_{next}")));
+                    let inner = producer_source(
+                        &g,
+                        None,
+                        GraphNodeOpts::named(format!("repeat_live_{next}")),
+                    );
                     inners.borrow_mut().push(inner.clone());
-                    inner
+                    inner.node.clone()
                 }
             },
             2,
@@ -4035,7 +4233,7 @@ fn higher_order_repeat_live_inner_is_described_and_replaced_per_round() {
         .any(|e| e.from == "repeat_live_1" && e.to == "repeat_live"));
 
     let first_inner = inners.borrow()[0].clone();
-    first_inner.down(vec![Message::Complete]);
+    first_inner.complete();
     let snap = g.describe();
     assert!(snap.nodes.iter().any(|n| n.id == "repeat_live_2"));
     assert!(snap
@@ -4084,7 +4282,7 @@ fn higher_order_switch_and_exhaust_use_visible_rewire_deps() {
     );
 
     let exhaust_source = g.state(1i32);
-    let exhaust_inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let exhaust_inners = Rc::new(RefCell::new(Vec::<graphrefly::State<i32>>::new()));
     let exhausted = g.init_node(
         exhaust_map::<i32, i32>({
             let g = g.clone();
@@ -4092,7 +4290,7 @@ fn higher_order_switch_and_exhaust_use_visible_rewire_deps() {
             move |v| {
                 let inner = g.state(*v * 10);
                 exhaust_inners.borrow_mut().push(inner.clone());
-                inner
+                inner.node().clone()
             }
         }),
         vec![exhaust_source.erased()],
@@ -4107,7 +4305,7 @@ fn higher_order_switch_and_exhaust_use_visible_rewire_deps() {
         "exhaust_map ignores source DATA while an inner is live"
     );
     assert_eq!(*exhaust_seen.borrow(), vec![10]);
-    exhaust_inners.borrow()[0].down(vec![Message::Complete]);
+    exhaust_inners.borrow()[0].complete();
     exhaust_source.set(3);
     assert_eq!(*exhaust_seen.borrow(), vec![10, 30]);
 
@@ -4130,7 +4328,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
         vec![],
         GraphNodeOpts::named("merge_outer"),
     );
-    let merge_inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let merge_inners = Rc::new(RefCell::new(Vec::<graphrefly::State<i32>>::new()));
     let merged = g.init_node(
         merge_map::<i32, i32>({
             let g = g.clone();
@@ -4138,7 +4336,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
             move |v| {
                 let inner = g.state(*v * 10);
                 merge_inners.borrow_mut().push(inner.clone());
-                inner
+                inner.node().clone()
             }
         }),
         vec![merge_source.erased()],
@@ -4157,7 +4355,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
         vec![],
         GraphNodeOpts::named("concat_outer"),
     );
-    let concat_inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let concat_inners = Rc::new(RefCell::new(Vec::<graphrefly::State<i32>>::new()));
     let concatted = g.init_node(
         concat_map::<i32, i32>({
             let g = g.clone();
@@ -4165,7 +4363,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
             move |v| {
                 let inner = g.state(*v * 10);
                 concat_inners.borrow_mut().push(inner.clone());
-                inner
+                inner.node().clone()
             }
         }),
         vec![concat_source.erased()],
@@ -4179,10 +4377,10 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
         "concat_map projects the next queued inner only after the live one completes"
     );
     let concat_inner_0 = concat_inners.borrow()[0].clone();
-    concat_inner_0.down(vec![Message::Complete]);
+    concat_inner_0.complete();
     assert_eq!(*concat_shapes.borrow(), vec!["DATA", "DATA"]);
     let concat_inner_1 = concat_inners.borrow()[1].clone();
-    concat_inner_1.down(vec![Message::Complete]);
+    concat_inner_1.complete();
     assert_eq!(*concat_shapes.borrow(), vec!["DATA", "DATA", "COMPLETE"]);
 
     let flat_source = g.init_node(
@@ -4193,7 +4391,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
     let flattened = g.init_node(
         flat_map::<i32, i32>({
             let g = g.clone();
-            move |v| g.state(*v * 10)
+            move |v| g.state(*v * 10).into_node()
         }),
         vec![flat_source.erased()],
         GraphNodeOpts::named("flat_map"),
@@ -4215,7 +4413,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
 fn higher_order_merge_map_with_options_limits_live_inners() {
     let g = graph();
     let source = g.state_empty::<i32>();
-    let inners = Rc::new(RefCell::new(Vec::<Node<i32>>::new()));
+    let inners = Rc::new(RefCell::new(Vec::<graphrefly::State<i32>>::new()));
     let merged = g.init_node(
         merge_map_with_options::<i32, i32>(
             {
@@ -4224,7 +4422,7 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
                 move |_v| {
                     let inner = g.state_empty::<i32>();
                     inners.borrow_mut().push(inner.clone());
-                    inner
+                    inner.node().clone()
                 }
             },
             MergeMapOptions {
@@ -4236,12 +4434,12 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
     );
     let seen = collect_data(&merged);
 
-    source.down(vec![
-        Message::Data(Rc::new(1i32)),
-        Message::Data(Rc::new(2i32)),
-        Message::Data(Rc::new(3i32)),
-        Message::Complete,
-    ]);
+    graphrefly::batch(|_| {
+        source.set(1i32);
+        source.set(2i32);
+        source.set(3i32);
+        source.complete();
+    });
     assert_eq!(
         inners.borrow().len(),
         2,
@@ -4254,7 +4452,7 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
     assert_eq!(*seen.borrow(), vec![10, 20]);
     assert_ne!(merged.status(), graphrefly::Status::Completed);
 
-    inner_0.down(vec![Message::Complete]);
+    inner_0.complete();
     assert_eq!(
         inners.borrow().len(),
         3,
@@ -4263,8 +4461,8 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
     let inner_2 = inners.borrow()[2].clone();
     inner_2.set(30);
     assert_eq!(*seen.borrow(), vec![10, 20, 30]);
-    inner_1.down(vec![Message::Complete]);
-    inner_2.down(vec![Message::Complete]);
+    inner_1.complete();
+    inner_2.complete();
     assert_eq!(merged.status(), graphrefly::Status::Completed);
 }
 
@@ -4277,7 +4475,7 @@ fn higher_order_merge_map_with_options_skips_just_completed_reused_inner() {
         merge_map_with_options::<i32, i32>(
             {
                 let inner = inner.clone();
-                move |_v| inner.clone()
+                move |_v| inner.node().clone()
             },
             MergeMapOptions {
                 concurrent: Some(1),
@@ -4288,16 +4486,16 @@ fn higher_order_merge_map_with_options_skips_just_completed_reused_inner() {
     );
     let seen = collect_data(&merged);
 
-    source.down(vec![
-        Message::Data(Rc::new(1i32)),
-        Message::Data(Rc::new(2i32)),
-        Message::Complete,
-    ]);
+    graphrefly::batch(|_| {
+        source.set(1i32);
+        source.set(2i32);
+        source.complete();
+    });
     inner.set(10);
     assert_eq!(*seen.borrow(), vec![10]);
     assert_ne!(merged.status(), graphrefly::Status::Completed);
 
-    inner.down(vec![Message::Complete]);
+    inner.complete();
     assert_eq!(merged.status(), graphrefly::Status::Completed);
 }
 
@@ -4309,7 +4507,7 @@ fn higher_order_merge_map_dedupes_reused_live_inner() {
     let merged = g.init_node(
         merge_map::<i32, i32>({
             let shared = shared.clone();
-            move |_| shared.clone()
+            move |_| shared.node().clone()
         }),
         vec![source.erased()],
         GraphNodeOpts::named("merge_reused_inner"),
@@ -4317,13 +4515,13 @@ fn higher_order_merge_map_dedupes_reused_live_inner() {
     let shapes = collect_shapes::<i32>(&merged);
     let data = collect_data(&merged);
 
-    source.down(vec![
-        Message::Data(Rc::new(1i32)),
-        Message::Data(Rc::new(2i32)),
-        Message::Complete,
-    ]);
+    graphrefly::batch(|_| {
+        source.set(1i32);
+        source.set(2i32);
+        source.complete();
+    });
     shared.set(10);
-    shared.down(vec![Message::Complete]);
+    shared.complete();
 
     assert_eq!(*data.borrow(), vec![10]);
     assert_eq!(
@@ -4338,19 +4536,11 @@ fn higher_order_switch_map_dedupes_reused_live_inner() {
     let g = graph();
     let source = g.state_empty::<i32>();
     let cleanup = Rc::new(Cell::new(0usize));
-    let shared = g.producer({
-        let cleanup = cleanup.clone();
-        move |ctx| {
-            ctx.on_deactivation({
-                let cleanup = cleanup.clone();
-                move || cleanup.set(cleanup.get() + 1)
-            });
-        }
-    });
+    let shared = producer_source(&g, Some(cleanup.clone()), GraphNodeOpts::default());
     let switched = g.init_node(
         switch_map::<i32, i32>({
             let shared = shared.clone();
-            move |_| shared.clone()
+            move |_| shared.node.clone()
         }),
         vec![source.erased()],
         GraphNodeOpts::named("switch_reused_inner"),
@@ -4358,10 +4548,13 @@ fn higher_order_switch_map_dedupes_reused_live_inner() {
     let shapes = collect_shapes::<i32>(&switched);
     let data = collect_data(&switched);
 
-    source.down(vec![Message::Data(Rc::new(1i32))]);
-    source.down(vec![Message::Data(Rc::new(2i32)), Message::Complete]);
+    source.set(1i32);
+    graphrefly::batch(|_| {
+        source.set(2i32);
+        source.complete();
+    });
     shared.set(10);
-    shared.down(vec![Message::Complete]);
+    shared.complete();
 
     assert_eq!(*data.borrow(), vec![10]);
     assert_eq!(
@@ -4383,33 +4576,17 @@ fn higher_order_error_paths_detach_live_inners_and_seal_output() {
     let source = g.state_empty::<i32>();
     let cleanup_a = Rc::new(Cell::new(0usize));
     let cleanup_b = Rc::new(Cell::new(0usize));
-    let inner_a = g.producer({
-        let cleanup_a = cleanup_a.clone();
-        move |ctx| {
-            ctx.on_deactivation({
-                let cleanup_a = cleanup_a.clone();
-                move || cleanup_a.set(cleanup_a.get() + 1)
-            });
-        }
-    });
-    let inner_b = g.producer({
-        let cleanup_b = cleanup_b.clone();
-        move |ctx| {
-            ctx.on_deactivation({
-                let cleanup_b = cleanup_b.clone();
-                move || cleanup_b.set(cleanup_b.get() + 1)
-            });
-        }
-    });
+    let inner_a = producer_source(&g, Some(cleanup_a.clone()), GraphNodeOpts::default());
+    let inner_b = producer_source(&g, Some(cleanup_b.clone()), GraphNodeOpts::default());
     let merged = g.init_node(
         merge_map::<i32, i32>({
             let inner_a = inner_a.clone();
             let inner_b = inner_b.clone();
             move |v| {
                 if *v == 1 {
-                    inner_a.clone()
+                    inner_a.node.clone()
                 } else {
-                    inner_b.clone()
+                    inner_b.node.clone()
                 }
             }
         }),
@@ -4418,10 +4595,10 @@ fn higher_order_error_paths_detach_live_inners_and_seal_output() {
     );
     let shapes = collect_shapes::<i32>(&merged);
 
-    source.down(vec![Message::Data(Rc::new(1i32))]);
-    source.down(vec![Message::Data(Rc::new(2i32))]);
-    inner_a.down(vec![Message::Data(Rc::new(10i32))]);
-    source.down(vec![Message::Error("source boom".into())]);
+    source.set(1i32);
+    source.set(2i32);
+    inner_a.set(10i32);
+    source.error("source boom");
 
     assert_eq!(merged.status(), graphrefly::Status::Errored);
     assert_eq!(cleanup_a.get(), 1, "source ERROR should detach inner A");
@@ -4429,9 +4606,9 @@ fn higher_order_error_paths_detach_live_inners_and_seal_output() {
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
 
     let after_error = shapes.borrow().len();
-    inner_a.down(vec![Message::Data(Rc::new(11i32))]);
-    inner_b.down(vec![Message::Data(Rc::new(20i32))]);
-    source.down(vec![Message::Data(Rc::new(3i32))]);
+    inner_a.set(11i32);
+    inner_b.set(20i32);
+    source.set(3i32);
     assert_eq!(
         shapes.borrow().len(),
         after_error,
@@ -4445,21 +4622,13 @@ fn higher_order_projector_panic_cleans_live_inners() {
 
     let source = g.state_empty::<i32>();
     let cleanup = Rc::new(Cell::new(0usize));
-    let inner = g.producer({
-        let cleanup = cleanup.clone();
-        move |ctx| {
-            ctx.on_deactivation({
-                let cleanup = cleanup.clone();
-                move || cleanup.set(cleanup.get() + 1)
-            });
-        }
-    });
+    let inner = producer_source(&g, Some(cleanup.clone()), GraphNodeOpts::default());
     let merged = g.init_node(
         merge_map::<i32, i32>({
             let inner = inner.clone();
             move |v| {
                 assert!(*v != 2, "projector boom");
-                inner.clone()
+                inner.node.clone()
             }
         }),
         vec![source.erased()],
@@ -4467,17 +4636,17 @@ fn higher_order_projector_panic_cleans_live_inners() {
     );
     let shapes = collect_shapes::<i32>(&merged);
 
-    source.down(vec![Message::Data(Rc::new(1i32))]);
-    inner.down(vec![Message::Data(Rc::new(10i32))]);
-    source.down(vec![Message::Data(Rc::new(2i32))]);
+    source.set(1i32);
+    inner.set(10i32);
+    source.set(2i32);
 
     assert_eq!(merged.status(), graphrefly::Status::Errored);
     assert_eq!(cleanup.get(), 1, "projector panic should detach live inner");
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
 
     let after_error = shapes.borrow().len();
-    inner.down(vec![Message::Data(Rc::new(11i32))]);
-    source.down(vec![Message::Data(Rc::new(3i32))]);
+    inner.set(11i32);
+    source.set(3i32);
     assert_eq!(
         shapes.borrow().len(),
         after_error,
@@ -4491,21 +4660,13 @@ fn higher_order_switch_projector_panic_detaches_previous_inner() {
 
     let source = g.state_empty::<i32>();
     let cleanup = Rc::new(Cell::new(0usize));
-    let inner = g.producer({
-        let cleanup = cleanup.clone();
-        move |ctx| {
-            ctx.on_deactivation({
-                let cleanup = cleanup.clone();
-                move || cleanup.set(cleanup.get() + 1)
-            });
-        }
-    });
+    let inner = producer_source(&g, Some(cleanup.clone()), GraphNodeOpts::default());
     let switched = g.init_node(
         switch_map::<i32, i32>({
             let inner = inner.clone();
             move |v| {
                 assert!(*v != 2, "switch projector boom");
-                inner.clone()
+                inner.node.clone()
             }
         }),
         vec![source.erased()],
@@ -4513,9 +4674,9 @@ fn higher_order_switch_projector_panic_detaches_previous_inner() {
     );
     let shapes = collect_shapes::<i32>(&switched);
 
-    source.down(vec![Message::Data(Rc::new(1i32))]);
-    inner.down(vec![Message::Data(Rc::new(10i32))]);
-    source.down(vec![Message::Data(Rc::new(2i32))]);
+    source.set(1i32);
+    inner.set(10i32);
+    source.set(2i32);
 
     assert_eq!(switched.status(), graphrefly::Status::Errored);
     assert_eq!(
@@ -4526,8 +4687,8 @@ fn higher_order_switch_projector_panic_detaches_previous_inner() {
     assert_eq!(*shapes.borrow(), vec!["DATA", "ERROR"]);
 
     let after_error = shapes.borrow().len();
-    inner.down(vec![Message::Data(Rc::new(11i32))]);
-    source.down(vec![Message::Data(Rc::new(3i32))]);
+    inner.set(11i32);
+    source.set(3i32);
     assert_eq!(
         shapes.borrow().len(),
         after_error,

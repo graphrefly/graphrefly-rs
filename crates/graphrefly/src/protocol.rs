@@ -100,10 +100,11 @@ impl<T> Message<T> {
         matches!(self, Message::Complete | Message::Error(_))
     }
 
-    /// Whether only the kernel may send this message (PENDING and RESOLVED, R-wave).
+    /// Whether only the kernel may send this message: START (R-subscription), PENDING
+    /// and RESOLVED (R-wave).
     #[inline]
     pub fn is_kernel_only(&self) -> bool {
-        matches!(self, Message::Pending | Message::Resolved)
+        matches!(self, Message::Start | Message::Pending | Message::Resolved)
     }
 }
 
@@ -124,16 +125,17 @@ impl<T> std::fmt::Debug for Message<T> {
 /// One array of messages delivered by one call (R-wave).
 pub type Wave<T> = Vec<Message<T>>;
 
-/// Rejects node output that only the kernel may send (R-wave, R-failure).
+/// Rejects node output that only the kernel may send (R-wave, R-subscription,
+/// R-failure).
 ///
-/// PENDING and RESOLVED are the kernel's alone; an array carrying either is
-/// rejected before anything of it is applied. The rejection panics, the Rust
+/// START, PENDING and RESOLVED are the kernel's alone (graphrefly:D801 for START); an
+/// array carrying any of them is rejected before anything of it is applied. The rejection panics, the Rust
 /// form of a throw from `ctx.down`: uncaught, it becomes the node's ERROR at
 /// the wave boundary.
 pub(crate) fn reject_kernel_only_output<T>(msgs: &[Message<T>]) {
     if let Some(m) = msgs.iter().find(|m| m.is_kernel_only()) {
         panic!(
-            "node output may not contain {m:?}: PENDING and RESOLVED are sent only by the kernel (R-wave)"
+            "node output may not contain {m:?}: START, PENDING and RESOLVED are sent only by the kernel (R-subscription, R-wave)"
         );
     }
 }
@@ -153,9 +155,10 @@ mod tests {
         assert_eq!(Message::<i32>::Complete.class_rank(), 4);
     }
 
-    // R-wave: PENDING and RESOLVED are kernel-only.
+    // R-subscription, R-wave: START, PENDING and RESOLVED are kernel-only.
     #[test]
     fn kernel_only_messages_are_pending_and_resolved() {
+        assert!(Message::<i32>::Start.is_kernel_only());
         assert!(Message::<i32>::Pending.is_kernel_only());
         assert!(Message::<i32>::Resolved.is_kernel_only());
         assert!(!Message::Data(1).is_kernel_only());

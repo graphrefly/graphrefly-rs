@@ -42,11 +42,16 @@ use std::time::Duration;
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Rc<RefCell<Vec<T>>> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let sink = seen.clone();
-    let _keep = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                sink.borrow_mut().push(value.clone());
+    let _keep = node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+        let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+            if let Message::Data(value) = msg {
+                if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                    sink.borrow_mut().push(value.clone());
+                }
             }
+        };
+        for msg in msgs {
+            handle(msg);
         }
     });
     seen
@@ -372,7 +377,7 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
     let graph_projection = knowledge_graph_reducer_bundle(
         &g,
         KnowledgeGraphReducerBundleOptions::new(kg.assertions.clone())
-            .with_policy(kg_policy)
+            .with_policy(kg_policy.node().clone())
             .named("knowledgeGraph"),
     );
 
@@ -414,7 +419,7 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
         &g,
         AgenticMemoryConsolidationBundleOptions::new(
             retention.consolidation_requests.clone(),
-            consolidation_outcomes,
+            consolidation_outcomes.node().clone(),
         )
         .named("consolidation"),
     );
@@ -571,15 +576,21 @@ fn public_crate_root_b72_sources_io_and_resilience_acceptance() {
     let completed = Rc::new(Cell::new(false));
     let events_sink = events.clone();
     let completed_sink = completed.clone();
-    let unsubscribe_sse = sse.subscribe(move |msg| match msg {
-        Message::Data(value) => {
-            if let Some(event) = value.as_ref().downcast_ref::<SseEvent>() {
-                events_sink.borrow_mut().push(event.clone());
+    let unsubscribe_sse =
+        sse.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| match msg {
+                Message::Data(value) => {
+                    if let Some(event) = value.as_ref().downcast_ref::<SseEvent>() {
+                        events_sink.borrow_mut().push(event.clone());
+                    }
+                }
+                Message::Complete => completed_sink.set(true),
+                _ => {}
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-        Message::Complete => completed_sink.set(true),
-        _ => {}
-    });
+        });
 
     assert_eq!(http_stream_driver.request().method, "GET");
     assert_eq!(
@@ -642,18 +653,24 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     let source = g.state_opts(1_i32, GraphNodeOpts::named("acceptance/source"));
     let before_pipe = g.describe();
 
-    let doubled = pipe(&g, source.clone())
+    let doubled = pipe(&g, source.node().clone())
         .through(map::<i32, i32>(|value| value * 2))
         .done();
     let doubled_values = Rc::new(RefCell::new(Vec::new()));
     let doubled_sink = doubled_values.clone();
-    let unsubscribe_doubled = doubled.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<i32>() {
-                doubled_sink.borrow_mut().push(*value);
+    let unsubscribe_doubled =
+        doubled.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Data(value) = msg {
+                    if let Some(value) = value.as_ref().downcast_ref::<i32>() {
+                        doubled_sink.borrow_mut().push(*value);
+                    }
+                }
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-    });
+        });
     source.set(2);
 
     assert_eq!(doubled_values.borrow().as_slice(), &[2, 4]);
@@ -678,16 +695,24 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     let selected = map_store.select(|value, _key| *value >= 2);
     let selected_snapshots = Rc::new(RefCell::new(Vec::new()));
     let selected_snapshot_sink = selected_snapshots.clone();
-    let unsubscribe_selected_snapshot = selected.snapshot.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(snapshot) = value
-                .as_ref()
-                .downcast_ref::<std::collections::BTreeMap<String, i32>>()
-            {
-                selected_snapshot_sink.borrow_mut().push(snapshot.clone());
-            }
-        }
-    });
+    let unsubscribe_selected_snapshot =
+        selected
+            .snapshot
+            .subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+                let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                    if let Message::Data(value) = msg {
+                        if let Some(snapshot) = value
+                            .as_ref()
+                            .downcast_ref::<std::collections::BTreeMap<String, i32>>()
+                        {
+                            selected_snapshot_sink.borrow_mut().push(snapshot.clone());
+                        }
+                    }
+                };
+                for msg in msgs {
+                    handle(msg);
+                }
+            });
 
     map_store.set("c".to_owned(), 3);
     selected.snapshot_request.set(());
@@ -765,7 +790,7 @@ fn public_crate_root_d566_app_infra_acceptance() {
     let readiness = scheduled_readiness_projector(
         &g,
         ScheduledReadinessOptions::new(vec![schedules.readiness_schedules.clone()])
-            .with_clocks(vec![clock.clone()])
+            .with_clocks(vec![clock.node().clone()])
             .named("acceptance/d566Readiness"),
     );
     let handoff = work_queue_readiness_handoff_projector(

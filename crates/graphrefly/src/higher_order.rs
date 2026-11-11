@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
-use crate::ctx::{Ctx, DepTerminal, WaveData};
+use crate::ctx::{Ctx, DepTerminal};
 use crate::node::{Core, Node, NodeOpts};
 use crate::operators::Operator;
 use crate::protocol::Message;
@@ -479,10 +479,8 @@ fn forward_data(ctx: &Ctx, dep: usize) {
         .into_iter()
         .flat_map(|waves| waves.iter())
     {
-        for item in wave.iter() {
-            if let WaveData::Data(value) = item {
-                ctx.down(vec![Message::Data(value.clone())]);
-            }
+        for value in wave {
+            ctx.down(vec![Message::Data(value.clone())]);
         }
     }
 }

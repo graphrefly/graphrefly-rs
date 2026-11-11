@@ -20,7 +20,7 @@ use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::canonical_tuple_key;
 use crate::json::JsonValue;
-use crate::node::{Core, Node, NodeOpts};
+use crate::node::{Core, Node, NodeOpts, State};
 use crate::protocol::AnyValue;
 use crate::request::requested;
 
@@ -995,7 +995,7 @@ pub struct MessageBusProjection<TPage, TRequest> {
     pub snapshot: Node<TPage>,
     /// Request state for `snapshot`: each write asks for one page with the written
     /// params (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
-    pub snapshot_request: Node<TRequest>,
+    pub snapshot_request: State<TRequest>,
     /// `status` field for status.
     pub status: Node<MessageBusStatus>,
     /// `issues` field for issues.
@@ -1013,7 +1013,7 @@ pub struct MessageBusSubscription<T = AnyValue> {
     pub available: Node<MessageBusAvailablePage<T>>,
     /// Request state for `available`: each write asks for one page with the
     /// written params (graphrefly-rs:D1 (1)).
-    pub available_request: Node<MessageBusAvailableParams>,
+    pub available_request: State<MessageBusAvailableParams>,
     /// `cursor` field for cursor.
     pub cursor: Node<MessageBusCursor>,
     /// `status` field for status.
@@ -1508,7 +1508,7 @@ impl<T: Clone + 'static> MessageBus<T> {
     }
 
     /// The request state a projection declares as its dependency (graphrefly-rs:D1 (1)).
-    fn request_state<P: 'static>(&self, projection_name: &str) -> Node<P> {
+    fn request_state<P: 'static>(&self, projection_name: &str) -> State<P> {
         self.graph.state_empty_opts(node_opts(
             format!("{projection_name}/request"),
             "messageBusProjectionRequest",
@@ -1630,15 +1630,22 @@ pub(crate) fn attach_message_bus_deferred_command_sink<T: Clone + 'static>(
     );
     let _ = graph;
     let bus_commands = bus.commands.erased();
-    commands.subscribe(move |msg| {
-        if let crate::protocol::Message::Data(value) = msg {
-            if let Ok(command) = value.clone().downcast::<MessageBusCommand<T>>() {
-                bus_commands.request_down_next(vec![crate::protocol::Message::Data(Rc::new(
-                    (*command).clone(),
-                ))]);
+    commands.subscribe(
+        move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+            let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
+                if let crate::protocol::Message::Data(value) = msg {
+                    if let Ok(command) = value.clone().downcast::<MessageBusCommand<T>>() {
+                        bus_commands.request_down_next(vec![crate::protocol::Message::Data(
+                            Rc::new((*command).clone()),
+                        )]);
+                    }
+                }
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-    })
+        },
+    )
 }
 
 fn message_bus_command_body<T: Clone + 'static>(
@@ -2513,9 +2520,12 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
     opts
 }
 
+/// A projection served on request is quiet (R-wave): its source's waves mark nothing
+/// below it, and a page it sends is a later wave of its own.
 fn request_node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
     let mut opts = node_opts(name, factory);
     opts.node.partial = true;
+    opts.node.quiet = true;
     opts
 }
 

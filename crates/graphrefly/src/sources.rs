@@ -40,15 +40,17 @@ pub fn of<T: Clone + 'static>(value: T) -> Operator<T> {
     })
 }
 
-/// from_iter: emit every item in order, then COMPLETE, on activation.
+/// from_iter: on activation, send every item in order and then COMPLETE, as one
+/// array, so a subscriber's snapshot carries all of them (R-subscription).
 pub fn from_iter<T: Clone + 'static>(items: impl IntoIterator<Item = T>) -> Operator<T> {
     let values: Vec<T> = items.into_iter().collect();
     Operator::new("fromIter", move |ctx| {
-        for value in &values {
-            let out: AnyValue = Rc::new(value.clone());
-            ctx.down(vec![Message::Data(out)]);
-        }
-        ctx.down(vec![Message::Complete]);
+        let mut out: Vec<Message<AnyValue>> = values
+            .iter()
+            .map(|value| Message::Data(Rc::new(value.clone()) as AnyValue))
+            .collect();
+        out.push(Message::Complete);
+        ctx.down(out);
     })
 }
 
@@ -113,9 +115,13 @@ where
 {
     let state = Rc::new(RefCell::new(SyncValueCapture::<T>::default()));
     let sink_state = state.clone();
-    let unsubscribe = node.subscribe(move |msg| {
-        sink_state.borrow_mut().record(msg);
-    });
+    let unsubscribe = node.subscribe(
+        move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+            for msg in msgs {
+                sink_state.borrow_mut().record(msg);
+            }
+        },
+    );
     unsubscribe();
     let result = state.borrow_mut().first_result();
     result
@@ -132,9 +138,13 @@ where
 {
     let state = Rc::new(RefCell::new(SyncValueCapture::<T>::default()));
     let sink_state = state.clone();
-    let unsubscribe = node.subscribe(move |msg| {
-        sink_state.borrow_mut().record(msg);
-    });
+    let unsubscribe = node.subscribe(
+        move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
+            for msg in msgs {
+                sink_state.borrow_mut().record(msg);
+            }
+        },
+    );
     unsubscribe();
     let result = state.borrow_mut().single_result();
     result

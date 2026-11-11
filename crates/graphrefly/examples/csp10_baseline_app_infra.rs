@@ -43,13 +43,19 @@ impl<T> Drop for Collected<T> {
 fn collect_data<T: Clone + 'static>(node: &graphrefly::Node<T>) -> Collected<T> {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let sink = seen.clone();
-    let unsubscribe = node.subscribe(move |msg| {
-        if let Message::Data(value) = msg {
-            if let Some(value) = value.as_ref().downcast_ref::<T>() {
-                sink.borrow_mut().push(value.clone());
+    let unsubscribe =
+        node.subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
+            let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
+                if let Message::Data(value) = msg {
+                    if let Some(value) = value.as_ref().downcast_ref::<T>() {
+                        sink.borrow_mut().push(value.clone());
+                    }
+                }
+            };
+            for msg in msgs {
+                handle(msg);
             }
-        }
-    });
+        });
     Collected {
         values: seen,
         unsubscribe: Some(unsubscribe),
@@ -97,7 +103,9 @@ fn main() {
         &graph,
         CqrsMessageAckOptions {
             name: "example/cqrsAck".to_owned(),
-            delivered_commands: graph.state_empty::<CqrsDeliveredCommand<String>>(),
+            delivered_commands: graph
+                .state_empty::<CqrsDeliveredCommand<String>>()
+                .into_node(),
             status: cqrs.status.clone(),
             issues: None,
             ack_rejected: true,
@@ -113,7 +121,7 @@ fn main() {
     let readiness = scheduled_readiness_projector(
         &graph,
         ScheduledReadinessOptions::new(vec![readiness_schedules.readiness_schedules.clone()])
-            .with_clocks(vec![clock.clone()])
+            .with_clocks(vec![clock.node().clone()])
             .named("example/readiness"),
     );
     let ready = collect_data(&readiness.ready);
@@ -132,7 +140,8 @@ fn main() {
         graph.state_empty::<WorkQueueRecord<ProcessQueuedEffectPayload<String>>>();
     let _process_queue = process_work_queue_recipe(
         &graph,
-        ProcessWorkQueueRecipeOptions::new(process_records).named("example/processQueue"),
+        ProcessWorkQueueRecipeOptions::new(process_records.node().clone())
+            .named("example/processQueue"),
     );
 
     queue.submit(
@@ -197,7 +206,7 @@ fn main() {
         },
         &CqrsWorkQueuePolicy::default(),
     );
-    queue.commands.set(disposition);
+    queue.dispatch(disposition);
 
     assert!(ready.values.borrow().iter().any(|fact| fact
         .subject_refs

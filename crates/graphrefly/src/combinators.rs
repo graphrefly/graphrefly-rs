@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 
-use crate::ctx::{Ctx, DepTerminal, WaveData};
+use crate::ctx::{Ctx, DepTerminal};
 use crate::node::NodeOpts;
 use crate::operators::Operator;
 use crate::protocol::Message;
@@ -55,8 +55,11 @@ pub fn with_latest_from<A: Clone + 'static, B: Clone + 'static>() -> Operator<(A
             let Some(secondary) = ctx.data::<B>(1) else {
                 return;
             };
-            for primary in ctx.batch::<A>(0) {
-                ctx.emit(((*primary).clone(), (*secondary).clone()));
+            for wave in ctx.batches::<A>(0) {
+                ctx.emit_all(
+                    wave.iter()
+                        .map(|primary| ((**primary).clone(), (*secondary).clone())),
+                );
             }
         },
     )
@@ -155,8 +158,8 @@ pub fn concat<T: Clone + 'static>() -> Operator<T> {
                 });
 
             if st.phase == 0 {
-                for value in ctx.batch::<T>(0) {
-                    ctx.emit((*value).clone());
+                for wave in ctx.batches::<T>(0) {
+                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
                 }
                 for value in ctx.batch::<T>(1) {
                     st.pending.push((*value).clone());
@@ -166,16 +169,14 @@ pub fn concat<T: Clone + 'static>() -> Operator<T> {
                 }
                 if is_complete(ctx.terminal(0)) {
                     st.phase = 1;
-                    for value in st.pending.drain(..) {
-                        ctx.emit(value);
-                    }
+                    ctx.emit_all(st.pending.drain(..));
                     if st.second_done {
                         ctx.down(vec![Message::Complete]);
                     }
                 }
             } else {
-                for value in ctx.batch::<T>(1) {
-                    ctx.emit((*value).clone());
+                for wave in ctx.batches::<T>(1) {
+                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
                 }
                 if is_complete(ctx.terminal(1)) {
                     ctx.down(vec![Message::Complete]);
@@ -221,8 +222,8 @@ pub fn race<T: Clone + 'static>() -> Operator<T> {
             }
 
             if let Some(winner) = st.winner {
-                for value in ctx.batch::<T>(winner) {
-                    ctx.emit((*value).clone());
+                for wave in ctx.batches::<T>(winner) {
+                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
                 }
                 match ctx.terminal(winner) {
                     Some(DepTerminal::Complete) => {
@@ -419,6 +420,5 @@ fn dep_has_data(ctx: &Ctx, i: usize) -> bool {
         .get(i)
         .into_iter()
         .flat_map(|waves| waves.iter())
-        .flat_map(|wave| wave.iter())
-        .any(|item| matches!(item, WaveData::Data(_)))
+        .any(|wave| !wave.is_empty())
 }

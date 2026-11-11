@@ -20,7 +20,7 @@ use crate::messaging::{
     MessageBusAvailableParams, MessageBusCommand, MessageBusStatus, MessageBusStatusKind,
     MessageBusSubscriptionFrom, MessageBusSubscriptionOptions, MessageEnvelope,
 };
-use crate::node::{Core, Node, NodeOpts};
+use crate::node::{Core, Node, NodeOpts, State};
 use crate::protocol::Message;
 use crate::request::requested;
 use crate::resilience::{BackoffPolicy, RetryPolicy};
@@ -910,7 +910,7 @@ pub struct WorkQueueProjection<TPage, TRequest = ()> {
     pub snapshot: Node<TPage>,
     /// Request state for `snapshot`: each write asks for one page with the written
     /// params (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
-    pub snapshot_request: Node<TRequest>,
+    pub snapshot_request: State<TRequest>,
     /// `status` field for status.
     pub status: Node<WorkQueueStatus>,
     /// `issues` field for issues.
@@ -924,7 +924,7 @@ pub struct WorkQueueAvailableProjection<T> {
     pub available: Node<WorkQueueAvailablePage<T>>,
     /// Request state for `available`: each write asks for one page with the
     /// written params (graphrefly-rs:D1 (1)).
-    pub available_request: Node<WorkQueueAvailableParams>,
+    pub available_request: State<WorkQueueAvailableParams>,
     /// `status` field for status.
     pub status: Node<WorkQueueStatus>,
     /// `issues` field for issues.
@@ -1316,11 +1316,17 @@ impl<T: Clone + 'static> WorkQueue<T> {
     }
 
     /// The request state a projection declares as its dependency (graphrefly-rs:D1 (1)).
-    fn request_state<P: 'static>(&self, projection_name: &str) -> Node<P> {
+    fn request_state<P: 'static>(&self, projection_name: &str) -> State<P> {
         self.graph.state_empty_opts(node_opts(
             format!("{projection_name}/request"),
             "workQueueProjectionRequest",
         ))
+    }
+
+    /// Applies a prepared command, such as a disposition built by a recipe, and
+    /// returns it.
+    pub fn dispatch(&self, command: WorkQueueCommand<T>) -> WorkQueueCommand<T> {
+        self.publish_command(command)
     }
 
     fn publish_command(&self, command: WorkQueueCommand<T>) -> WorkQueueCommand<T> {
@@ -3355,9 +3361,12 @@ fn node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOp
     opts
 }
 
+/// A projection served on request is quiet (R-wave): its source's waves mark nothing
+/// below it, and a page it sends is a later wave of its own.
 fn request_node_opts(name: impl Into<String>, factory: impl Into<String>) -> GraphNodeOpts {
     let mut opts = node_opts(name, factory);
     opts.node.partial = true;
+    opts.node.quiet = true;
     opts
 }
 
