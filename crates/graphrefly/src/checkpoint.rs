@@ -10,8 +10,9 @@
 //! each node after its declared dependencies, and runs no recipe function: each node
 //! gets its saved state as a seed, and at its first activation its setup runs and its
 //! function runs once only if a dependency no longer holds what it had received. The
-//! layout (`graphrefly.checkpoint.v2`) carries no version evidence; earlier
-//! checkpoints are refused.
+//! layout is graphrefly-rs's own (graphrefly:D802), tagged
+//! `graphrefly-rs/checkpoint@1`; it carries no version evidence, and a checkpoint
+//! with any other tag, another package's included, is refused.
 //!
 //! Restored values and private state are `serde_json::Value`, whatever type the
 //! saved graph used: the checkpoint carries JSON, not Rust types, and restore runs no
@@ -44,12 +45,13 @@ use crate::json::validate_strict_json_value;
 use crate::node::{Core, NodeSeed, SeedInput};
 use crate::protocol::AnyValue;
 
-/// `constant` constant.
-///
-/// v2 (R-checkpoint@1, graphrefly:D802): each node's last-array values, terminal (an
-/// ERROR payload included), private state, received inputs and lifetime dependencies;
-/// no status, lifecycle or version evidence. Earlier checkpoints are refused.
-pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly.checkpoint.v2";
+/// The tag of this package's checkpoint layout (R-checkpoint@1, graphrefly:D802; review
+/// Q5): each package defines its own layout, so the tag names the package. The layout:
+/// each node's last-array values, terminal (an ERROR payload included), private state,
+/// received inputs and lifetime dependencies; no status, lifecycle or version
+/// evidence. A checkpoint with any other tag is refused, the earlier
+/// `graphrefly.checkpoint.v2` (a string TS used for a different layout) included.
+pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly-rs/checkpoint@1";
 
 /// `GraphCheckpointJson` type alias.
 pub type GraphCheckpointJson = Value;

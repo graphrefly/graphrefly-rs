@@ -2891,13 +2891,26 @@ fn c38_capture_and_restore() {
         graphrefly::RestoreGraphOptions::new(registry(&counters)),
     );
     assert!(refused.is_err_and(|e| e.to_string().contains("received")));
-    let mut v1 = checkpoint.clone();
-    v1.version = "graphrefly.checkpoint.v1".into();
-    assert!(restore_graph(
-        v1,
-        graphrefly::RestoreGraphOptions::new(registry(&counters))
-    )
-    .is_err());
+    assert_eq!(
+        checkpoint.version, "graphrefly-rs/checkpoint@1",
+        "the tag names the package"
+    );
+    for other in [
+        "graphrefly.checkpoint.v1",
+        "graphrefly.checkpoint.v2",
+        "graphrefly-ts/checkpoint@1",
+    ] {
+        let mut tagged = checkpoint.clone();
+        tagged.version = other.into();
+        assert!(
+            restore_graph(
+                tagged,
+                graphrefly::RestoreGraphOptions::new(registry(&counters))
+            )
+            .is_err(),
+            "{other} is refused"
+        );
+    }
 
     let local = graphrefly::graph();
     let la = local.state_opts(json!(1), graphrefly::GraphNodeOpts::named("a"));
