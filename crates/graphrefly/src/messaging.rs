@@ -1629,6 +1629,12 @@ impl<T: Clone + 'static> MessageBusSubscription<T> {
 }
 
 /// Creates or computes `message_bus`.
+///
+/// The bus has no camel-case alias:
+///
+/// ```compile_fail
+/// use graphrefly::dynamicHub;
+/// ```
 pub fn message_bus<T: Clone + 'static>(graph: &Graph, opts: MessageBusOptions) -> MessageBus<T> {
     MessageBus::with_options(graph, opts)
 }
