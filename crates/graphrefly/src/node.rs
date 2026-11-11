@@ -3886,6 +3886,11 @@ impl Core {
         drop(old);
     }
 
+    /// Whether the node is quiet (R-wave@2).
+    pub(crate) fn is_quiet(&self) -> bool {
+        self.with_config(|cfg| cfg.quiet)
+    }
+
     /// A state node: no function and no dependencies.
     pub(crate) fn is_state(&self) -> bool {
         self.with_call(|c| c.handle.is_none()) && self.borrow().deps.is_empty()
@@ -3956,8 +3961,8 @@ pub struct ReplaceOpts {
 pub struct NodeDefinition {
     /// The declared dependencies.
     pub deps: Vec<Core>,
-    /// Whether the node has a function (a state node has none).
-    pub has_function: bool,
+    /// The current instance's function; a state node has none.
+    pub function: Option<NodeFn>,
     /// The current instance's setup.
     pub setup: Option<crate::lifetime::Setup>,
     /// The current instance's recipe.
@@ -4362,14 +4367,17 @@ impl<T: 'static> Node<T> {
         });
     }
 
-    /// The node's current definition (R-node): its declared dependencies, its current
-    /// instance's setup and recipe, and its policies. Reading changes nothing.
+    /// The node's current definition (R-node@2): its declared dependencies, its current
+    /// instance's function, setup and recipe, and its policies. Reading changes nothing.
     pub fn definition(&self) -> NodeDefinition {
         let deps = self.core.with_inner_edges(|n, _| n.declared.clone());
-        let has_function = self.core.with_call(|c| c.handle.is_some());
+        let function = self
+            .core
+            .with_call(|c| c.handle.map(|h| (c.dispatcher.clone(), h)))
+            .and_then(|(dispatcher, handle)| dispatcher.function(handle));
         self.core.with_config(|cfg| NodeDefinition {
             deps,
-            has_function,
+            function,
             setup: cfg.setup.clone(),
             recipe: cfg.recipe.clone(),
             complete: cfg.complete,

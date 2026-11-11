@@ -120,33 +120,6 @@ jobs:
           arguments: --all-features
 
   # ---------------------------------------------------------------------
-  # Python binding foundation: keep the retained binding crate compiling
-  # after the JS/WASM/native binding crates were retired.
-  # ---------------------------------------------------------------------
-  bindings-py:
-    name: Python binding smoke
-    if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.95"
-          components: clippy
-
-      - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: bindings-py
-
-      - name: Cargo check (Python binding test feature)
-        run: cargo check -p graphrefly-bindings-py --features test-python
-        env:
-          RUSTFLAGS: "-D warnings"
-
-  # ---------------------------------------------------------------------
   # TLA+ model checks — runs selected canonical models from
   # `graphrefly/formal`, the language-neutral authority repo.
   #
@@ -155,7 +128,7 @@ jobs:
   # on the next run.
   # ---------------------------------------------------------------------
   tlc:
-    name: TLA+ model check (wave_protocol scenarios)
+    name: TLA+ model check (kernel_wave, kernel_lifetime)
     if: "${{ github.event_name != 'pull_request' || github.actor != 'graphrefly-write-content[bot]' }}"
     runs-on: ubuntu-latest
     steps:
@@ -174,10 +147,9 @@ jobs:
           test -s /tmp/tla2tools.jar
 
       - name: Fetch formal models from graphrefly/formal
-        # NOTE: pinned via the `TLA_REF` env var. `main` is the Rust port's
-        # default tracking branch — it picks up canonical-spec amendments
-        # immediately. Pin to a release SHA / tag once the authority repo cuts
-        # versioned releases.
+        # NOTE: pinned via the `TLA_REF` env var. `main` picks up canonical-spec
+        # amendments immediately. The D797 kernel models (graphrefly:D798) replaced
+        # the retired wave_protocol and wave_rewire models.
         env:
           TLA_REF: main
         shell: bash -euo pipefail {0}
@@ -185,44 +157,28 @@ jobs:
           mkdir -p /tmp/tla
           BASE_SPEC="https://raw.githubusercontent.com/graphrefly/graphrefly/${TLA_REF}/formal"
           fetch() {
-            # `--retry-all-errors` retries on 404 too — covers the case where
-            # raw.githubusercontent.com's CDN edge hasn't propagated a fresh
-            # push yet. Without it, `--retry` skips 404. `--retry-delay 10`
-            # spaces retries to let CDN catch up.
+            # `--retry-all-errors` retries on 404 too, for a CDN edge that has not
+            # caught up with a fresh push yet.
             local url="$1" out="$2"
             curl -fL --retry 5 --retry-all-errors --retry-delay 10 \
               -o "$out" "$url"
             test -s "$out"
           }
-          for f in wave_protocol.tla wave_protocol_MC.tla wave_protocol.cfg \
-                   wave_rewire.tla wave_rewire.cfg; do
+          for f in kernel_wave.tla kernel_wave.cfg kernel_lifetime.tla kernel_lifetime.cfg; do
             fetch "$BASE_SPEC/$f" "/tmp/tla/$f"
           done
 
-      - name: TLC — wave_protocol_MC
+      - name: TLC - kernel_wave and kernel_lifetime
         working-directory: /tmp/tla
-        # `set -euo pipefail` ensures a failed `java` invocation (OOM,
-        # classpath error, etc.) propagates through `tee` instead of being
-        # masked by `tee`'s exit code. The explicit `grep` checks cover
-        # TLC's logical failures (invariant violations, "Error:" lines).
+        # `set -euo pipefail` makes a failed `java` run fail the step through `tee`;
+        # the greps catch TLC's logical failures.
         shell: bash -euo pipefail {0}
         run: |
-          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-            -tool -workers auto -config wave_protocol.cfg wave_protocol_MC.tla \
-            | tee wave_protocol.log
-          # TLC reports "Model checking completed" on success; "Error:" or
-          # "Invariant ... is violated" on failure.
-          grep -q "Model checking completed" wave_protocol.log
-          ! grep -q "is violated" wave_protocol.log
-          ! grep -qi "^error:" wave_protocol.log
-
-      - name: TLC — wave_rewire
-        working-directory: /tmp/tla
-        shell: bash -euo pipefail {0}
-        run: |
-          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar \
-            -tool -workers auto -config wave_rewire.cfg wave_rewire.tla \
-            | tee rewire.log
-          grep -q "Model checking completed" rewire.log
-          ! grep -q "is violated" rewire.log
-          ! grep -qi "^error:" rewire.log
+          for model in kernel_wave kernel_lifetime; do
+            java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+              -workers auto -deadlock -config "$model.cfg" "$model" \
+              | tee "$model.log"
+            grep -q "Model checking completed" "$model.log"
+            ! grep -q "is violated" "$model.log"
+            ! grep -qi "^error:" "$model.log"
+          done

@@ -209,7 +209,7 @@ pub use diagnostics::{
     ProfileSummaryOptions, ProfileSummaryStatus, ReachableDirection, ReachableOptions,
     ReachableResult, ValidateNoIslandsResult,
 };
-pub use dispatcher::{default_dispatcher, Dispatcher, PoolKind};
+pub use dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
 #[cfg(feature = "tokio-http")]
 pub use environment::TokioHttpDriver;
 #[cfg(feature = "tokio-http-stream")]
@@ -226,10 +226,11 @@ pub use environment::{
     WebSocketSend, WebSocketSendResult, WebhookDriverEvent, WebhookEvent, WebhookRegistration,
 };
 pub use graph::{
-    graph, graph_opts, DescribeEdge, DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue,
-    Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions, GraphTopologyObserver,
-    NodeProfile, ObserveEvent, ObserveMessage, ObserveStream, Profile, RestoreFactoryMeta,
-    TopologyEvent, TopologyEventKind, TopologyGroup, TopologyGroupOptions, TopologyStream, Values,
+    graph, graph_opts, DescribeEdge, DescribeKind, DescribeNode, DescribeOpts, DescribeSnapshot,
+    DescribeValue, Explain, Graph, GraphNode, GraphNodeOpts, GraphObserver, GraphOptions,
+    GraphTopologyObserver, NodeProfile, ObserveEvent, ObserveMessage, ObserveStream, Profile,
+    RestoreFactoryMeta, TopologyEvent, TopologyEventKind, TopologyGroup, TopologyGroupOptions,
+    TopologyStream, Values,
 };
 pub use higher_order::{
     concat_map, exhaust_map, flat_map, merge_map, merge_map_with_options, repeat, switch_map,

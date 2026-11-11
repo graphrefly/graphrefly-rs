@@ -1374,7 +1374,9 @@ impl Graph {
                 status: entry.core.status(),
                 value: entry.core.cache_any().as_ref().map(describe_value),
                 version: entry.core.version(),
+                kind: DescribeKind::of(&entry.core),
                 deps,
+                quiet: entry.core.is_quiet(),
                 meta: if entry.meta.is_empty() {
                     None
                 } else {
@@ -1417,7 +1419,9 @@ impl Graph {
                 status: core.status(),
                 value: core.cache_any().as_ref().map(describe_value),
                 version: core.version(),
+                kind: DescribeKind::of(&core),
                 deps,
+                quiet: core.is_quiet(),
                 meta: None,
             });
         }
@@ -1700,10 +1704,33 @@ pub struct DescribeNode {
     pub value: Option<DescribeValue>,
     /// `version` field for version.
     pub version: Option<NodeVersion>,
-    /// `deps` field for deps.
+    /// Whether the node is a state or a computed node (R-node@2).
+    pub kind: DescribeKind,
+    /// The current dependencies, in order (R-node@2).
     pub deps: Vec<String>,
+    /// Whether the node is quiet (R-node@2, R-wave@2).
+    pub quiet: bool,
     /// `meta` field for meta.
     pub meta: Option<BTreeMap<String, String>>,
+}
+
+/// What kind of node a [`DescribeNode`] is (R-node@2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribeKind {
+    /// A state node: no function and no dependencies.
+    State,
+    /// A computed node.
+    Node,
+}
+
+impl DescribeKind {
+    fn of(core: &Core) -> Self {
+        if core.is_state() {
+            Self::State
+        } else {
+            Self::Node
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

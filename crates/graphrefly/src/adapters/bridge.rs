@@ -1003,7 +1003,7 @@ pub enum WireBridgeIngress<T> {
 #[derive(Clone)]
 /// `WireBridgeInbound` data container.
 pub struct WireBridgeInbound<T: Clone + 'static> {
-    node: Node<WireBridgeIngress<T>>,
+    state: crate::node::State<WireBridgeIngress<T>>,
     session_id: String,
 }
 
@@ -1013,59 +1013,25 @@ impl<T: Clone + 'static> WireBridgeInbound<T> {
         &self.session_id
     }
 
-    /// Updates or reads `down`.
-    pub fn down(&self, msgs: Vec<Message<AnyValue>>) {
-        for msg in msgs {
-            self.node.down(vec![self.guard_msg(msg)]);
-        }
-    }
-
-    fn guard_msg(&self, msg: Message<AnyValue>) -> Message<AnyValue> {
-        match msg {
-            Message::Data(value) => match value.downcast::<WireBridgeEnvelope<T>>() {
-                Ok(envelope) => data_msg(WireBridgeIngress::Envelope((*envelope).clone())),
-                Err(value) => match value.downcast::<WireBridgeIngress<T>>() {
-                    Ok(ingress) => data_msg((*ingress).clone()),
-                    Err(_) => data_msg(WireBridgeIngress::<T>::Invalid(
-                        "wireBridge: inbound DATA must carry a wire bridge envelope".to_owned(),
-                    )),
-                },
-            },
-            Message::Error(error) => data_msg(WireBridgeIngress::<T>::Invalid(
-                format!(
-                    "{}: inbound protocol ERROR {error} is local misuse; remote errors must arrive as DATA envelope facts",
-                    self.session_id
-                ),
-            )),
-            Message::Complete => data_msg(WireBridgeIngress::<T>::Invalid(
-                format!(
-                    "{}: inbound protocol COMPLETE is local misuse; remote completion must arrive as a DATA envelope fact",
-                    self.session_id
-                ),
-            )),
-            other => data_msg(WireBridgeIngress::<T>::Invalid(format!(
-                "{}: inbound port accepts DATA envelope facts only; {other:?} is local protocol traffic",
-                self.session_id
-            ))),
-        }
-    }
-
-    /// Updates or reads `set`.
+    /// Writes one received envelope into the inbound state, as one DATA wave. This is
+    /// the inbound's only host write (graphrefly-rs:D3 (2)): there is no raw array
+    /// input.
     pub fn set(&self, envelope: WireBridgeEnvelope<T>) {
-        self.down(vec![Message::Data(Rc::new(envelope))]);
+        self.state.set(WireBridgeIngress::Envelope(envelope));
     }
 
     /// Subscribes a sink, called once per array (R-wave).
     pub fn subscribe(&self, sink: impl Fn(&[Message<AnyValue>]) + 'static) -> Box<dyn FnOnce()> {
-        self.node.subscribe(sink)
+        self.state.subscribe(sink)
     }
 
     /// Updates or reads `erased`.
     pub fn erased(&self) -> crate::node::Core {
-        self.node.erased()
+        self.state.erased()
     }
 }
 
+#[cfg(test)]
 fn data_msg<T: 'static>(value: T) -> Message<AnyValue> {
     Message::Data(Rc::new(value) as AnyValue)
 }
@@ -1109,13 +1075,12 @@ where
             opts
         })
         .into_node();
-    let inbound_node = graph
-        .state_empty_opts::<WireBridgeIngress<TInbound>>(GraphNodeOpts::named(format!(
-            "{name}/inbound"
-        )))
-        .into_node();
+    let inbound_state = graph.state_empty_opts::<WireBridgeIngress<TInbound>>(
+        GraphNodeOpts::named(format!("{name}/inbound")),
+    );
+    let inbound_node = inbound_state.node().clone();
     let inbound = WireBridgeInbound {
-        node: inbound_node.clone(),
+        state: inbound_state,
         session_id: opts.session_id.clone(),
     };
     let events =
@@ -3721,20 +3686,14 @@ mod tests {
         bridge
             .command
             .down(vec![Message::Data(Rc::new("not-a-command".to_owned()))]);
-        bridge
-            .inbound
-            .down(vec![Message::Data(Rc::new("not-an-envelope".to_owned()))]);
-
-        assert!(bridge
-            .errors
-            .cache()
-            .unwrap()
-            .contains("inbound DATA must carry"));
+        // The inbound takes only typed envelopes (WireBridgeInbound::set), so a
+        // malformed inbound value cannot be written in process.
+        assert!(bridge.errors.cache().is_some());
         assert!(bridge.outbound.cache().is_none());
     }
 
     #[test]
-    fn inbound_vec_is_split_into_single_receipt_local_waves() {
+    fn each_inbound_envelope_is_its_own_local_wave() {
         let g = graph();
         let bridge =
             wire_bridge::<String, String>(&g, WireBridgeOptions::named("session-a", "bridge"));
@@ -3751,24 +3710,16 @@ mod tests {
         );
         let _observed = observed.subscribe(|_| {});
 
-        bridge.inbound.down(vec![
-            Message::Data(Rc::new(envelope(
+        for (seq, text) in [(1, "one"), (2, "two")] {
+            bridge.inbound.set(envelope(
                 "session-a",
                 WireBridgeEnvelopeType::Data,
-                1,
+                seq,
                 0,
-                Some(WireBridgePayload::Data("one".to_owned())),
+                Some(WireBridgePayload::Data(text.to_owned())),
                 None,
-            ))),
-            Message::Data(Rc::new(envelope(
-                "session-a",
-                WireBridgeEnvelopeType::Data,
-                2,
-                0,
-                Some(WireBridgePayload::Data("two".to_owned())),
-                None,
-            ))),
-        ]);
+            ));
+        }
 
         assert_eq!(*batch_sizes.borrow(), vec![1, 1]);
     }
@@ -3813,9 +3764,6 @@ mod tests {
         let _errors = bridge.errors.subscribe(|_| {});
         let _cursor = bridge.cursor.subscribe(|_| {});
 
-        bridge
-            .inbound
-            .down(vec![Message::Error("remote protocol error".into())]);
         bridge.inbound.set(envelope(
             "session-a",
             WireBridgeEnvelopeType::Data,

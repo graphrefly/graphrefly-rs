@@ -295,6 +295,11 @@ impl Dispatcher {
         self.0.borrow().pools[pool_id as usize].kind
     }
 
+    /// The function registered under `handle`, if it is still registered.
+    pub(crate) fn function(&self, handle: Handle) -> Option<NodeFn> {
+        self.0.borrow().pools[handle.pool_id as usize].get(handle.handle_id, handle.generation)
+    }
+
     /// Free a node's fn slot (B32) — called from `NodeInner::Drop`. The pool stops
     /// holding a dropped node's fn (and thus its captured upstream `Core`s) alive for
     /// the whole process. Idempotent / generation-checked: a stale unregister is a no-op.

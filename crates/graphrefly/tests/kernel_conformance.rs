@@ -3459,3 +3459,67 @@ fn queued_replaces_cannot_commit_a_cycle() {
         )]
     );
 }
+
+/// R-node@2 (review F 2.16, C F12): the definition gives the current instance's
+/// function, and describe gives each node's kind, dependencies and whether it is
+/// quiet.
+#[test]
+fn definition_and_describe_give_the_r_node_content() {
+    let g = graphrefly::graph();
+    let a = g.state_opts(1i32, named("a"));
+    let q = g.node_opts::<i32, _>(vec![a.erased()], |_| {}, named("q").with_node(quiet_opts()));
+    assert!(a.definition().function.is_none(), "a state has no function");
+    let first = q.definition().function.expect("q has a function");
+    q.replace(vec![a.erased()], |_| {}, graphrefly::ReplaceOpts::default());
+    let second = q
+        .definition()
+        .function
+        .expect("the new instance's function");
+    assert!(!Rc::ptr_eq(&first, &second), "replace gives a new function");
+
+    let described: Vec<(String, graphrefly::DescribeKind, Vec<String>, bool)> = g
+        .describe()
+        .nodes
+        .into_iter()
+        .map(|n| (n.id, n.kind, n.deps, n.quiet))
+        .collect();
+    assert_eq!(
+        described,
+        vec![
+            (
+                "a".to_owned(),
+                graphrefly::DescribeKind::State,
+                vec![],
+                false
+            ),
+            (
+                "q".to_owned(),
+                graphrefly::DescribeKind::Node,
+                vec!["a".to_owned()],
+                true
+            ),
+        ]
+    );
+}
+
+/// R-checkpoint@1, the Rust limit recorded in graphrefly-rs:D9 (review F 2.18): restored
+/// values are `serde_json::Value`, whatever type the saved graph used.
+#[test]
+fn restored_values_are_json_whatever_the_saved_type() {
+    let g = graphrefly::graph();
+    let _a = g.state_opts(41i32, named("a"));
+    let checkpoint = g.checkpoint().expect("an i32 is saved as JSON");
+    let restored = graphrefly::restore_graph(
+        checkpoint,
+        graphrefly::RestoreGraphOptions::new(graphrefly::restore_registry([
+            graphrefly::GraphRestoreEntry::descriptor(graphrefly::StateRestoreDescriptor),
+        ])),
+    )
+    .expect("restore succeeds");
+    let node = restored.find("a").expect("a restored");
+    assert_eq!(
+        node.as_node::<serde_json::Value>().cache(),
+        Some(serde_json::json!(41))
+    );
+    assert_eq!(node.as_node::<i32>().cache(), None, "not the saved type");
+}

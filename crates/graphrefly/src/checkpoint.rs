@@ -13,6 +13,13 @@
 //! layout (`graphrefly.checkpoint.v2`) carries no version evidence; earlier
 //! checkpoints are refused.
 //!
+//! Restored values and private state are `serde_json::Value`, whatever type the
+//! saved graph used: the checkpoint carries JSON, not Rust types, and restore runs no
+//! recipe that could decode it. Read a restored node as `serde_json::Value`
+//! ([`crate::GraphNode::as_node::<serde_json::Value>()`](crate::GraphNode::as_node));
+//! reading it as the original `T` gives `None`. A graph that is meant to round-trip
+//! is therefore written over `serde_json::Value` (graphrefly-rs:D9).
+//!
 //! Checkpoint-owned storage integration is deliberately absent here: callers
 //! load/decode checkpoint JSON outside the sync core, then pass the already-loaded
 //! value to [`restore_graph`].
@@ -977,13 +984,18 @@ impl RestoreGraphOptions {
 }
 
 impl Graph {
-    /// Updates or reads `checkpoint`.
+    /// Captures the graph at a wave boundary (R-checkpoint@1); refused inside a wave or
+    /// a batch body, and for values or private state that are not JSON.
     pub fn checkpoint(&self) -> RestoreResult<GraphCheckpoint> {
         checkpoint_graph(self)
     }
 }
 
-/// Creates or computes `restore_graph`.
+/// Builds a new graph from `checkpoint` (R-checkpoint@1). No recipe function runs;
+/// each node gets its saved state as a seed. Restored values and private state are
+/// `serde_json::Value`: a node saved as `State<i32>` reads back through
+/// `as_node::<serde_json::Value>()`, and `as_state::<i32>()` gives no value (see the
+/// module docs).
 pub fn restore_graph(
     checkpoint: GraphCheckpoint,
     options: RestoreGraphOptions,

@@ -136,7 +136,6 @@ mod tests {
     use crate::dispatcher::Dispatcher;
     use crate::environment::EnvironmentDrivers;
     use crate::graph::{graph_opts, GraphOptions};
-    use crate::node::Status;
 
     fn run_tokio_local<F>(future: F) -> F::Output
     where
