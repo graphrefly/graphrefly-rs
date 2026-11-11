@@ -1140,6 +1140,9 @@ struct NodeAux {
     /// A restored node's construction seed, consumed by its first activation
     /// (R-checkpoint).
     seed: Option<NodeSeedRuntime>,
+    /// The seed's note, handed to the seeded instance's first run only
+    /// (R-subscription@3, R-invocation@2).
+    seed_note: Option<AnyValue>,
 }
 
 /// What a restored computed node starts its first lifetime with (R-checkpoint).
@@ -1147,6 +1150,7 @@ struct NodeSeedRuntime {
     private_state: Option<AnyValue>,
     lifetime_deps: Option<Vec<Core>>,
     received: Vec<SeedInput>,
+    note: Option<AnyValue>,
 }
 
 impl NodeAux {
@@ -1159,6 +1163,7 @@ impl NodeAux {
             lifetime: None,
             closing: false,
             seed: None,
+            seed_note: None,
         }
     }
 }
@@ -1192,6 +1197,8 @@ pub(crate) struct NodeSeed {
     pub private_state: Option<AnyValue>,
     pub lifetime_deps: Option<Vec<Core>>,
     pub received: Option<Vec<SeedInput>>,
+    /// The seed's opaque note (R-subscription@3).
+    pub note: Option<AnyValue>,
 }
 
 /// The mutable state of a node. Pure fields + non-reentrant helpers only; the
@@ -2751,6 +2758,7 @@ impl Core {
                     private_state: seed.private_state,
                     lifetime_deps: seed.lifetime_deps,
                     received: seed.received.unwrap_or_default(),
+                    note: seed.note,
                 });
             }
         });
@@ -2767,6 +2775,7 @@ impl Core {
             a.activated = true;
             a.lifetime = Some(crate::lifetime::Lifetime::open());
             a.state = seed.private_state;
+            a.seed_note = seed.note;
             r.has_called_fn_once = true;
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
             e.idx_boxes = (0..n.deps.len())
@@ -3160,6 +3169,7 @@ impl Core {
                 }
                 // Only the seeded instance's first run uses the seed.
                 a.seed = None;
+                a.seed_note = None;
                 for b in &e.idx_boxes {
                     b.set(-1);
                 }
@@ -3776,15 +3786,18 @@ impl Core {
                     lifetime.setup_done = true;
                     cfg.setup.clone()
                 };
+                let mut ctx = Ctx::new(
+                    self.borrowed_view(),
+                    dep_records,
+                    lifetime.id,
+                    lifetime.signal.clone(),
+                );
+                // Only the seeded instance's first run receives the note.
+                ctx.seed = a.seed_note.take();
                 (
                     c.handle.expect("invoke ⇒ handle present"),
                     c.dispatcher.clone(),
-                    Ctx::new(
-                        self.borrowed_view(),
-                        dep_records,
-                        lifetime.id,
-                        lifetime.signal.clone(),
-                    ),
+                    ctx,
                     setup,
                 )
             });
@@ -5316,6 +5329,40 @@ mod tests {
 
         assert_eq!(runs.get(), 1, "the run sees the DATA before the COMPLETE");
         assert_eq!(derived.status().output, crate::OutputStatus::Completed);
+    }
+
+    #[test]
+    fn seed_note_reaches_only_the_seeded_first_run() {
+        // R-invocation@2 / R-subscription@3: only the seeded instance's first run
+        // receives the seed's note; every other run sees none.
+        let s = Node::<i32>::state(1);
+        let notes = Rc::new(RefCell::new(Vec::<Option<i32>>::new()));
+        let d: Node<i32> = {
+            let notes = notes.clone();
+            Node::derived(vec![s.erased()], move |ctx| {
+                notes.borrow_mut().push(ctx.seed::<i32>().map(|n| *n));
+                ctx.emit(*ctx.data::<i32>(0).unwrap());
+            })
+        };
+        d.core.restore_seed(NodeSeed {
+            values: vec![Rc::new(0i32)],
+            ended: None,
+            private_state: None,
+            lifetime_deps: None,
+            // It had received nothing, so S's value is a change: the first run runs.
+            received: Some(vec![SeedInput {
+                values: Vec::new(),
+                ended: None,
+            }]),
+            note: Some(Rc::new(7i32)),
+        });
+        let u = d.subscribe(|_| {});
+        s.set(2);
+        assert_eq!(*notes.borrow(), vec![Some(7), None]);
+        // A later lifetime is not the seeded first run.
+        u();
+        let _u = d.subscribe(|_| {});
+        assert_eq!(notes.borrow().last(), Some(&None));
     }
 
     #[test]

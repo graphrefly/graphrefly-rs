@@ -1366,7 +1366,7 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
 }
 
 #[test]
-fn graph_checkpoint_uses_collection_backend_state_as_authority() {
+fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
     let g = graph();
     let list = reactive_list::<i32>(vec![1], ReactiveListOptions::named("list").graph(g.clone()));
     list.append(2);
@@ -1378,7 +1378,7 @@ fn graph_checkpoint_uses_collection_backend_state_as_authority() {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(by_id["list.delta"].backend_state, Some(json!([1, 2])));
+    assert_eq!(by_id["list.delta"].private_state, Some(json!([1, 2])));
     assert!(by_id["list.snapshot"].values.is_empty());
     assert_eq!(
         by_id["list.snapshot"].private_state, None,
@@ -1400,7 +1400,7 @@ fn graph_checkpoint_uses_collection_backend_state_as_authority() {
         .iter()
         .find(|node| node.id == "list.delta")
         .expect("restored delta exists");
-    assert_eq!(restored_delta.backend_state, Some(json!([1, 2])));
+    assert_eq!(restored_delta.private_state, Some(json!([1, 2])));
 
     let view_graph = graph();
     let map = reactive_map::<String, i32>(
@@ -1453,7 +1453,7 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
         capped.factory,
         GraphCheckpointFactory::LocalOnly { .. }
     ));
-    assert_eq!(capped.backend_state, None);
+    assert_eq!(capped.private_state, None);
 }
 
 #[test]
@@ -1473,7 +1473,7 @@ fn capped_reactive_log_checkpoint_restores_with_max_size_config() {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(by_id["log.delta"].backend_state, Some(json!([3, 4])));
+    assert_eq!(by_id["log.delta"].private_state, Some(json!([3, 4])));
     assert!(matches!(
         &by_id["log.delta"].factory,
         GraphCheckpointFactory::RegistryRef { config, .. }
@@ -1491,7 +1491,7 @@ fn capped_reactive_log_checkpoint_restores_with_max_size_config() {
         .iter()
         .find(|node| node.id == "log.delta")
         .expect("restored log delta exists");
-    assert_eq!(restored_log.backend_state, Some(json!([3, 4])));
+    assert_eq!(restored_log.private_state, Some(json!([3, 4])));
 }
 
 #[test]

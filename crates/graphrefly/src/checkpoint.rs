@@ -126,15 +126,14 @@ pub struct GraphCheckpointNode {
     pub values: Vec<GraphCheckpointJson>,
     /// The node's terminal, with an ERROR payload.
     pub terminal: GraphCheckpointTerminal,
-    /// A computed node's private state.
+    /// A computed node's private state; for a collection's delta node, the
+    /// collection's backend (a collection is a node whose backend is its private
+    /// state, graphrefly:D802).
     #[serde(rename = "privateState", skip_serializing_if = "Option::is_none")]
     pub private_state: Option<GraphCheckpointJson>,
     /// What a computed node with a lifetime received from each current dependency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub received: Option<Vec<GraphCheckpointInput>>,
-    /// A collection's backend (Rust-local, graphrefly-rs:D9).
-    #[serde(rename = "backendState", skip_serializing_if = "Option::is_none")]
-    pub backend_state: Option<GraphCheckpointJson>,
     /// The node's graph metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<BTreeMap<String, GraphCheckpointJson>>,
@@ -284,7 +283,7 @@ fn checkpoint_backend_state(core: &Core, path: &str) -> RestoreResult<Option<Gra
     contributor
         .map(|contributor| {
             let value = contributor(path).map_err(|err| {
-                GraphRestoreError::new(format!("checkpoint: backendState at {path}: {err}"))
+                GraphRestoreError::new(format!("checkpoint: collection backend at {path}: {err}"))
             })?;
             validate_checkpoint_json(&value, path)?;
             Ok(value)
@@ -649,9 +648,9 @@ fn backend_array(
     node: &GraphCheckpointNode,
     ref_: &str,
 ) -> RestoreResult<Vec<GraphCheckpointJson>> {
-    let Some(GraphCheckpointJson::Array(items)) = &node.backend_state else {
+    let Some(GraphCheckpointJson::Array(items)) = &node.private_state else {
         return Err(GraphRestoreError::new(format!(
-            "restore_graph: '{ref_}' node '{}' requires array backendState",
+            "restore_graph: '{ref_}' node '{}' requires an array backend as its privateState",
             node.id
         )));
     };
@@ -667,20 +666,20 @@ fn map_entries(
     for (i, entry) in backend_array(node, ref_)?.into_iter().enumerate() {
         let GraphCheckpointJson::Array(pair) = entry else {
             return Err(GraphRestoreError::new(format!(
-                "restore_graph: {}.backendState[{i}] must be a [key,value] map entry",
+                "restore_graph: {}.privateState[{i}] must be a [key,value] map entry",
                 node.id
             )));
         };
         if pair.len() != 2 {
             return Err(GraphRestoreError::new(format!(
-                "restore_graph: {}.backendState[{i}] must be a [key,value] map entry",
+                "restore_graph: {}.privateState[{i}] must be a [key,value] map entry",
                 node.id
             )));
         }
         let key = CheckpointJsonOrd(pair[0].clone());
         if !seen.insert(key.clone()) {
             return Err(GraphRestoreError::new(format!(
-                "restore_graph: {}.backendState[{i}][0] duplicates an earlier map key",
+                "restore_graph: {}.privateState[{i}][0] duplicates an earlier map key",
                 node.id
             )));
         }
@@ -702,7 +701,7 @@ fn index_rows(
     for (i, row) in backend_array(node, ref_)?.into_iter().enumerate() {
         let GraphCheckpointJson::Object(obj) = row else {
             return Err(GraphRestoreError::new(format!(
-                "restore_graph: {}.backendState[{i}] must be an index row object",
+                "restore_graph: {}.privateState[{i}] must be an index row object",
                 node.id
             )));
         };
@@ -712,14 +711,14 @@ fn index_rows(
             || !obj.contains_key("value")
         {
             return Err(GraphRestoreError::new(format!(
-                "restore_graph: {}.backendState[{i}] must contain primary, secondary, and value",
+                "restore_graph: {}.privateState[{i}] must contain primary, secondary, and value",
                 node.id
             )));
         }
         let primary = CheckpointJsonOrd(obj.get("primary").expect("checked").clone());
         if !seen.insert(primary.clone()) {
             return Err(GraphRestoreError::new(format!(
-                "restore_graph: {}.backendState[{i}].primary duplicates an earlier index row",
+                "restore_graph: {}.privateState[{i}].primary duplicates an earlier index row",
                 node.id
             )));
         }
@@ -812,7 +811,7 @@ impl GraphRestoreDescriptor for ReactiveLogDeltaRestoreDescriptor {
                 if let Some(max_size) = max_size {
                     if state.len() > max_size {
                         return Err(GraphRestoreError::new(format!(
-                        "restore_graph: 'reactiveLog.delta' node '{}' backendState exceeds config.maxSize",
+                        "restore_graph: 'reactiveLog.delta' node '{}' privateState backend exceeds config.maxSize",
                         node.id
                     )));
                     }
@@ -1057,16 +1056,16 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             from: dep.clone(),
             to: entry.id.clone(),
         }));
-        let backend_state =
-            checkpoint_backend_state(&entry.core, &format!("{}.backendState", entry.id))?;
+        let backend = checkpoint_backend_state(&entry.core, &format!("{}.privateState", entry.id))?;
         let helper = is_non_authoritative_helper(entry.meta.get("kind").map(String::as_str));
         let values = if helper {
             Vec::new()
         } else {
             values_to_json(&runtime.values, &format!("{}.values", entry.id))?
         };
-        let private_state = match (&runtime.private_state, helper) {
-            (Some(state), false) => {
+        let private_state = match (backend, &runtime.private_state, helper) {
+            (Some(backend), _, _) => Some(backend),
+            (None, Some(state), false) => {
                 Some(any_to_json(state, &format!("{}.privateState", entry.id))?)
             }
             _ => None,
@@ -1104,7 +1103,6 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             terminal: terminal_to_json(runtime.ended.as_ref()),
             private_state,
             received,
-            backend_state,
             meta: if entry.meta.is_empty() {
                 None
             } else {
@@ -1388,7 +1386,7 @@ fn prepare_checkpoint(
         validate_checkpoint_node_json(node)?;
         // A computed node with private state saved without what it received is from
         // an earlier format: refused, never completed from its dependencies.
-        if node.private_state.is_some() && node.received.is_none() {
+        if !node.deps.is_empty() && node.private_state.is_some() && node.received.is_none() {
             return Err(GraphRestoreError::new(format!(
                 "restore_graph: node '{}' lacks the record of what it received (R-checkpoint)",
                 node.id
@@ -1512,9 +1510,6 @@ fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()
             validate_checkpoint_json(value, &format!("{}.received[{i}]", node.id))?;
         }
     }
-    if let Some(backend_state) = &node.backend_state {
-        validate_checkpoint_json(backend_state, &format!("{}.backendState", node.id))?;
-    }
     if let GraphCheckpointTerminal::Error { error } = &node.terminal {
         validate_checkpoint_json(error, &format!("{}.terminal.error", node.id))?;
     }
@@ -1593,6 +1588,11 @@ fn construct_prepared(
                         ended: terminal_from_json(&input.terminal),
                     })
                     .collect()
+            }),
+            // The note holds what the node had received (R-checkpoint@1).
+            note: node.received.as_ref().map(|inputs| {
+                Rc::new(serde_json::to_value(inputs).unwrap_or(GraphCheckpointJson::Null))
+                    as AnyValue
             }),
         });
     }

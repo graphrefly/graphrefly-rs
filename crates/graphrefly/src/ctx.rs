@@ -67,6 +67,7 @@ pub struct Ctx {
     dep_records: Vec<DepRecord>,
     lifetime: u64,
     signal: AbortSignal,
+    pub(crate) seed: Option<AnyValue>,
 }
 
 impl Ctx {
@@ -81,7 +82,15 @@ impl Ctx {
             dep_records,
             lifetime,
             signal,
+            seed: None,
         }
+    }
+
+    /// The seed's note on a seeded instance's first run, typed; `None` on every
+    /// other run (R-invocation@2, R-subscription@3). A restored node's note holds what
+    /// it had received, as the checkpoint's `received` records.
+    pub fn seed<S: 'static>(&self) -> Option<Rc<S>> {
+        self.seed.clone().and_then(|note| note.downcast::<S>().ok())
     }
 
     pub(crate) fn lifetime_id(&self) -> u64 {
