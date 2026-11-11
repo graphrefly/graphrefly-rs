@@ -117,7 +117,8 @@ impl fmt::Debug for DebugCollisionKey {
 
 #[test]
 fn reactive_list_delta_and_quick_reads() {
-    let list = reactive_list::<i32>(vec![1], ReactiveListOptions::default());
+    let g = graphrefly::graph();
+    let list = reactive_list::<i32>(&g, vec![1], ReactiveListOptions::default());
     let deltas = collect_data(&list.delta);
     let delta_kinds = collect_kinds(&list.delta);
 
@@ -153,8 +154,9 @@ fn reactive_list_delta_and_quick_reads() {
 
 #[test]
 fn reactive_list_snapshot_is_pull_driven_and_coalesces_no_change_demand() {
-    let list = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default());
-    let other = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default());
+    let g = graphrefly::graph();
+    let list = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default());
+    let other = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default());
     assert!(!list
         .snapshot_request
         .erased()
@@ -182,7 +184,8 @@ fn reactive_list_snapshot_is_pull_driven_and_coalesces_no_change_demand() {
 
 #[test]
 fn reactive_list_capacity_trims_head_and_emits_delta() {
-    let list = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default().max_size(2));
+    let g = graphrefly::graph();
+    let list = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default().max_size(2));
     let deltas = collect_data(&list.delta);
 
     list.append_many(vec![1, 2, 3]);
@@ -201,7 +204,8 @@ fn reactive_list_capacity_trims_head_and_emits_delta() {
 
 #[test]
 fn reactive_log_delta_quick_reads_and_pull_snapshot() {
-    let log = reactive_log::<i32>(vec![1], ReactiveLogOptions::default().max_size(3));
+    let g = graphrefly::graph();
+    let log = reactive_log::<i32>(&g, vec![1], ReactiveLogOptions::default().max_size(3));
     let deltas = collect_data(&log.delta);
     let snapshots = collect_data(&log.snapshot);
 
@@ -245,7 +249,8 @@ fn reactive_log_delta_quick_reads_and_pull_snapshot() {
 
 #[test]
 fn reactive_log_incremental_views_follow_delta_backbone() {
-    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
+    let g = graphrefly::graph();
+    let log = reactive_log::<i32>(&g, Vec::new(), ReactiveLogOptions::default());
     let tail = log.tail(2);
     let slice = log.slice(1, Some(3));
     let sum = log.scan(0i32, |acc, value| acc + *value);
@@ -278,7 +283,8 @@ fn reactive_log_incremental_views_follow_delta_backbone() {
 
 #[test]
 fn reactive_log_scan_recomputes_after_max_size_trimmed_append() {
-    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default().max_size(3));
+    let g = graphrefly::graph();
+    let log = reactive_log::<i32>(&g, Vec::new(), ReactiveLogOptions::default().max_size(3));
     let sum = log.scan(0i32, |acc, value| acc + *value);
     let sum_seen = collect_data(&sum);
 
@@ -295,7 +301,8 @@ fn reactive_log_scan_recomputes_after_max_size_trimmed_append() {
 
 #[test]
 fn reactive_log_scan_recomputes_after_oversized_append_many_trim() {
-    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default().max_size(3));
+    let g = graphrefly::graph();
+    let log = reactive_log::<i32>(&g, Vec::new(), ReactiveLogOptions::default().max_size(3));
     let sum = log.scan(0i32, |acc, value| acc + *value);
     let sum_seen = collect_data(&sum);
 
@@ -311,7 +318,7 @@ fn reactive_log_scan_recomputes_after_oversized_append_many_trim() {
 #[test]
 fn reactive_log_page_is_light_view_and_lazy_pull() {
     let g = graph();
-    let log = reactive_log::<i32>(vec![1, 2, 3, 4], ReactiveLogOptions::named("log").graph(g));
+    let log = reactive_log::<i32>(&g, vec![1, 2, 3, 4], ReactiveLogOptions::named("log"));
     let page = log.page(1, 2);
     let same = log.page(1, 2);
     assert!(page
@@ -348,10 +355,8 @@ fn reactive_log_page_is_light_view_and_lazy_pull() {
 #[test]
 fn reactive_index_range_is_light_view_and_lazy_pull() {
     let g = graph();
-    let index = reactive_index::<i32, String, i32>(
-        Vec::new(),
-        ReactiveIndexOptions::named("idx").graph(g.clone()),
-    );
+    let index =
+        reactive_index::<i32, String, i32>(&g, Vec::new(), ReactiveIndexOptions::named("idx"));
     let deltas = collect_data(&index.delta);
     let snapshots = collect_data(&index.snapshot);
 
@@ -433,7 +438,8 @@ fn reactive_index_range_is_light_view_and_lazy_pull() {
 
 #[test]
 fn reactive_index_delete_many_emits_one_delta_for_removed_primaries() {
-    let index = reactive_index::<i32, String, i32>(Vec::new(), ReactiveIndexOptions::default());
+    let g = graphrefly::graph();
+    let index = reactive_index::<i32, String, i32>(&g, Vec::new(), ReactiveIndexOptions::default());
     let deltas = collect_data(&index.delta);
 
     index.upsert(1, "a".to_owned(), 10);
@@ -476,7 +482,9 @@ fn reactive_index_delete_many_emits_one_delta_for_removed_primaries() {
 
 #[test]
 fn reactive_index_range_memo_uses_structural_keys_not_debug_text() {
+    let g = graphrefly::graph();
     let index = reactive_index::<DebugCollisionKey, i32, i32>(
+        &g,
         vec![
             IndexRow {
                 primary: DebugCollisionKey(1),
@@ -522,6 +530,7 @@ fn reactive_index_range_memo_uses_structural_keys_not_debug_text() {
 fn reactive_index_range_dispose_releases_graph_registered_nodes() {
     let g = graph();
     let index = reactive_index::<i32, String, i32>(
+        &g,
         vec![
             IndexRow {
                 primary: 1,
@@ -534,7 +543,7 @@ fn reactive_index_range_dispose_releases_graph_registered_nodes() {
                 value: 20,
             },
         ],
-        ReactiveIndexOptions::named("idx").graph(g.clone()),
+        ReactiveIndexOptions::named("idx"),
     );
     let range = index.range(1, 3);
 
@@ -570,12 +579,13 @@ fn reactive_index_range_dispose_releases_graph_registered_nodes() {
 fn reactive_index_dispose_releases_memoized_range_views() {
     let g = graph();
     let index = reactive_index::<i32, String, i32>(
+        &g,
         vec![IndexRow {
             primary: 1,
             secondary: "a".to_owned(),
             value: 10,
         }],
-        ReactiveIndexOptions::named("idx").graph(g.clone()),
+        ReactiveIndexOptions::named("idx"),
     );
     let _range = index.range(1, 2);
 
@@ -588,10 +598,7 @@ fn reactive_index_dispose_releases_memoized_range_views() {
 #[test]
 fn reactive_log_page_dispose_releases_graph_registered_nodes() {
     let g = graph();
-    let log = reactive_log::<i32>(
-        vec![1, 2, 3, 4],
-        ReactiveLogOptions::named("log").graph(g.clone()),
-    );
+    let log = reactive_log::<i32>(&g, vec![1, 2, 3, 4], ReactiveLogOptions::named("log"));
     let page = log.page(1, 2);
 
     let snap = g.describe();
@@ -632,10 +639,7 @@ fn reactive_log_page_dispose_releases_graph_registered_nodes() {
 #[test]
 fn reactive_log_dispose_releases_memoized_page_views() {
     let g = graph();
-    let log = reactive_log::<i32>(
-        vec![1, 2, 3],
-        ReactiveLogOptions::named("log").graph(g.clone()),
-    );
+    let log = reactive_log::<i32>(&g, vec![1, 2, 3], ReactiveLogOptions::named("log"));
     let _page = log.page(0, 2);
 
     log.dispose();
@@ -645,8 +649,9 @@ fn reactive_log_dispose_releases_memoized_page_views() {
 }
 
 #[test]
-fn graphless_light_views_mint_distinct_snapshot_requests() {
-    let log = reactive_log::<i32>(vec![1, 2, 3], ReactiveLogOptions::default());
+fn light_views_mint_distinct_snapshot_requests() {
+    let g = graphrefly::graph();
+    let log = reactive_log::<i32>(&g, vec![1, 2, 3], ReactiveLogOptions::default());
     let first = log.page(0, 1);
     let second = log.page(1, 1);
 
@@ -661,7 +666,9 @@ fn graphless_light_views_mint_distinct_snapshot_requests() {
 
 #[test]
 fn reactive_map_delta_quick_reads_and_pull_snapshot() {
-    let map = reactive_map::<String, i32>(vec![("a".to_owned(), 1)], ReactiveMapOptions::default());
+    let g = graphrefly::graph();
+    let map =
+        reactive_map::<String, i32>(&g, vec![("a".to_owned(), 1)], ReactiveMapOptions::default());
     let deltas = collect_data(&map.delta);
     let snapshots = collect_data(&map.snapshot);
 
@@ -725,8 +732,9 @@ fn reactive_map_delta_quick_reads_and_pull_snapshot() {
 fn reactive_map_select_is_light_view_and_lazy_pull() {
     let g = graph();
     let map = reactive_map::<String, i32>(
+        &g,
         vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
-        ReactiveMapOptions::named("map").graph(g),
+        ReactiveMapOptions::named("map"),
     );
     let is_even: StringNumberPredicate = Rc::new(|value, _| *value % 2 == 0);
     let view = map.select_by(is_even.clone());
@@ -771,8 +779,9 @@ fn reactive_map_select_is_light_view_and_lazy_pull() {
 fn reactive_map_select_dispose_releases_graph_registered_nodes() {
     let g = graph();
     let map = reactive_map::<String, i32>(
+        &g,
         vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
-        ReactiveMapOptions::named("map").graph(g.clone()),
+        ReactiveMapOptions::named("map"),
     );
     let select = map.select(|value, _| *value > 1);
 
@@ -820,8 +829,9 @@ fn reactive_map_select_dispose_releases_graph_registered_nodes() {
 fn reactive_map_select_dispose_emits_node_released_after_atomic_release() {
     let g = graph();
     let map = reactive_map::<String, i32>(
+        &g,
         vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
-        ReactiveMapOptions::named("map").graph(g.clone()),
+        ReactiveMapOptions::named("map"),
     );
     let select = map.select(|value, _| *value > 1);
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
@@ -892,10 +902,7 @@ fn reactive_map_select_dispose_emits_node_released_after_atomic_release() {
 #[should_panic(expected = "still depends")]
 fn reactive_log_page_dispose_rejects_external_registered_dependents() {
     let g = graph();
-    let log = reactive_log::<i32>(
-        vec![1, 2, 3, 4],
-        ReactiveLogOptions::named("log").graph(g.clone()),
-    );
+    let log = reactive_log::<i32>(&g, vec![1, 2, 3, 4], ReactiveLogOptions::named("log"));
     let page = log.page(1, 2);
     let _consumer = g.derived_opts(
         vec![page.snapshot.erased()],
@@ -909,10 +916,7 @@ fn reactive_log_page_dispose_rejects_external_registered_dependents() {
 #[test]
 fn reactive_log_page_dispose_rejects_live_external_subscribers_and_can_retry() {
     let g = graph();
-    let log = reactive_log::<i32>(
-        vec![1, 2, 3, 4],
-        ReactiveLogOptions::named("log").graph(g.clone()),
-    );
+    let log = reactive_log::<i32>(&g, vec![1, 2, 3, 4], ReactiveLogOptions::named("log"));
     let page = log.page(1, 2);
     let unsub = page.snapshot.subscribe(|_| {});
 
@@ -931,10 +935,7 @@ fn reactive_log_page_dispose_rejects_live_external_subscribers_and_can_retry() {
 #[test]
 fn failed_reactive_log_page_dispose_emits_no_node_released_and_keeps_topology() {
     let g = graph();
-    let log = reactive_log::<i32>(
-        vec![1, 2, 3, 4],
-        ReactiveLogOptions::named("log").graph(g.clone()),
-    );
+    let log = reactive_log::<i32>(&g, vec![1, 2, 3, 4], ReactiveLogOptions::named("log"));
     let page = log.page(1, 2);
     let _consumer = g.derived_opts(
         vec![page.snapshot.erased()],
@@ -977,10 +978,7 @@ fn failed_reactive_log_page_dispose_emits_no_node_released_and_keeps_topology() 
 fn reactive_log_attach_is_graph_visible_declared_dep() {
     let g = graph();
     let src = g.state_opts(0i32, GraphNodeOpts::named("src"));
-    let log = reactive_log::<i32>(
-        Vec::new(),
-        ReactiveLogOptions::named("log").graph(g.clone()),
-    );
+    let log = reactive_log::<i32>(&g, Vec::new(), ReactiveLogOptions::named("log"));
     let deltas = collect_data(&log.delta);
 
     let dispose = log.attach(&src);
@@ -1023,9 +1021,10 @@ fn reactive_log_attach_is_graph_visible_declared_dep() {
 
 #[test]
 fn merge_reactive_logs_is_declared_dep_fan_in() {
-    let a = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
-    let b = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
-    let merged = merge_reactive_logs(vec![a.clone(), b.clone()]);
+    let g = graphrefly::graph();
+    let a = reactive_log::<i32>(&g, Vec::new(), ReactiveLogOptions::default());
+    let b = reactive_log::<i32>(&g, Vec::new(), ReactiveLogOptions::default());
+    let merged = merge_reactive_logs(&g, vec![a.clone(), b.clone()]);
     let seen = collect_data(&merged);
 
     a.append(1);
@@ -1044,7 +1043,8 @@ fn merge_reactive_logs_is_declared_dep_fan_in() {
 
 #[test]
 fn scan_log_helper_delegates_to_reactive_log_scan() {
-    let log = reactive_log::<i32>(Vec::new(), ReactiveLogOptions::default());
+    let g = graphrefly::graph();
+    let log = reactive_log::<i32>(&g, Vec::new(), ReactiveLogOptions::default());
     let scanned = scan_log(&log, 1i32, |acc, value| acc * *value);
     let seen = collect_data(&scanned);
 
@@ -1059,10 +1059,7 @@ fn scan_log_helper_delegates_to_reactive_log_scan() {
 fn reactive_list_append_from_is_graph_visible_declared_dep() {
     let g = graph();
     let src = g.state_opts(0i32, GraphNodeOpts::named("src"));
-    let list = reactive_list::<i32>(
-        Vec::new(),
-        ReactiveListOptions::named("list").graph(g.clone()),
-    );
+    let list = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::named("list"));
     let deltas = collect_data(&list.delta);
 
     let dispose = list.append_from(&src);
@@ -1106,8 +1103,8 @@ fn reactive_list_append_from_is_graph_visible_declared_dep() {
 #[test]
 fn unnamed_graph_reactive_lists_get_distinct_public_ids() {
     let g = graph();
-    let a = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default().graph(g.clone()));
-    let b = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default().graph(g.clone()));
+    let a = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default());
+    let b = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default());
 
     assert!(!a
         .snapshot_request
@@ -1122,13 +1119,15 @@ fn unnamed_graph_reactive_lists_get_distinct_public_ids() {
 #[test]
 #[should_panic(expected = "insert: index 5 out of range")]
 fn reactive_list_insert_out_of_range_panics() {
-    let list = reactive_list::<i32>(vec![1, 2], ReactiveListOptions::default());
+    let g = graphrefly::graph();
+    let list = reactive_list::<i32>(&g, vec![1, 2], ReactiveListOptions::default());
     list.insert(5, 9);
 }
 
 #[test]
 #[should_panic(expected = "pop from empty list")]
 fn reactive_list_pop_empty_panics() {
-    let list = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default());
+    let g = graphrefly::graph();
+    let list = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default());
     list.pop(None);
 }

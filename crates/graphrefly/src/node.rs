@@ -39,7 +39,9 @@ use crate::checkpoint::{
     unregister_backend_state_contributor, unregister_backend_state_contributor_key,
 };
 use crate::ctx::{Ctx, DepRecord, DepTerminal};
-use crate::dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
+#[cfg(test)]
+use crate::dispatcher::default_dispatcher;
+use crate::dispatcher::{Dispatcher, NodeFn, PoolKind};
 use crate::environment::EnvironmentDrivers;
 use crate::protocol::{reject_kernel_only_output, AnyValue, GraphError, Handle, Message, Wave};
 use crate::versioning::{
@@ -131,7 +133,8 @@ pub enum Policy {
 /// the dep-terminal propagation policy (R-deps-terminal).
 #[derive(Debug, Clone)]
 pub struct NodeOpts {
-    /// Real factory name for graph-less nodes that `describe` auto-discovers (D43/D51).
+    /// The factory name `describe` shows for a node with no graph entry of its own
+    /// (D43/D51), such as an operator's internal node.
     /// Registered graph entries still carry their own graph-layer factory string.
     pub factory: Option<String>,
     /// The dispatch pool (default LocalSync, R-sync-core).
@@ -397,10 +400,6 @@ impl GraphArena {
         Self(Rc::new(RefCell::new(GraphCore::new())))
     }
 
-    pub(crate) fn default() -> Self {
-        DEFAULT_GRAPH_CORE.with(|graph| Self(graph.clone()))
-    }
-
     /// The arena's concurrency domain.
     pub(crate) fn domain(&self) -> DomainRef {
         graph_domain(&self.0)
@@ -434,8 +433,8 @@ struct GraphCore {
 
 /// A graph's concurrency domain (R-graph-domain@3): its own wave scope, delivery
 /// scope, request queue and batch frame. Graphs on one thread share none of them: a
-/// request to one graph is never held by another graph's wave or batch. Nodes built
-/// outside any Graph live in the default arena, whose domain is one per thread.
+/// request to one graph is never held by another graph's wave or batch. Every node
+/// belongs to a graph (review Q2), so every node has a domain.
 pub(crate) struct Domain {
     wave: RefCell<Option<WaveScope>>,
     delivery_depth: Cell<usize>,
@@ -464,11 +463,6 @@ impl Domain {
 
 fn graph_domain(graph: &RefCell<GraphCore>) -> DomainRef {
     graph.borrow().domain.clone()
-}
-
-/// The domain of nodes built outside any Graph: the default arena's.
-pub(crate) fn default_domain() -> DomainRef {
-    DEFAULT_GRAPH_CORE.with(|graph| graph_domain(graph))
 }
 
 fn with_wave<R>(d: &Domain, f: impl FnOnce(&RefCell<Option<WaveScope>>) -> R) -> R {
@@ -811,13 +805,6 @@ impl GraphCore {
         let aux = self.aux_slots.get_mut(key.id.0)?.take()?;
         Some((inner, topology, call, config, edges, version, aux))
     }
-}
-
-thread_local! {
-    /// Until the Rust graph layer lands, public constructors allocate into the default
-    /// graph-local arena, mirroring the existing default dispatcher shape (D26). A later
-    /// graph-owned constructor can pass an explicit arena without changing [`Core`].
-    static DEFAULT_GRAPH_CORE: Rc<RefCell<GraphCore>> = Rc::new(RefCell::new(GraphCore::new()));
 }
 
 /// One message as a dependent records it: PENDING and START stripped, the error kept
@@ -3877,28 +3864,77 @@ fn register_with(disp: &Dispatcher, pool: PoolKind, f: NodeFn) -> Handle {
 ///
 /// No `PartialEq` bound (D49: the substrate does no value-equality — dedup is
 /// opt-in at the operator layer, e.g. `distinctUntilChanged`).
+///
+/// Every node belongs to a [`Graph`](crate::Graph) (review Q2): it is built by the
+/// graph (`graph.state`, `graph.node`, ...), and a batch is the graph's. There is no
+/// constructor outside a graph and no free `batch`:
+///
+/// ```compile_fail
+/// let s = graphrefly::Node::<i32>::state(1);
+/// ```
+///
+/// ```compile_fail
+/// graphrefly::batch(|_| {});
+/// ```
+///
+/// ```
+/// let g = graphrefly::graph();
+/// let s = g.state(1i32);
+/// g.batch(|_| s.set(2));
+/// assert_eq!(s.cache(), Some(2));
+/// ```
 pub struct Node<T> {
     core: Core,
     _t: PhantomData<T>,
 }
 
 impl<T: 'static> Node<T> {
-    /// A state node pre-populated with `initial`; a new subscriber gets `[DATA]`
-    /// (R-initial). The host writes it through the returned [`State`].
-    pub fn state(initial: T) -> State<T> {
-        State::from_node(Self::state_in_arena(&GraphArena::default(), initial))
-    }
-
+    // Arena-level constructors for the kernel's own unit tests; shipped code builds
+    // every node through a Graph (review Q2).
+    #[cfg(test)]
     pub(crate) fn state_in_arena(arena: &GraphArena, initial: T) -> Node<T> {
         Self::state_in_arena_with_dispatcher(arena, default_dispatcher(), initial)
     }
 
+    #[cfg(test)]
     pub(crate) fn state_in_arena_with_dispatcher(
         arena: &GraphArena,
         dispatcher: Dispatcher,
         initial: T,
     ) -> Node<T> {
         Self::state_opts_in_arena_with_dispatcher(arena, dispatcher, initial, NodeOpts::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_empty_in_arena(arena: &GraphArena) -> Node<T> {
+        Self::state_empty_in_arena_with_dispatcher(arena, default_dispatcher())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_empty_in_arena_with_dispatcher(
+        arena: &GraphArena,
+        dispatcher: Dispatcher,
+    ) -> Node<T> {
+        Self::state_empty_opts_in_arena_with_dispatcher(arena, dispatcher, NodeOpts::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn producer_opts_in_arena<F: Fn(&Ctx) + 'static>(
+        arena: &GraphArena,
+        opts: NodeOpts,
+        f: F,
+    ) -> Node<T> {
+        Self::producer_opts_in_arena_with_dispatcher(arena, default_dispatcher(), opts, f)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn derived_opts_in_arena<F: Fn(&Ctx) + 'static>(
+        arena: &GraphArena,
+        deps: Vec<Core>,
+        opts: NodeOpts,
+        f: F,
+    ) -> Node<T> {
+        Self::derived_opts_in_arena_with_dispatcher(arena, default_dispatcher(), deps, opts, f)
     }
 
     pub(crate) fn state_opts_in_arena_with_dispatcher(
@@ -3920,22 +3956,6 @@ impl<T: 'static> Node<T> {
         }
     }
 
-    /// A state node with no value until the first [`State::set`].
-    pub fn state_empty() -> State<T> {
-        State::from_node(Self::state_empty_in_arena(&GraphArena::default()))
-    }
-
-    pub(crate) fn state_empty_in_arena(arena: &GraphArena) -> Node<T> {
-        Self::state_empty_in_arena_with_dispatcher(arena, default_dispatcher())
-    }
-
-    pub(crate) fn state_empty_in_arena_with_dispatcher(
-        arena: &GraphArena,
-        dispatcher: Dispatcher,
-    ) -> Node<T> {
-        Self::state_empty_opts_in_arena_with_dispatcher(arena, dispatcher, NodeOpts::default())
-    }
-
     pub(crate) fn state_empty_opts_in_arena_with_dispatcher(
         arena: &GraphArena,
         dispatcher: Dispatcher,
@@ -3945,42 +3965,6 @@ impl<T: 'static> Node<T> {
             core: Core::new_in_arena(arena, vec![], None, dispatcher, None, opts),
             _t: PhantomData,
         }
-    }
-
-    /// A producer node (fn, no deps): runs once on activation, emits via `ctx.emit`.
-    pub fn producer<F: Fn(&Ctx) + 'static>(f: F) -> Node<T> {
-        Self::producer_opts(NodeOpts::default(), f)
-    }
-
-    /// A producer on the LocalAsync pool (D20): the fn runs once on activation and may
-    /// DEFER its emission — stash `ctx.defer()` and emit later via the [`DeferredCtx`]
-    /// (the async source pattern, R-sync-core / R-no-raw-async). Default pause mode
-    /// (`true`); a depless leaf source's own production is delivered immediately even
-    /// while paused (R-pause-modes / C-10).
-    ///
-    /// [`DeferredCtx`]: crate::ctx::DeferredCtx
-    pub fn producer_async<F: Fn(&Ctx) + 'static>(f: F) -> Node<T> {
-        Self::producer_opts(
-            NodeOpts {
-                factory: None,
-                pool: PoolKind::Async,
-                ..NodeOpts::default()
-            },
-            f,
-        )
-    }
-
-    /// A producer with explicit [`NodeOpts`] (pool + pause mode).
-    pub fn producer_opts<F: Fn(&Ctx) + 'static>(opts: NodeOpts, f: F) -> Node<T> {
-        Self::producer_opts_in_arena(&GraphArena::default(), opts, f)
-    }
-
-    pub(crate) fn producer_opts_in_arena<F: Fn(&Ctx) + 'static>(
-        arena: &GraphArena,
-        opts: NodeOpts,
-        f: F,
-    ) -> Node<T> {
-        Self::producer_opts_in_arena_with_dispatcher(arena, default_dispatcher(), opts, f)
     }
 
     pub(crate) fn producer_opts_in_arena_with_dispatcher<F: Fn(&Ctx) + 'static>(
@@ -3999,46 +3983,6 @@ impl<T: 'static> Node<T> {
             call.factory = factory;
         });
         node
-    }
-
-    /// A derived node over erased deps. The fn reads deps positionally via
-    /// `ctx.dep(i).value::<U>()` and emits via `ctx.emit`. The kernel has no first-run
-    /// gate: the fn runs on activation whatever its deps hold. A fn that returns WITHOUT
-    /// emitting (filter-reject) makes the substrate synthesize an undirty RESOLVED
-    /// (D49 / R-resolved-undirty).
-    pub fn derived<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, f: F) -> Node<T> {
-        Self::derived_opts(deps, NodeOpts::default(), f)
-    }
-
-    /// A derived node on the LocalAsync pool (D20): the fn may DEFER its emission (stash
-    /// `ctx.defer()`, emit later). An async COMPUTE node (deps>0) that returns without
-    /// emitting has DEFERRED (not rejected) — no undirty RESOLVED is synthesized, and its
-    /// in-flight result buffers if the node is paused (R-async-paused / C-2/C-4). Default
-    /// pause mode (`true`).
-    pub fn derived_async<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, f: F) -> Node<T> {
-        Self::derived_opts(
-            deps,
-            NodeOpts {
-                factory: None,
-                pool: PoolKind::Async,
-                ..NodeOpts::default()
-            },
-            f,
-        )
-    }
-
-    /// A derived node with explicit [`NodeOpts`] (pool + pause mode + dep-terminal policy).
-    pub fn derived_opts<F: Fn(&Ctx) + 'static>(deps: Vec<Core>, opts: NodeOpts, f: F) -> Node<T> {
-        Self::derived_opts_in_arena(&GraphArena::default(), deps, opts, f)
-    }
-
-    pub(crate) fn derived_opts_in_arena<F: Fn(&Ctx) + 'static>(
-        arena: &GraphArena,
-        deps: Vec<Core>,
-        opts: NodeOpts,
-        f: F,
-    ) -> Node<T> {
-        Self::derived_opts_in_arena_with_dispatcher(arena, default_dispatcher(), deps, opts, f)
     }
 
     pub(crate) fn derived_opts_in_arena_with_dispatcher<F: Fn(&Ctx) + 'static>(
@@ -4411,6 +4355,50 @@ mod tests {
 
     use serde_json::json;
 
+    /// A bare arena with the Graph constructor names, for the kernel unit tests that
+    /// count a node's handles or arena slots: a Graph's registry holds a handle of its
+    /// own to every node it owns.
+    struct TestArena(GraphArena);
+
+    impl TestArena {
+        fn new() -> Self {
+            Self(GraphArena::new())
+        }
+
+        fn state<T: 'static>(&self, initial: T) -> State<T> {
+            State::from_node(Node::state_in_arena(&self.0, initial))
+        }
+
+        fn state_empty<T: 'static>(&self) -> State<T> {
+            State::from_node(Node::state_empty_in_arena(&self.0))
+        }
+
+        fn node_opts<T: 'static, F: Fn(&Ctx) + 'static>(
+            &self,
+            deps: Vec<Core>,
+            f: F,
+            opts: crate::graph::GraphNodeOpts,
+        ) -> Node<T> {
+            Node::derived_opts_in_arena(&self.0, deps, opts.node, f)
+        }
+
+        fn producer<T: 'static, F: Fn(&Ctx) + 'static>(&self, f: F) -> Node<T> {
+            Node::producer_opts_in_arena(&self.0, NodeOpts::default(), f)
+        }
+
+        fn producer_opts<T: 'static, F: Fn(&Ctx) + 'static>(
+            &self,
+            f: F,
+            opts: crate::graph::GraphNodeOpts,
+        ) -> Node<T> {
+            Node::producer_opts_in_arena(&self.0, opts.node, f)
+        }
+
+        fn batch<R>(&self, f: impl FnOnce(&crate::batch::BatchCtx) -> R) -> R {
+            crate::batch::batch_in(&self.0.domain(), f)
+        }
+    }
+
     /// Collect a subscriber's message-kind tags into a shared Vec for shape asserts.
     type KindLog = Rc<RefCell<Vec<String>>>;
 
@@ -4452,7 +4440,8 @@ mod tests {
 
     #[test]
     fn state_node_push_on_subscribe_and_set() {
-        let s = Node::<i32>::state(1);
+        let g = crate::graph::graph();
+        let s = g.state::<i32>(1);
         let (log, sink) = recorder();
         let _u = s.subscribe(sink);
         // push-on-subscribe: START then cached DATA (R-push-subscribe).
@@ -4468,14 +4457,15 @@ mod tests {
 
     #[test]
     fn batch_commits_one_array_and_rollback_delivers_nothing() {
+        let g = crate::graph::graph();
         // R-request-order: a batch delivers nothing before its commit, and its writes
         // to one node commit as one array; a rollback drops them with nothing to undo.
-        let s = Node::<i32>::state(0);
+        let s = g.state::<i32>(0);
         let (log, sink) = recorder();
         let _u = s.subscribe(sink);
         log.borrow_mut().clear();
 
-        crate::batch::batch(|_| {
+        g.batch(|_| {
             s.set(1);
             s.set(2);
             assert!(log.borrow().is_empty());
@@ -4485,7 +4475,7 @@ mod tests {
         assert_eq!(s.cache(), Some(2));
 
         log.borrow_mut().clear();
-        crate::batch::batch(|bctx| {
+        g.batch(|bctx| {
             s.set(3);
             bctx.rollback();
             assert!(log.borrow().is_empty());
@@ -4496,9 +4486,10 @@ mod tests {
 
     #[test]
     fn d49_repeated_equal_value_stays_data() {
+        let g = crate::graph::graph();
         // D49 (supersedes D15): every occurrence is DATA — NO equals-substitution.
         // Probe: fromIter([1,1,1]) must be [DATA,DATA,DATA] so take/scan/count work.
-        let s = Node::<i32>::state(5);
+        let s = g.state::<i32>(5);
         let (log, sink) = recorder();
         let _u = s.subscribe(sink);
         s.set(5); // unchanged value → still DATA (never absorbed to RESOLVED)
@@ -4558,16 +4549,18 @@ mod tests {
 
     #[test]
     fn d1_drop_releases_upstream_subscription_and_runs_cleanup() {
+        let g = TestArena::new();
         // D1: dropping an active node (no explicit unsubscribe) must detach from its
         // deps and fire its cleanup hooks — Rust has no GC to reap the dead sink.
         let deactivated = Rc::new(Cell::new(false));
-        let a = Node::<i32>::state(1);
+        let a = g.state::<i32>(1);
         {
             let flag = deactivated.clone();
-            let mid: Node<i32> = Node::derived_opts(
+            let mid: Node<i32> = g.node_opts(
                 vec![a.erased()],
-                with_cleanup(move || flag.set(true)),
                 |ctx| ctx.emit(*ctx.dep(0).value::<i32>().unwrap() + 1),
+                crate::graph::GraphNodeOpts::default()
+                    .with_node(with_cleanup(move || flag.set(true))),
             );
             let _sub = mid.subscribe(|_| {}); // activates mid: setup + fn, subscribes to a
             assert!(!deactivated.get());
@@ -4585,7 +4578,8 @@ mod tests {
 
     #[test]
     fn producer_runs_once_on_activation() {
-        let p = Node::<i32>::producer(|ctx| ctx.emit(42i32));
+        let g = crate::graph::graph();
+        let p = g.producer::<i32, _>(|ctx| ctx.emit(42i32));
         let (log, sink) = recorder();
         let _u = p.subscribe(sink);
         // activation-exempt: the first run during subscribe needs no preceding DIRTY.
@@ -4595,14 +4589,15 @@ mod tests {
 
     #[test]
     fn a_kernel_node_has_no_first_run_gate() {
+        let g = crate::graph::graph();
         // The kernel runs a function on whatever its dependencies delivered; waiting
         // for every dependency to have a value is derived and effect sugar
         // (graphrefly:D797 (9), review Q1).
-        let a = Node::<i32>::state_empty();
-        let b = Node::<i32>::state_empty();
+        let a = g.state_empty::<i32>();
+        let b = g.state_empty::<i32>();
         let runs = Rc::new(Cell::new(0usize));
         let r2 = runs.clone();
-        let sum: Node<i32> = Node::derived(vec![a.erased(), b.erased()], move |ctx| {
+        let sum: Node<i32> = g.node(vec![a.erased(), b.erased()], move |ctx| {
             r2.set(r2.get() + 1);
             if let (Some(x), Some(y)) = (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>()) {
                 ctx.emit(*x + *y);
@@ -4629,21 +4624,22 @@ mod tests {
 
     #[test]
     fn diamond_recomputes_exactly_once_two_phase() {
+        let g = crate::graph::graph();
         // A → B, A → C, B → D, C → D. D must join once per A update, glitch-free.
-        let a = Node::<i32>::state_empty();
-        let b: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+        let a = g.state_empty::<i32>();
+        let b: Node<i32> = g.node(vec![a.erased()], |ctx| {
             if let Some(v) = ctx.dep(0).value::<i32>() {
                 ctx.emit(*v + 1)
             }
         });
-        let c: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+        let c: Node<i32> = g.node(vec![a.erased()], |ctx| {
             if let Some(v) = ctx.dep(0).value::<i32>() {
                 ctx.emit(*v * 10)
             }
         });
         let d_runs = Rc::new(Cell::new(0usize));
         let dr = d_runs.clone();
-        let d: Node<i32> = Node::derived(vec![b.erased(), c.erased()], move |ctx| {
+        let d: Node<i32> = g.node(vec![b.erased(), c.erased()], move |ctx| {
             let (Some(x), Some(y)) = (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>()) else {
                 return;
             };
@@ -4666,8 +4662,9 @@ mod tests {
 
     #[test]
     fn rom_ram_deactivation_clears_compute_cache() {
-        let a = Node::<i32>::state(7); // ROM: state node retains across disconnect
-        let dbl: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+        let g = crate::graph::graph();
+        let a = g.state::<i32>(7); // ROM: state node retains across disconnect
+        let dbl: Node<i32> = g.node(vec![a.erased()], |ctx| {
             ctx.emit(*ctx.dep(0).value::<i32>().unwrap() * 2)
         });
         let (_log, sink) = recorder();
@@ -4684,9 +4681,10 @@ mod tests {
 
     #[test]
     fn subscribe_to_ended_node_gets_start_last_data_and_terminal() {
+        let g = crate::graph::graph();
         // R-terminals / R-subscription@3: an ended node stays subscribable; a late
         // subscriber gets START, the last DATA array and the terminal.
-        let s = Node::<i32>::state(1);
+        let s = g.state::<i32>(1);
         let _u = s.subscribe(|_| {});
         s.down(vec![Message::Complete]);
         assert_eq!(s.status().output, crate::OutputStatus::Completed);
@@ -4698,8 +4696,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "host input to an ended state is refused")]
     fn set_on_ended_state_is_refused() {
+        let g = crate::graph::graph();
         // R-terminals: host input to an ended node is refused.
-        let s = Node::<i32>::state(1);
+        let s = g.state::<i32>(1);
         let (log, sink) = recorder();
         let _u = s.subscribe(sink);
         s.down(vec![Message::Complete]);
@@ -4709,6 +4708,7 @@ mod tests {
 
     #[test]
     fn b32_dropped_node_unregisters_its_fn_releasing_captures() {
+        let g = TestArena::new();
         // B32: the dispatcher pool no longer holds a dropped node's fn forever. Before the
         // slotmap + unregister-on-Drop, a registered fn lived for the process, pinning the
         // upstream `Core`s it captured (the no-GC leak). Probe via a guard captured by the
@@ -4722,7 +4722,7 @@ mod tests {
         let fn_dropped = Rc::new(Cell::new(false));
         {
             let guard = DropFlag(fn_dropped.clone());
-            let p = Node::<i32>::producer(move |ctx| {
+            let p = g.producer::<i32, _>(move |ctx| {
                 let _hold = &guard; // the fn captures the guard (stands in for a captured Core)
                 ctx.emit(1i32);
             });
@@ -4742,12 +4742,14 @@ mod tests {
 
     #[test]
     fn private_state_replace_drops_captured_core_borrow_free() {
+        let g = crate::graph::graph();
         // B49/D71 regression: replacing private state must drop the old value AFTER
         // releasing the GraphCore borrow. The old value may hold the last handle to
         // another node; dropping that handle re-enters Core::drop on the same arena.
-        let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.state_set(Node::<i32>::state(99));
+        let a = g.state::<i32>(1);
+        let held = g.clone();
+        let d: Node<i32> = g.node(vec![a.erased()], move |ctx| {
+            ctx.state_set(held.state::<i32>(99));
             ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
         });
         let _u = d.subscribe(|_| {});
@@ -4758,13 +4760,14 @@ mod tests {
 
     #[test]
     fn subscriber_callback_drops_handle_borrow_free() {
+        let g = crate::graph::graph();
         // DR-8/B54 owner-execution invariant: callbacks run only after the owner arena
         // mutation borrow has been released. A subscriber may drop the last handle to
         // another same-arena node, which re-enters Core::drop; holding the owner borrow
         // across the callback would panic.
         let held: Rc<RefCell<Option<Node<i32>>>> =
-            Rc::new(RefCell::new(Some(Node::<i32>::producer(|_| {}))));
-        let source = Node::<i32>::state_empty();
+            Rc::new(RefCell::new(Some(g.producer::<i32, _>(|_| {}))));
+        let source = g.state_empty::<i32>();
         let h = held.clone();
         let _u = source.subscribe(
             move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
@@ -4787,19 +4790,26 @@ mod tests {
 
     #[test]
     fn drop_returns_arena_slot_when_cleanup_hook_panics() {
+        let g = TestArena::new();
         // B49/D71 regression: Core::drop removes the NodeInner from the arena before
         // running cleanup. Even if a user cleanup hook panics, the slot id must be
         // returned to the free list.
-        let free_before = DEFAULT_GRAPH_CORE.with(|g| g.borrow().free.len());
+        let probe = g.state::<i32>(0);
+        let free_len = || probe.core.graph.borrow().free.len();
+        let free_before = free_len();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let p = Node::<i32>::producer_opts(with_cleanup(|| panic!("cleanup boom")), |ctx| {
-                ctx.emit(1i32);
-            });
+            let p = g.producer_opts::<i32, _>(
+                |ctx| {
+                    ctx.emit(1i32);
+                },
+                crate::graph::GraphNodeOpts::default()
+                    .with_node(with_cleanup(|| panic!("cleanup boom"))),
+            );
             let _u = p.subscribe(|_| {});
         }));
         // R-failure@3: the cleanup's panic goes to the host reporter.
         assert!(result.is_ok());
-        let free_after = DEFAULT_GRAPH_CORE.with(|g| g.borrow().free.len());
+        let free_after = free_len();
         assert!(
             free_after > free_before,
             "panicking cleanup still returns the arena slot to the free list"
@@ -4808,6 +4818,7 @@ mod tests {
 
     #[test]
     fn drop_unregisters_fn_even_when_cleanup_hook_panics() {
+        let g = crate::graph::graph();
         // DR-8/B54 side-table cleanup regression: the call slot must unregister before
         // the lifetime cleanup runs, or a panicking cleanup strands the dispatcher
         // fn slot and every Core/resource captured by the fn.
@@ -4823,12 +4834,13 @@ mod tests {
             let fn_dropped = fn_dropped.clone();
             move || {
                 let guard = DropFlag(fn_dropped);
-                let p = Node::<i32>::producer_opts(
-                    with_cleanup(|| panic!("cleanup boom")),
+                let p = g.producer_opts::<i32, _>(
                     move |ctx| {
                         let _keep = &guard;
                         ctx.emit(1i32);
                     },
+                    crate::graph::GraphNodeOpts::default()
+                        .with_node(with_cleanup(|| panic!("cleanup boom"))),
                 );
                 let _u = p.subscribe(|_| {});
             }
@@ -4846,22 +4858,23 @@ mod tests {
 
     #[test]
     fn identity_key_changes_when_arena_slot_is_reused() {
-        let first = Node::<i32>::producer_opts(
-            NodeOpts {
+        let g = crate::graph::graph();
+        let first = g.producer_opts::<i32, _>(
+            |_| {},
+            crate::graph::GraphNodeOpts::default().with_node(NodeOpts {
                 factory: Some("first".to_owned()),
                 ..NodeOpts::default()
-            },
-            |_| {},
+            }),
         );
         let first_key = first.erased().identity_key();
         drop(first);
 
-        let second = Node::<i32>::producer_opts(
-            NodeOpts {
+        let second = g.producer_opts::<i32, _>(
+            |_| {},
+            crate::graph::GraphNodeOpts::default().with_node(NodeOpts {
                 factory: Some("second".to_owned()),
                 ..NodeOpts::default()
-            },
-            |_| {},
+            }),
         );
         let second_key = second.erased().identity_key();
 
@@ -4902,13 +4915,14 @@ mod tests {
 
     #[test]
     fn active_wave_deferred_delivery_drain_uses_borrowed_core() {
+        let g = crate::graph::graph();
         // DR-8/B54: when a DATA delivery queues a fn run until the delivery boundary,
         // the owner wave's arena pin is still live while the drain executes. Rehydrate
         // that target as a borrowed Core, not a transient counted Core.
-        let source = Node::<i32>::state_empty();
+        let source = g.state_empty::<i32>();
         let observed_refs = Rc::new(Cell::new(usize::MAX));
         let refs_slot: Rc<RefCell<Option<Rc<Cell<usize>>>>> = Rc::new(RefCell::new(None));
-        let derived: Node<i32> = Node::derived(vec![source.erased()], {
+        let derived: Node<i32> = g.node(vec![source.erased()], {
             let observed_refs = observed_refs.clone();
             let refs_slot = refs_slot.clone();
             move |ctx| {
@@ -4964,11 +4978,12 @@ mod tests {
 
     #[test]
     fn same_array_data_then_complete_runs_once_then_completes() {
+        let g = crate::graph::graph();
         // R-terminals (auto COMPLETE): the node runs once on the DATA its dependency sent
         // with COMPLETE in one array, then completes after that run (C-36).
-        let source = Node::<i32>::state_empty();
+        let source = g.state_empty::<i32>();
         let runs = Rc::new(Cell::new(0usize));
-        let derived: Node<i32> = Node::derived(vec![source.erased()], {
+        let derived: Node<i32> = g.node(vec![source.erased()], {
             let runs = runs.clone();
             move |ctx| {
                 let Some(v) = ctx.dep(0).value::<i32>() else {
@@ -4988,13 +5003,14 @@ mod tests {
 
     #[test]
     fn seed_note_reaches_only_the_seeded_first_run() {
+        let g = crate::graph::graph();
         // R-invocation@2 / R-subscription@3: only the seeded instance's first run
         // receives the seed's note; every other run sees none.
-        let s = Node::<i32>::state(1);
+        let s = g.state::<i32>(1);
         let notes = Rc::new(RefCell::new(Vec::<Option<i32>>::new()));
         let d: Node<i32> = {
             let notes = notes.clone();
-            Node::derived(vec![s.erased()], move |ctx| {
+            g.node(vec![s.erased()], move |ctx| {
                 notes.borrow_mut().push(ctx.seed::<i32>().map(|n| *n));
                 ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
             })
@@ -5022,13 +5038,13 @@ mod tests {
 
     #[test]
     fn sink_panic_does_not_abort_the_wave() {
+        let g = crate::graph::graph();
         // R-failure@3: a panicking sink on the source neither aborts the fanout nor
         // leaves queued delivery work behind; the dependent still runs once.
-        default_domain().deferred_delivery.borrow_mut().clear();
-
-        let source = Node::<i32>::state_empty();
+        let source = g.state_empty::<i32>();
+        source.core.domain().deferred_delivery.borrow_mut().clear();
         let runs = Rc::new(Cell::new(0usize));
-        let d: Node<i32> = Node::derived(vec![source.erased()], {
+        let d: Node<i32> = g.node(vec![source.erased()], {
             let runs = runs.clone();
             move |ctx| {
                 if ctx.dep(0).has() {
@@ -5049,7 +5065,7 @@ mod tests {
 
         assert_eq!(runs.get(), 1, "the dependent still runs once");
         assert!(
-            default_domain().deferred_delivery.borrow().is_empty(),
+            source.core.domain().deferred_delivery.borrow().is_empty(),
             "no delivery work is left queued"
         );
         source.set(2);
@@ -5135,12 +5151,13 @@ mod tests {
 
     #[test]
     fn public_wave_owner_entry_does_not_preclone_core() {
+        let g = TestArena::new();
         // DR-8/B54 owner-execution prep: public down/up entry should enter the
         // wave-owner boundary with the existing owner handle instead of creating an
         // extra counted Core clone before the hot wave path runs. The scope itself
         // also stores only the owner's graph id; the touched-set remains the only
         // in-wave arena safety pin.
-        let source = Node::<i32>::state_empty();
+        let source = g.state_empty::<i32>();
         let refs = source.core.refs.clone();
         let seen_refs = Rc::new(Cell::new(0usize));
         let seen = seen_refs.clone();
@@ -5310,6 +5327,7 @@ mod tests {
 
     #[test]
     fn run_wave_ctx_borrows_core_until_defer_promotes() {
+        let g = TestArena::new();
         // DR-8/B54 delivery-waist follow-up: a synchronous fn-body Ctx is used only
         // while the wave touched-set already pins the owner in the arena, so it can be
         // an uncounted arena view. The async escape hatch ctx.defer() must promote to a
@@ -5320,7 +5338,7 @@ mod tests {
         let deferred_ctx: Rc<RefCell<Option<crate::ctx::DeferredCtx>>> =
             Rc::new(RefCell::new(None));
 
-        let p = Node::<i32>::producer({
+        let p = g.producer::<i32, _>({
             let refs_slot = refs_slot.clone();
             let sync_refs = sync_refs.clone();
             let deferred_refs = deferred_refs.clone();
@@ -5366,10 +5384,11 @@ mod tests {
 
     #[test]
     fn a_producer_reruns_on_reactivation_while_its_call_slot_persists() {
+        let g = crate::graph::graph();
         // Deactivation closes the lifetime and the next activation is a new first run,
         // without unregistering and re-registering the producer's callable.
         let runs = Rc::new(Cell::new(0usize));
-        let p = Node::<i32>::producer({
+        let p = g.producer::<i32, _>({
             let runs = runs.clone();
             move |ctx| {
                 runs.set(runs.get() + 1);
@@ -5394,14 +5413,15 @@ mod tests {
 
     #[test]
     fn reachable_upstream_uses_arena_keys_without_refcount_churn() {
+        let g = crate::graph::graph();
         // DR-8/B54 retained-topology safe subset: the cycle-prevention DFS should walk
         // graph-owned generation keys from the topology side-table without allocating
         // extra counted Core clones for traversal.
-        let a = Node::<i32>::state(1);
-        let b: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
+        let a = g.state::<i32>(1);
+        let b: Node<i32> = g.node(vec![a.erased()], |ctx| {
             ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
         });
-        let c: Node<i32> = Node::derived(vec![b.erased()], |ctx| {
+        let c: Node<i32> = g.node(vec![b.erased()], |ctx| {
             ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
         });
         let before = (a.core.refs.get(), b.core.refs.get(), c.core.refs.get());
@@ -5596,12 +5616,13 @@ mod tests {
 
     #[test]
     fn queued_later_output_does_not_pin_its_node() {
+        let g = TestArena::new();
         // DR-8/B54: a later wave queued as a request holds its node weakly, so the
         // queue never keeps a node alive.
-        let source = Node::<i32>::state(1);
+        let source = g.state::<i32>(1);
         let refs = source.core.refs.clone();
 
-        crate::batch::batch(|_| {
+        g.batch(|_| {
             let before = refs.get();
             source.core.request_down_next(vec![Message::Invalidate]);
             assert_eq!(
@@ -5616,11 +5637,12 @@ mod tests {
 
     #[test]
     fn defer_to_batch_does_not_increment_refs() {
-        let source = Node::<i32>::state(1);
+        let g = crate::graph::graph();
+        let source = g.state::<i32>(1);
         let refs = source.core.refs.clone();
         let before = refs.get();
 
-        crate::batch::batch(|_| {
+        g.batch(|_| {
             source.set(2);
             source.set(3);
             source.set(4);
@@ -5750,10 +5772,11 @@ mod tests {
 
     #[test]
     fn wave_scope_blamed_does_not_add_ref_pin() {
+        let g = TestArena::new();
         // DR-8/B54 next slice: `blamed` is a generation-keyed arena reference rather
         // than another counted Core clone. The touched-set now pins live nodes in the
         // owner arena for drop/unwind safety; neither touch nor blame increments Core refs.
-        let source = Node::<i32>::state(1);
+        let source = g.state::<i32>(1);
         let refs = source.core.refs.clone();
 
         with_wave_owner(
@@ -5783,14 +5806,15 @@ mod tests {
 
     #[test]
     fn generation_keyed_blame_recovers_after_callback_drop_and_fn_panic() {
+        let g = crate::graph::graph();
         // DR-8/B54: the fn-running node is pinned by the touched set, while `blamed`
         // itself is only a generation key. If a subscriber callback drops another
         // same-arena node and the fn then panics, recovery still emits ERROR on the
         // blamed node without holding a GraphCore borrow across the callback.
         let held: Rc<RefCell<Option<Node<i32>>>> =
-            Rc::new(RefCell::new(Some(Node::<i32>::producer(|_| {}))));
-        let source = Node::<i32>::state_empty();
-        let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
+            Rc::new(RefCell::new(Some(g.producer::<i32, _>(|_| {}))));
+        let source = g.state_empty::<i32>();
+        let derived: Node<i32> = g.node(vec![source.erased()], |ctx| {
             ctx.emit(*ctx.dep(0).value::<i32>().unwrap());
             panic!("panic after subscriber callback");
         });
@@ -5925,7 +5949,8 @@ mod tests {
 
     #[test]
     fn d109_default_v0_advances_only_on_data() {
-        let s = Node::<i32>::state(1);
+        let g = crate::graph::graph();
+        let s = g.state::<i32>(1);
         assert_eq!(s.version(), Some(NodeVersion::V0 { counter: 0 }));
 
         s.set(2);
@@ -5941,6 +5966,7 @@ mod tests {
 
     #[test]
     fn d112_v1_hash_receives_strict_canonical_json_bytes() {
+        let g = crate::graph::graph();
         let calls = Rc::new(RefCell::new(Vec::<String>::new()));
         let calls_for_hash = calls.clone();
         let hash = Rc::new(move |bytes: &[u8]| {
@@ -5950,13 +5976,13 @@ mod tests {
             calls_for_hash.borrow_mut().push(text.clone());
             format!("h:{text}")
         });
-        let node = Node::<serde_json::Value>::derived_opts(
+        let node = g.node_opts::<serde_json::Value, _>(
             vec![],
-            NodeOpts {
+            |ctx| ctx.emit(json!({ "b": 2, "a": 1 })),
+            crate::graph::GraphNodeOpts::default().with_node(NodeOpts {
                 versioning: Some(NodeVersioningPolicy::Level1 { hash: Some(hash) }),
                 ..NodeOpts::default()
-            },
-            |ctx| ctx.emit(json!({ "b": 2, "a": 1 })),
+            }),
         );
         let _u = node.subscribe(|_| {});
 
@@ -5979,13 +6005,14 @@ mod tests {
 
     #[test]
     fn d112_v1_rejects_invalid_data_before_cache_or_version_mutation() {
-        let node = Node::<serde_json::Value>::derived_opts(
+        let g = crate::graph::graph();
+        let node = g.node_opts::<serde_json::Value, _>(
             vec![],
-            NodeOpts {
+            |_ctx| {},
+            crate::graph::GraphNodeOpts::default().with_node(NodeOpts {
                 versioning: Some(NodeVersioningPolicy::Level1 { hash: None }),
                 ..NodeOpts::default()
-            },
-            |_ctx| {},
+            }),
         );
         let before = node.version();
         node.down(vec![Message::Data(Rc::new(f64::NAN))]);

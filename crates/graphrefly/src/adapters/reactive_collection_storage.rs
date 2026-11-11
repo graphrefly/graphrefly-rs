@@ -427,6 +427,7 @@ where
 
 /// Creates or computes `open_persistent_reactive_list`.
 pub fn open_persistent_reactive_list<T>(
+    graph: &crate::Graph,
     options: OpenPersistentReactiveListOptions<T>,
 ) -> StorageResult<OpenPersistentReactiveList<T>>
 where
@@ -444,7 +445,7 @@ where
         state.state = options.initial;
     }
     let initial_cursor = state.cursor;
-    let collection = restore_reactive_list(state, options.collection)?;
+    let collection = restore_reactive_list(graph, state, options.collection)?;
     let persistence =
         persist_reactive_list_with_cursor(&collection, options.persistence, initial_cursor)?;
     Ok(OpenPersistentReactiveList {
@@ -455,6 +456,7 @@ where
 
 /// Creates or computes `open_persistent_reactive_log`.
 pub fn open_persistent_reactive_log<T>(
+    graph: &crate::Graph,
     options: OpenPersistentReactiveLogOptions<T>,
 ) -> StorageResult<OpenPersistentReactiveLog<T>>
 where
@@ -472,7 +474,7 @@ where
         state.state = options.initial;
     }
     let initial_cursor = state.cursor;
-    let collection = restore_reactive_log(state, options.collection)?;
+    let collection = restore_reactive_log(graph, state, options.collection)?;
     let persistence =
         persist_reactive_log_with_cursor(&collection, options.persistence, initial_cursor)?;
     Ok(OpenPersistentReactiveLog {
@@ -483,6 +485,7 @@ where
 
 /// Creates or computes `open_persistent_reactive_map`.
 pub fn open_persistent_reactive_map<K, V>(
+    graph: &crate::Graph,
     options: OpenPersistentReactiveMapOptions<K, V>,
 ) -> StorageResult<OpenPersistentReactiveMap<K, V>>
 where
@@ -504,7 +507,7 @@ where
         state.state = options.initial;
     }
     let initial_cursor = state.cursor;
-    let collection = restore_reactive_map(state, options.collection)?;
+    let collection = restore_reactive_map(graph, state, options.collection)?;
     let persistence =
         persist_reactive_map_with_cursor(&collection, options.persistence, initial_cursor)?;
     Ok(OpenPersistentReactiveMap {
@@ -515,6 +518,7 @@ where
 
 /// Creates or computes `open_persistent_reactive_index`.
 pub fn open_persistent_reactive_index<K, S, V>(
+    graph: &crate::Graph,
     options: OpenPersistentReactiveIndexOptions<K, S, V>,
 ) -> StorageResult<OpenPersistentReactiveIndex<K, S, V>>
 where
@@ -537,7 +541,7 @@ where
         state.state = options.initial;
     }
     let initial_cursor = state.cursor;
-    let collection = restore_reactive_index(state, options.collection)?;
+    let collection = restore_reactive_index(graph, state, options.collection)?;
     let persistence =
         persist_reactive_index_with_cursor(&collection, options.persistence, initial_cursor)?;
     Ok(OpenPersistentReactiveIndex {

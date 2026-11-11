@@ -689,8 +689,9 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     unsubscribe_doubled();
 
     let map_store = reactive_map::<String, i32>(
+        &g,
         vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
-        ReactiveMapOptions::named("acceptance/items").graph(g.clone()),
+        ReactiveMapOptions::named("acceptance/items"),
     );
     let selected = map_store.select(|value, _key| *value >= 2);
     let selected_snapshots = Rc::new(RefCell::new(Vec::new()));

@@ -43,6 +43,7 @@ fn record<T: 'static>(node: &Node<T>) -> (Log, Unsub) {
 /// NOT hit by the landed operators (which use complete_when_deps_complete:false). Mirrors TS a/b/c.
 #[test]
 fn c17_absorbed_error_counts_terminal_for_auto_complete() {
+    let g = graphrefly::graph();
     fn fwd(ctx: &Ctx) {
         let v = ctx.dep(0).value::<i32>().map(|r| *r).unwrap_or(0);
         ctx.emit(v);
@@ -50,15 +51,15 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
 
     // (a) error-then-complete: C errors (absorbed), then B completes → D auto-COMPLETEs.
     {
-        let b = Node::<i32>::state_empty();
-        let c = Node::<i32>::state_empty();
-        let d = Node::<i32>::derived_opts(
+        let b = g.state_empty::<i32>();
+        let c = g.state_empty::<i32>();
+        let d = g.node_opts::<i32, _>(
             vec![b.erased(), c.erased()],
-            NodeOpts {
+            fwd,
+            graphrefly::GraphNodeOpts::default().with_node(NodeOpts {
                 error: graphrefly::Policy::Manual, // absorbs C's error, stays live
                 ..NodeOpts::default()
-            },
-            fwd,
+            }),
         );
         let (_log, _u) = record(&d);
         c.error("boom"); // absorbed; B still live → not yet all-terminal
@@ -71,15 +72,15 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
 
     // (b) complete-then-error: B completes, then C errors LAST → still auto-COMPLETEs (ERROR-arm mirror).
     {
-        let b = Node::<i32>::state_empty();
-        let c = Node::<i32>::state_empty();
-        let d = Node::<i32>::derived_opts(
+        let b = g.state_empty::<i32>();
+        let c = g.state_empty::<i32>();
+        let d = g.node_opts::<i32, _>(
             vec![b.erased(), c.erased()],
-            NodeOpts {
+            fwd,
+            graphrefly::GraphNodeOpts::default().with_node(NodeOpts {
                 error: graphrefly::Policy::Manual,
                 ..NodeOpts::default()
-            },
-            fwd,
+            }),
         );
         let (_log, _u) = record(&d);
         b.set(1);
@@ -91,9 +92,13 @@ fn c17_absorbed_error_counts_terminal_for_auto_complete() {
 
     // (c) default error_when_deps_error:true → auto-ERRORs on a dep error (absorbed path gated off).
     {
-        let b = Node::<i32>::state_empty();
-        let c = Node::<i32>::state_empty();
-        let d = Node::<i32>::derived_opts(vec![b.erased(), c.erased()], NodeOpts::default(), fwd);
+        let b = g.state_empty::<i32>();
+        let c = g.state_empty::<i32>();
+        let d = g.node_opts::<i32, _>(
+            vec![b.erased(), c.erased()],
+            fwd,
+            graphrefly::GraphNodeOpts::default().with_node(NodeOpts::default()),
+        );
         let (_log, _u) = record(&d);
         c.error("boom"); // auto-cascade → ERROR before any complete-check
         assert_eq!(d.status().output, graphrefly::OutputStatus::Errored);

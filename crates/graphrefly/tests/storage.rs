@@ -758,6 +758,7 @@ fn reactive_collection_load_rejects_corrupt_frames_and_impossible_folds() {
 
 #[test]
 fn restore_reactive_helpers_seed_backends_without_storage_reads() {
+    let g = graphrefly::graph();
     let list_state = graphrefly::ReactiveCollectionRestoreState {
         kind: ReactiveCollectionKind::ReactiveList,
         state: vec![1, 2],
@@ -774,7 +775,7 @@ fn restore_reactive_helpers_seed_backends_without_storage_reads() {
         snapshot_found: true,
         changes_applied: 0,
     };
-    let list = restore_reactive_list(list_state, ReactiveListOptions::default()).unwrap();
+    let list = restore_reactive_list(&g, list_state, ReactiveListOptions::default()).unwrap();
     assert_eq!(list.to_vec(), vec![1, 2]);
 
     let log_state = graphrefly::ReactiveCollectionRestoreState {
@@ -793,7 +794,7 @@ fn restore_reactive_helpers_seed_backends_without_storage_reads() {
         snapshot_found: true,
         changes_applied: 0,
     };
-    let log = restore_reactive_log(log_state, ReactiveLogOptions::default()).unwrap();
+    let log = restore_reactive_log(&g, log_state, ReactiveLogOptions::default()).unwrap();
     assert_eq!(log.to_vec(), vec!["a".to_owned(), "b".to_owned()]);
 
     let map_state = graphrefly::ReactiveCollectionRestoreState {
@@ -812,7 +813,7 @@ fn restore_reactive_helpers_seed_backends_without_storage_reads() {
         snapshot_found: true,
         changes_applied: 0,
     };
-    let map = restore_reactive_map(map_state, ReactiveMapOptions::default()).unwrap();
+    let map = restore_reactive_map(&g, map_state, ReactiveMapOptions::default()).unwrap();
     assert_eq!(map.get(&"k".to_owned()), Some(7));
     let duplicate_map = graphrefly::ReactiveCollectionRestoreState {
         kind: ReactiveCollectionKind::ReactiveMap,
@@ -830,7 +831,7 @@ fn restore_reactive_helpers_seed_backends_without_storage_reads() {
         snapshot_found: true,
         changes_applied: 0,
     };
-    let err = match restore_reactive_map(duplicate_map, ReactiveMapOptions::default()) {
+    let err = match restore_reactive_map(&g, duplicate_map, ReactiveMapOptions::default()) {
         Ok(_) => panic!("duplicate map keys must fail restore"),
         Err(err) => err,
     };
@@ -856,7 +857,7 @@ fn restore_reactive_helpers_seed_backends_without_storage_reads() {
         snapshot_found: true,
         changes_applied: 0,
     };
-    let index = restore_reactive_index(index_state, ReactiveIndexOptions::default()).unwrap();
+    let index = restore_reactive_index(&g, index_state, ReactiveIndexOptions::default()).unwrap();
     assert_eq!(index.get(&"p".to_owned()), Some(9));
     let duplicate_index = graphrefly::ReactiveCollectionRestoreState {
         kind: ReactiveCollectionKind::ReactiveIndex,
@@ -885,7 +886,7 @@ fn restore_reactive_helpers_seed_backends_without_storage_reads() {
         snapshot_found: true,
         changes_applied: 0,
     };
-    let err = match restore_reactive_index(duplicate_index, ReactiveIndexOptions::default()) {
+    let err = match restore_reactive_index(&g, duplicate_index, ReactiveIndexOptions::default()) {
         Ok(_) => panic!("duplicate index primaries must fail restore"),
         Err(err) => err,
     };
@@ -901,20 +902,23 @@ fn open_persistent_reactive_list_composes_load_restore_and_persist() {
     );
 
     let opened_graph = graph();
-    let opened = open_persistent_reactive_list(OpenPersistentReactiveListOptions {
-        initial: vec![10],
-        collection: ReactiveListOptions::default().graph(opened_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(opened_graph),
-            name: None,
-            storage_prefix: Some("persistent-list".to_owned()),
-            snapshot_key: None,
-            snapshot_store: snapshots.clone(),
-            change_log: Some(changes.clone()),
-            snapshot_on_attach: true,
-            snapshot_every_changes: None,
+    let opened = open_persistent_reactive_list(
+        &opened_graph,
+        OpenPersistentReactiveListOptions {
+            initial: vec![10],
+            collection: ReactiveListOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(opened_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-list".to_owned()),
+                snapshot_key: None,
+                snapshot_store: snapshots.clone(),
+                change_log: Some(changes.clone()),
+                snapshot_on_attach: true,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
 
     assert_eq!(opened.collection.to_vec(), vec![10]);
@@ -934,20 +938,23 @@ fn open_persistent_reactive_list_composes_load_restore_and_persist() {
     assert_eq!(opened.persistence.ready.cache(), Some(true));
 
     let reopened_graph = graph();
-    let reopened = open_persistent_reactive_list(OpenPersistentReactiveListOptions {
-        initial: vec![99],
-        collection: ReactiveListOptions::default().graph(reopened_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(reopened_graph),
-            name: None,
-            storage_prefix: Some("persistent-list".to_owned()),
-            snapshot_key: None,
-            snapshot_store: snapshots.clone(),
-            change_log: Some(changes.clone()),
-            snapshot_on_attach: true,
-            snapshot_every_changes: None,
+    let reopened = open_persistent_reactive_list(
+        &reopened_graph,
+        OpenPersistentReactiveListOptions {
+            initial: vec![99],
+            collection: ReactiveListOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(reopened_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-list".to_owned()),
+                snapshot_key: None,
+                snapshot_store: snapshots.clone(),
+                change_log: Some(changes.clone()),
+                snapshot_on_attach: true,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
 
     assert_eq!(
@@ -961,20 +968,23 @@ fn open_persistent_reactive_list_composes_load_restore_and_persist() {
     assert_eq!(reopened_cursor.change_writes, 0);
 
     let reopened_again_graph = graph();
-    let reopened_again = open_persistent_reactive_list(OpenPersistentReactiveListOptions {
-        initial: vec![99],
-        collection: ReactiveListOptions::default().graph(reopened_again_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(reopened_again_graph),
-            name: None,
-            storage_prefix: Some("persistent-list".to_owned()),
-            snapshot_key: None,
-            snapshot_store: snapshots,
-            change_log: Some(changes),
-            snapshot_on_attach: false,
-            snapshot_every_changes: None,
+    let reopened_again = open_persistent_reactive_list(
+        &reopened_again_graph,
+        OpenPersistentReactiveListOptions {
+            initial: vec![99],
+            collection: ReactiveListOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(reopened_again_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-list".to_owned()),
+                snapshot_key: None,
+                snapshot_store: snapshots,
+                change_log: Some(changes),
+                snapshot_on_attach: false,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
 
     assert_eq!(
@@ -993,39 +1003,45 @@ fn open_persistent_reactive_log_composes_load_restore_and_persist() {
     );
 
     let opened_graph = graph();
-    let opened = open_persistent_reactive_log(OpenPersistentReactiveLogOptions {
-        initial: vec!["a".to_owned()],
-        collection: ReactiveLogOptions::default().graph(opened_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(opened_graph),
-            name: None,
-            storage_prefix: Some("persistent-log".to_owned()),
-            snapshot_key: None,
-            snapshot_store: snapshots.clone(),
-            change_log: Some(changes.clone()),
-            snapshot_on_attach: true,
-            snapshot_every_changes: None,
+    let opened = open_persistent_reactive_log(
+        &opened_graph,
+        OpenPersistentReactiveLogOptions {
+            initial: vec!["a".to_owned()],
+            collection: ReactiveLogOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(opened_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-log".to_owned()),
+                snapshot_key: None,
+                snapshot_store: snapshots.clone(),
+                change_log: Some(changes.clone()),
+                snapshot_on_attach: true,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
     opened.collection.append("b".to_owned());
     opened.persistence.flush().unwrap();
 
     let reopened_graph = graph();
-    let reopened = open_persistent_reactive_log(OpenPersistentReactiveLogOptions {
-        initial: vec!["ignored".to_owned()],
-        collection: ReactiveLogOptions::default().graph(reopened_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(reopened_graph),
-            name: None,
-            storage_prefix: Some("persistent-log".to_owned()),
-            snapshot_key: None,
-            snapshot_store: snapshots,
-            change_log: Some(changes),
-            snapshot_on_attach: false,
-            snapshot_every_changes: None,
+    let reopened = open_persistent_reactive_log(
+        &reopened_graph,
+        OpenPersistentReactiveLogOptions {
+            initial: vec!["ignored".to_owned()],
+            collection: ReactiveLogOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(reopened_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-log".to_owned()),
+                snapshot_key: None,
+                snapshot_store: snapshots,
+                change_log: Some(changes),
+                snapshot_on_attach: false,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
     assert_eq!(
         reopened.collection.to_vec(),
@@ -1041,39 +1057,45 @@ fn open_persistent_map_and_index_compose_load_restore_and_persist() {
         memory_append_log::<ReactiveCollectionChangeFrame>("persistent-map/changes"),
     );
     let opened_map_graph = graph();
-    let opened_map = open_persistent_reactive_map(OpenPersistentReactiveMapOptions {
-        initial: vec![("a".to_owned(), 1)],
-        collection: ReactiveMapOptions::default().graph(opened_map_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(opened_map_graph),
-            name: None,
-            storage_prefix: Some("persistent-map".to_owned()),
-            snapshot_key: None,
-            snapshot_store: map_snapshots.clone(),
-            change_log: Some(map_changes.clone()),
-            snapshot_on_attach: true,
-            snapshot_every_changes: None,
+    let opened_map = open_persistent_reactive_map(
+        &opened_map_graph,
+        OpenPersistentReactiveMapOptions {
+            initial: vec![("a".to_owned(), 1)],
+            collection: ReactiveMapOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(opened_map_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-map".to_owned()),
+                snapshot_key: None,
+                snapshot_store: map_snapshots.clone(),
+                change_log: Some(map_changes.clone()),
+                snapshot_on_attach: true,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
     opened_map.collection.set("b".to_owned(), 2);
     opened_map.persistence.flush().unwrap();
 
     let reopened_map_graph = graph();
-    let reopened_map = open_persistent_reactive_map(OpenPersistentReactiveMapOptions {
-        initial: vec![("ignored".to_owned(), 9)],
-        collection: ReactiveMapOptions::default().graph(reopened_map_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(reopened_map_graph),
-            name: None,
-            storage_prefix: Some("persistent-map".to_owned()),
-            snapshot_key: None,
-            snapshot_store: map_snapshots,
-            change_log: Some(map_changes),
-            snapshot_on_attach: false,
-            snapshot_every_changes: None,
+    let reopened_map = open_persistent_reactive_map(
+        &reopened_map_graph,
+        OpenPersistentReactiveMapOptions {
+            initial: vec![("ignored".to_owned(), 9)],
+            collection: ReactiveMapOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(reopened_map_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-map".to_owned()),
+                snapshot_key: None,
+                snapshot_store: map_snapshots,
+                change_log: Some(map_changes),
+                snapshot_on_attach: false,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
     assert_eq!(reopened_map.collection.get(&"a".to_owned()), Some(1));
     assert_eq!(reopened_map.collection.get(&"b".to_owned()), Some(2));
@@ -1084,24 +1106,27 @@ fn open_persistent_map_and_index_compose_load_restore_and_persist() {
         memory_append_log::<ReactiveCollectionChangeFrame>("persistent-index/changes"),
     );
     let opened_index_graph = graph();
-    let opened_index = open_persistent_reactive_index(OpenPersistentReactiveIndexOptions {
-        initial: vec![graphrefly::IndexRow {
-            primary: "p1".to_owned(),
-            secondary: 2,
-            value: 20,
-        }],
-        collection: ReactiveIndexOptions::default().graph(opened_index_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(opened_index_graph),
-            name: None,
-            storage_prefix: Some("persistent-index".to_owned()),
-            snapshot_key: None,
-            snapshot_store: index_snapshots.clone(),
-            change_log: Some(index_changes.clone()),
-            snapshot_on_attach: true,
-            snapshot_every_changes: None,
+    let opened_index = open_persistent_reactive_index(
+        &opened_index_graph,
+        OpenPersistentReactiveIndexOptions {
+            initial: vec![graphrefly::IndexRow {
+                primary: "p1".to_owned(),
+                secondary: 2,
+                value: 20,
+            }],
+            collection: ReactiveIndexOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(opened_index_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-index".to_owned()),
+                snapshot_key: None,
+                snapshot_store: index_snapshots.clone(),
+                change_log: Some(index_changes.clone()),
+                snapshot_on_attach: true,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
     opened_index.collection.upsert("p2".to_owned(), 1, 10);
     opened_index.collection.upsert("p3".to_owned(), 3, 30);
@@ -1113,20 +1138,23 @@ fn open_persistent_map_and_index_compose_load_restore_and_persist() {
     opened_index.persistence.flush().unwrap();
 
     let reopened_index_graph = graph();
-    let reopened_index = open_persistent_reactive_index(OpenPersistentReactiveIndexOptions {
-        initial: Vec::<graphrefly::IndexRow<String, i32, i32>>::new(),
-        collection: ReactiveIndexOptions::default().graph(reopened_index_graph.clone()),
-        persistence: PersistReactiveCollectionOptions {
-            graph: Some(reopened_index_graph),
-            name: None,
-            storage_prefix: Some("persistent-index".to_owned()),
-            snapshot_key: None,
-            snapshot_store: index_snapshots,
-            change_log: Some(index_changes),
-            snapshot_on_attach: false,
-            snapshot_every_changes: None,
+    let reopened_index = open_persistent_reactive_index(
+        &reopened_index_graph,
+        OpenPersistentReactiveIndexOptions {
+            initial: Vec::<graphrefly::IndexRow<String, i32, i32>>::new(),
+            collection: ReactiveIndexOptions::default(),
+            persistence: PersistReactiveCollectionOptions {
+                graph: Some(reopened_index_graph.clone()),
+                name: None,
+                storage_prefix: Some("persistent-index".to_owned()),
+                snapshot_key: None,
+                snapshot_store: index_snapshots,
+                change_log: Some(index_changes),
+                snapshot_on_attach: false,
+                snapshot_every_changes: None,
+            },
         },
-    })
+    )
     .unwrap();
     assert_eq!(reopened_index.collection.get(&"p1".to_owned()), None);
     assert_eq!(reopened_index.collection.get(&"p2".to_owned()), Some(10));
@@ -1141,10 +1169,7 @@ fn persistence_sidecar_snapshot_cadence_and_cross_graph_preflight() {
         memory_append_log::<ReactiveCollectionChangeFrame>("cadence/changes"),
     );
     let g = graph();
-    let list = reactive_list::<i32>(
-        vec![0],
-        ReactiveListOptions::named("cadence").graph(g.clone()),
-    );
+    let list = reactive_list::<i32>(&g, vec![0], ReactiveListOptions::named("cadence"));
     let persistence = persist_reactive_list(
         &list,
         PersistReactiveCollectionOptions {
@@ -1195,37 +1220,34 @@ fn persistence_sidecar_snapshot_cadence_and_cross_graph_preflight() {
     assert_eq!(status.state, ReactiveCollectionPersistenceStatus::Ready);
     assert_eq!(status.writes, 3);
 
-    let graphless = reactive_list::<i32>(Vec::new(), ReactiveListOptions::default());
-    let graphless_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
+    let unbound = reactive_list::<i32>(&g, Vec::new(), ReactiveListOptions::default());
+    let unbound_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
         Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
-    let graphless_err = match persist_reactive_list(
-        &graphless,
+    let unbound_err = match persist_reactive_list(
+        &unbound,
         PersistReactiveCollectionOptions {
             graph: None,
             name: Some("graphless/persistence".to_owned()),
             storage_prefix: Some("graphless".to_owned()),
             snapshot_key: Some("graphless/snapshot".to_owned()),
-            snapshot_store: graphless_snapshots.clone(),
+            snapshot_store: unbound_snapshots.clone(),
             change_log: None,
             snapshot_on_attach: false,
             snapshot_every_changes: None,
         },
     ) {
-        Ok(_) => panic!("graphless persistence must fail before creating facts"),
+        Ok(_) => panic!("persistence without a graph option must fail before creating facts"),
         Err(err) => err,
     };
-    assert!(graphless_err.to_string().contains("graph is required"));
-    assert!(graphless_snapshots
+    assert!(unbound_err.to_string().contains("graph is required"));
+    assert!(unbound_snapshots
         .get("graphless/snapshot")
         .unwrap()
         .is_none());
 
     let owner = graph();
     let other = graph();
-    let owned = reactive_list::<i32>(
-        Vec::new(),
-        ReactiveListOptions::named("owned").graph(owner.clone()),
-    );
+    let owned = reactive_list::<i32>(&owner, Vec::new(), ReactiveListOptions::named("owned"));
     let cross_snapshots: Rc<dyn KvStorageTier<ReactiveCollectionSnapshotFrame>> =
         Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
     let cross_changes: Rc<dyn AppendLogStorageTier<ReactiveCollectionChangeFrame>> = Rc::new(
@@ -1266,13 +1288,14 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
         Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
     let snapshot_only_graph = graph();
     let list = reactive_list::<i32>(
+        &snapshot_only_graph,
         vec![1],
-        ReactiveListOptions::default().graph(snapshot_only_graph.clone()),
+        ReactiveListOptions::default(),
     );
     let persistence = persist_reactive_list(
         &list,
         PersistReactiveCollectionOptions {
-            graph: Some(snapshot_only_graph),
+            graph: Some(snapshot_only_graph.clone()),
             name: None,
             storage_prefix: Some("snapshot-only".to_owned()),
             snapshot_key: None,
@@ -1294,13 +1317,14 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
     let failing_snapshots = Rc::new(FailOnceSnapshotStore::new());
     let failing_snapshot_graph = graph();
     let failing_snapshot_list = reactive_list::<i32>(
+        &failing_snapshot_graph,
         vec![1],
-        ReactiveListOptions::default().graph(failing_snapshot_graph.clone()),
+        ReactiveListOptions::default(),
     );
     let failing_snapshot = persist_reactive_list(
         &failing_snapshot_list,
         PersistReactiveCollectionOptions {
-            graph: Some(failing_snapshot_graph),
+            graph: Some(failing_snapshot_graph.clone()),
             name: None,
             storage_prefix: Some("snapshot-failure".to_owned()),
             snapshot_key: None,
@@ -1328,14 +1352,11 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
         Rc::new(memory_kv::<ReactiveCollectionSnapshotFrame>());
     let failing_log = Rc::new(FailOnceChangeLog::new("retry/changes"));
     let retry_graph = graph();
-    let retry_list = reactive_list::<i32>(
-        vec![0],
-        ReactiveListOptions::default().graph(retry_graph.clone()),
-    );
+    let retry_list = reactive_list::<i32>(&retry_graph, vec![0], ReactiveListOptions::default());
     let retry = persist_reactive_list(
         &retry_list,
         PersistReactiveCollectionOptions {
-            graph: Some(retry_graph),
+            graph: Some(retry_graph.clone()),
             name: None,
             storage_prefix: Some("retry".to_owned()),
             snapshot_key: None,
@@ -1368,7 +1389,7 @@ fn persistence_sidecar_flush_without_change_log_writes_snapshot_and_failed_appen
 #[test]
 fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
     let g = graph();
-    let list = reactive_list::<i32>(vec![1], ReactiveListOptions::named("list").graph(g.clone()));
+    let list = reactive_list::<i32>(&g, vec![1], ReactiveListOptions::named("list"));
     list.append(2);
     let _activate_snapshot = list.snapshot.subscribe(|_| {});
 
@@ -1404,8 +1425,9 @@ fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
 
     let view_graph = graph();
     let map = reactive_map::<String, i32>(
+        &view_graph,
         vec![("a".to_owned(), 1), ("b".to_owned(), 2)],
-        ReactiveMapOptions::named("map").graph(view_graph.clone()),
+        ReactiveMapOptions::named("map"),
     );
     let view = map.select(|value, _key| *value > 1);
     view.snapshot_request.set(());
@@ -1427,8 +1449,9 @@ fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
 fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state() {
     let unsupported = graph();
     reactive_list::<i16>(
+        &unsupported,
         vec![1],
-        ReactiveListOptions::named("unsupported").graph(unsupported.clone()),
+        ReactiveListOptions::named("unsupported"),
     );
     let err = unsupported.checkpoint().unwrap_err();
     assert!(
@@ -1438,10 +1461,9 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
 
     let local_only = graph();
     reactive_list::<i32>(
+        &local_only,
         vec![1, 2, 3],
-        ReactiveListOptions::named("capped")
-            .graph(local_only.clone())
-            .max_size(2),
+        ReactiveListOptions::named("capped").max_size(2),
     );
     let checkpoint = local_only.checkpoint().unwrap();
     let capped = checkpoint
@@ -1460,10 +1482,9 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
 fn capped_reactive_log_checkpoint_restores_with_max_size_config() {
     let g = graph();
     let log = reactive_log::<i32>(
+        &g,
         vec![1, 2, 3],
-        ReactiveLogOptions::named("log")
-            .graph(g.clone())
-            .max_size(2),
+        ReactiveLogOptions::named("log").max_size(2),
     );
     log.append(4);
 

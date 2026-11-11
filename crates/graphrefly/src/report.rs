@@ -4,8 +4,8 @@
 //!
 //! The reporter belongs to the graph, the concurrency domain (R-graph-domain@2): it
 //! is the `report` option of [`crate::GraphOptions`], as the reference's
-//! `createGraph({ report })` (graphrefly-rs:D6). Nodes built outside any Graph live in
-//! the default domain, which has no reporter, so their failures are dropped.
+//! `createGraph({ report })` (graphrefly-rs:D6). Every node belongs to a graph
+//! (review Q2), so every failure has a graph whose option decides where it goes.
 
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};

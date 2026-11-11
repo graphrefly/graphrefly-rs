@@ -13,11 +13,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_core::Stream;
 use graphrefly::{
-    audit, audit_time, batch, buffer, buffer_count, buffer_time, catch_error, combine,
-    combine_latest, concat, concat_map, debounce, debounce_time, delay, distinct_until_changed,
-    element_at, empty, exhaust_map, filter, find, first, first_any, first_sync_value_from,
-    flat_map, from_cron, from_cron_with_options, from_fs_watch, from_fs_watch_with_options,
-    from_git_hook, from_git_hook_with_options, from_http, from_iter, from_process, from_sse,
+    audit, audit_time, buffer, buffer_count, buffer_time, catch_error, combine, combine_latest,
+    concat, concat_map, debounce, debounce_time, delay, distinct_until_changed, element_at, empty,
+    exhaust_map, filter, find, first, first_any, first_sync_value_from, flat_map, from_cron,
+    from_cron_with_options, from_fs_watch, from_fs_watch_with_options, from_git_hook,
+    from_git_hook_with_options, from_http, from_iter, from_process, from_sse,
     from_sse_with_options, from_timer, from_webhook, from_webhook_with_options, from_websocket,
     future_local, graph, interval, last, last_any, map, matches_cron, merge_map,
     merge_map_with_options, never, of, on_first_data, on_first_data_where, pairwise, parse_cron,
@@ -2618,7 +2618,7 @@ fn throttle_waits_for_open_window_before_source_complete() {
     let seen = collect_shapes::<i32>(&throttled);
     let data = collect_data(&throttled);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(1i32);
         src.complete();
     });
@@ -2675,7 +2675,7 @@ fn throttle_reactivation_starts_a_new_lifetime_on_the_completed_snapshot() {
             }
         });
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(1i32);
         src.complete();
     });
@@ -2765,7 +2765,7 @@ fn audit_flushes_same_wave_source_data_before_complete() {
     let seen = collect_shapes::<i32>(&audited);
     let data = collect_data(&audited);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(9i32);
         src.complete();
     });
@@ -2828,7 +2828,7 @@ fn audit_same_wave_reopen_only_suppresses_the_closed_notifier() {
     let data = collect_data(&audited);
 
     src.set(1);
-    batch(|_| {
+    g.batch(|_| {
         old_notifier.set(());
         src.set(2);
     });
@@ -2910,7 +2910,7 @@ fn timeout_arms_on_subscribe_resets_and_cleans_up() {
     let src = g.state_empty::<i32>();
     let completing = timeout(&src, 10);
     let completing_seen = collect_shapes::<i32>(&completing);
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(3i32);
         src.complete();
     });
@@ -3004,7 +3004,7 @@ fn timeout_same_wave_data_then_error_forwards_data_then_error_and_clears_timer()
     let seen = collect_shapes::<i32>(&timed);
     let data = collect_data(&timed);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(7i32);
         src.error("source failed");
     });
@@ -3046,7 +3046,7 @@ fn buffer_time_flushes_empty_windows_values_and_terminal_remainder() {
     driver.tick_intervals();
     assert_eq!(*data.borrow(), vec![Vec::<i32>::new(), vec![1, 2]]);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(3i32);
         src.complete();
     });
@@ -3166,7 +3166,7 @@ fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
     let delayed_seen = collect_shapes::<i32>(&delayed);
     let delayed_data = collect_data(&delayed);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(7i32);
         src.complete();
     });
@@ -3180,7 +3180,7 @@ fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
     let buffered_seen = collect_shapes::<Vec<i32>>(&buffered);
     let buffered_data = collect_data(&buffered);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         src.set(9i32);
         src.error("source failed");
     });
@@ -3589,7 +3589,7 @@ fn scan_and_merge_catalog_symbols_are_directly_pinned() {
         GraphNodeOpts::named("merge"),
     );
     let merged_seen = collect_data(&merged);
-    batch(|_| {
+    g.batch(|_| {
         left.set(1);
         right.set(10);
     });
@@ -3622,7 +3622,7 @@ fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
     let recovered_seen = collect_data(&recovered);
     let recovered_shapes = collect_shapes::<i32>(&recovered);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         source.set(7i32);
         source.error("boom");
     });
@@ -3890,7 +3890,7 @@ fn notifier_combinators_and_race_follow_static_edges() {
         GraphNodeOpts::named("sample_error"),
     );
     let sample_shapes = collect_shapes::<i32>(&sampled);
-    batch(|_| {
+    g.batch(|_| {
         source.complete();
         notifier.error("sample notifier failed");
     });
@@ -4147,7 +4147,8 @@ fn higher_order_repeat_replays_fresh_factory_rounds_and_completes() {
 #[test]
 #[should_panic(expected = "repeat: count must be positive")]
 fn higher_order_repeat_rejects_zero_count() {
-    let _ = repeat::<i32>(|| Node::producer(|_| {}), 0);
+    let g = graphrefly::graph();
+    let _ = repeat::<i32>(move || g.producer(|_| {}), 0);
 }
 
 #[test]
@@ -4465,7 +4466,7 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
     );
     let seen = collect_data(&merged);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         source.set(1i32);
         source.set(2i32);
         source.set(3i32);
@@ -4517,7 +4518,7 @@ fn higher_order_merge_map_with_options_skips_just_completed_reused_inner() {
     );
     let seen = collect_data(&merged);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         source.set(1i32);
         source.set(2i32);
         source.complete();
@@ -4546,7 +4547,7 @@ fn higher_order_merge_map_dedupes_reused_live_inner() {
     let shapes = collect_shapes::<i32>(&merged);
     let data = collect_data(&merged);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         source.set(1i32);
         source.set(2i32);
         source.complete();
@@ -4580,7 +4581,7 @@ fn higher_order_switch_map_dedupes_reused_live_inner() {
     let data = collect_data(&switched);
 
     source.set(1i32);
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         source.set(2i32);
         source.complete();
     });

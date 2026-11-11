@@ -140,7 +140,7 @@ fn stratify_branch_drops_source_values_while_rules_are_sentinel_until_future_sou
     );
     let seen = collect_data(&branch);
 
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         source.set(1i32);
         source.set(2i32);
     });

@@ -12,10 +12,10 @@ use graphrefly::{
     DescribeNode, DescribeOpts, DescribeSnapshot, DescribeValue, DiagramDirection, Dispatcher,
     Explain, ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
     GraphCheckpointJson, GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry,
-    IslandReport, Message, Node, NodeOpts, NodeVersion, NodeVersioningPolicy,
-    ProfileSummaryOptions, ReachableDirection, ReachableOptions, ReactiveListOptions,
-    RestoreFactoryMeta, RestoreGraphOptions, Status, TopologyEvent, TopologyEventKind,
-    TopologyGroupOptions, Values, GRAPH_CHECKPOINT_VERSION,
+    IslandReport, Message, NodeOpts, NodeVersion, NodeVersioningPolicy, ProfileSummaryOptions,
+    ReachableDirection, ReachableOptions, ReactiveListOptions, RestoreFactoryMeta,
+    RestoreGraphOptions, Status, TopologyEvent, TopologyEventKind, TopologyGroupOptions, Values,
+    GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -107,7 +107,7 @@ fn graph_default_versioning_applies_to_operator_and_empty_source_nodes() {
         })
     );
 
-    let list = reactive_list::<i32>(vec![], ReactiveListOptions::named("items").graph(g.clone()));
+    let list = reactive_list::<i32>(&g, vec![], ReactiveListOptions::named("items"));
     assert_eq!(
         list.delta.version(),
         Some(NodeVersion::V1 {
@@ -459,9 +459,6 @@ fn topology_group_add_accepts_only_registered_nodes_from_owning_graph() {
     released_group.release();
     let fresh_group = g.topology_group();
     assert!(catch_unwind(AssertUnwindSafe(|| fresh_group.add(&temp))).is_err());
-
-    let bare = Node::state(1i32);
-    assert!(catch_unwind(AssertUnwindSafe(|| group.add(&bare))).is_err());
 }
 
 #[test]
@@ -1368,17 +1365,6 @@ fn graph_rejects_cross_graph_deps_by_arena_identity() {
 }
 
 #[test]
-#[should_panic(expected = "different graph")]
-fn graph_rejects_bare_substrate_deps() {
-    let g = graph();
-    let bare = graphrefly::Node::<i32>::state(1);
-
-    let _bad = g.derived::<i32, _>(vec![bare.erased()], |values| {
-        Some(*last_or_prev(values, 0).unwrap())
-    });
-}
-
-#[test]
 fn derived_values_expose_prev_and_wave_batches_without_raw_ctx_or_sampling_helpers() {
     let g = graph();
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
@@ -1429,11 +1415,12 @@ fn derived_values_expose_prev_and_wave_batches_without_raw_ctx_or_sampling_helpe
 
 #[test]
 #[should_panic(expected = "different graph")]
-fn substrate_derived_rejects_cross_arena_deps() {
+fn kernel_node_rejects_cross_graph_deps() {
     let g = graph();
+    let other = graph();
     let graph_owned = g.state(1i32);
 
-    let _bad = graphrefly::Node::<i32>::derived(vec![graph_owned.erased()], |ctx| {
+    let _bad = other.node::<i32, _>(vec![graph_owned.erased()], |ctx| {
         ctx.emit(*ctx.dep(0).value::<i32>().unwrap())
     });
 }

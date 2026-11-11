@@ -58,27 +58,6 @@ impl<T> Operator<T> {
     }
 }
 
-/// Instantiate an operator as a bare node; graph-bound callers should prefer
-/// `Graph::init_node` so the node is registered for inspection.
-pub fn init_node<T: 'static>(op: Operator<T>, deps: Vec<Core>, caller_opts: NodeOpts) -> Node<T> {
-    init_node_in_arena(op, &GraphArena::default(), deps, caller_opts)
-}
-
-pub(crate) fn init_node_in_arena<T: 'static>(
-    op: Operator<T>,
-    arena: &GraphArena,
-    deps: Vec<Core>,
-    caller_opts: NodeOpts,
-) -> Node<T> {
-    init_node_in_arena_with_dispatcher(
-        op,
-        arena,
-        crate::dispatcher::default_dispatcher(),
-        deps,
-        caller_opts,
-    )
-}
-
 pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
     op: Operator<T>,
     arena: &GraphArena,

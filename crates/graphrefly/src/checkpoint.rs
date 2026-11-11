@@ -784,8 +784,9 @@ impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
             false,
             |graph: &Graph, base: String, node: &GraphCheckpointNode| {
                 let collection = crate::data_structures::reactive_list::<GraphCheckpointJson>(
+                    graph,
                     backend_array(node, "reactiveList.delta")?,
-                    crate::data_structures::ReactiveListOptions::named(base).graph(graph.clone()),
+                    crate::data_structures::ReactiveListOptions::named(base),
                 );
                 Ok(collection.delta.erased())
             },
@@ -825,13 +826,13 @@ impl GraphRestoreDescriptor for ReactiveLogDeltaRestoreDescriptor {
                     )));
                     }
                 }
-                let mut options =
-                    crate::data_structures::ReactiveLogOptions::named(base).graph(graph.clone());
+                let mut options = crate::data_structures::ReactiveLogOptions::named(base);
                 if let Some(max_size) = max_size {
                     options = options.max_size(max_size);
                 }
-                let collection =
-                    crate::data_structures::reactive_log::<GraphCheckpointJson>(state, options);
+                let collection = crate::data_structures::reactive_log::<GraphCheckpointJson>(
+                    graph, state, options,
+                );
                 Ok(collection.delta.erased())
             },
         )
@@ -862,9 +863,9 @@ impl GraphRestoreDescriptor for ReactiveMapDeltaRestoreDescriptor {
             |graph: &Graph, base: String, node: &GraphCheckpointNode| {
                 let collection =
                     crate::data_structures::reactive_map::<CheckpointJsonOrd, GraphCheckpointJson>(
+                        graph,
                         map_entries(node, "reactiveMap.delta")?,
-                        crate::data_structures::ReactiveMapOptions::named(base)
-                            .graph(graph.clone()),
+                        crate::data_structures::ReactiveMapOptions::named(base),
                     );
                 Ok(collection.delta.erased())
             },
@@ -899,8 +900,9 @@ impl GraphRestoreDescriptor for ReactiveIndexDeltaRestoreDescriptor {
                     CheckpointJsonOrd,
                     GraphCheckpointJson,
                 >(
+                    graph,
                     index_rows(node, "reactiveIndex.delta")?,
-                    crate::data_structures::ReactiveIndexOptions::named(base).graph(graph.clone()),
+                    crate::data_structures::ReactiveIndexOptions::named(base),
                 );
                 Ok(collection.delta.erased())
             },

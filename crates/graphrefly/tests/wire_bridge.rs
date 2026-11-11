@@ -2,12 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphrefly::{
-    batch, graph, remote_call, remote_call_with_options, remote_responder,
-    remote_responder_handler, wire_bridge, wire_bridge_envelope, Message, RemoteCallOptions,
-    RemoteCallRequest, RemoteCallResponse, RemoteCallResult, RemoteCallStatusState,
-    RemoteResponderOptions, RemoteResponderStatusState, WireBridgeCommand, WireBridgeEnvelopeInput,
-    WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeOptions, WireBridgePayload,
-    WireBridgeStatusState,
+    graph, remote_call, remote_call_with_options, remote_responder, remote_responder_handler,
+    wire_bridge, wire_bridge_envelope, Message, RemoteCallOptions, RemoteCallRequest,
+    RemoteCallResponse, RemoteCallResult, RemoteCallStatusState, RemoteResponderOptions,
+    RemoteResponderStatusState, WireBridgeCommand, WireBridgeEnvelopeInput, WireBridgeEnvelopeType,
+    WireBridgeEvent, WireBridgeOptions, WireBridgePayload, WireBridgeStatusState,
 };
 
 fn envelope<T>(
@@ -409,7 +408,7 @@ fn remote_call_accepts_same_wave_response_after_request_registration() {
     let results = collect_data(&remote.results);
     let status = collect_data(&remote.status);
 
-    batch(|_| {
+    g.batch(|_| {
         remote.call("echo", "req-1", "payload".to_owned());
         bridge.inbound.set(envelope_with_request(
             "session-a",
@@ -448,7 +447,7 @@ fn remote_call_duplicate_after_completion_is_visible_in_same_event_batch() {
 
     remote.call("echo", "req-1", "payload".to_owned());
     // Both responses arrive in one inbound array, as one batch commits them.
-    graphrefly::batch(|_| {
+    g.batch(|_| {
         bridge.inbound.set(envelope_with_request(
             "session-a",
             WireBridgeEnvelopeType::Data,

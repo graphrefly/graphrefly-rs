@@ -26,7 +26,7 @@ use std::rc::Rc;
 use crate::node::{commit_batched_waves, BatchTarget, Core, Domain, DomainRef};
 use crate::protocol::{AnyValue, Message, Wave};
 
-/// Explicit rollback escape hatch for [`batch`] (D12).
+/// The rollback escape hatch of [`crate::Graph::batch`] (D12).
 pub struct BatchCtx {
     rolled_back: Rc<Cell<bool>>,
 }
@@ -277,16 +277,6 @@ fn commit(targets: &[BatchTarget], resolved: Vec<(usize, Wave<AnyValue>)>) {
             .map(|(index, wave)| (&targets[index], wave))
             .collect(),
     );
-}
-
-/// Run `f` as a batch of the default domain, the one nodes built outside any Graph
-/// live in (R-graph-domain@3): success commits, panic/rollback discards. A graph's
-/// batch is [`crate::Graph::batch`]; a write to another domain inside the body is that
-/// domain's own request, not part of this commit.
-///
-/// Nested batches join the outer frame; the outermost frame owns commit/rollback.
-pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
-    batch_in(&crate::node::default_domain(), f)
 }
 
 /// A batch of domain `d` (R-request-order@2, R-graph-domain@3).

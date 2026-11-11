@@ -37,6 +37,7 @@ fn ns_per_op(ms: f64, ops: usize) -> f64 {
 }
 
 fn typed_vs_erased_probe(hops: usize, waves: usize, protocol_waves: usize, runs: usize) {
+    let g = graphrefly::graph();
     println!(
         "--- Probe E: typed vs erased value path ({hops} hops x {waves} waves; protocol {protocol_waves} waves) ---"
     );
@@ -90,8 +91,8 @@ fn typed_vs_erased_probe(hops: usize, waves: usize, protocol_waves: usize, runs:
         black_box(acc);
     });
 
-    let source = Node::<f64>::state(0.0);
-    let derived = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
+    let source = g.state::<f64>(0.0);
+    let derived = g.node::<f64, _>(vec![source.erased()], |ctx: &Ctx| {
         ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
     });
     let sink_count = Rc::new(Cell::new(0u64));
@@ -180,14 +181,15 @@ fn queue_probe(queue_n: usize, runs: usize) {
 }
 
 fn fanout_probe(fanout: usize, waves: usize, runs: usize) {
+    let g = graphrefly::graph();
     println!("--- Probe F: dirty/data fanout ({fanout} subscribers x {waves} waves) ---");
-    let source = Node::<f64>::state(0.0);
+    let source = g.state::<f64>(0.0);
     let sink_count = Rc::new(Cell::new(0u64));
 
     let mut derived_nodes = Vec::with_capacity(fanout);
     let mut unsubs: Vec<Box<dyn FnOnce()>> = Vec::with_capacity(fanout);
     for _ in 0..fanout {
-        let d = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
+        let d = g.node::<f64, _>(vec![source.erased()], |ctx: &Ctx| {
             ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         let c = sink_count.clone();
@@ -217,13 +219,14 @@ fn fanout_probe(fanout: usize, waves: usize, runs: usize) {
 }
 
 fn invalidate_probe(fanout: usize, waves: usize, runs: usize) {
+    let g = graphrefly::graph();
     println!("--- Probe I: invalidate traversal ({fanout} fanout x {waves} waves) ---");
-    let source = Node::<f64>::state(0.0);
+    let source = g.state::<f64>(0.0);
     let inv_count = Rc::new(Cell::new(0usize));
     let mut leaves = Vec::with_capacity(fanout);
     let mut unsubs: Vec<Box<dyn FnOnce()>> = Vec::with_capacity(fanout);
     for _ in 0..fanout {
-        let d = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
+        let d = g.node::<f64, _>(vec![source.erased()], |ctx: &Ctx| {
             ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         let c = inv_count.clone();
@@ -275,11 +278,12 @@ fn invalidate_probe(fanout: usize, waves: usize, runs: usize) {
 }
 
 fn diamond_probe(legs: usize, waves: usize, runs: usize) {
+    let g = graphrefly::graph();
     println!("--- Probe D: diamond pending join ({legs} legs x {waves} waves) ---");
-    let source = Node::<f64>::state_empty();
+    let source = g.state_empty::<f64>();
     let mut mids = Vec::with_capacity(legs);
     for _ in 0..legs {
-        let m = Node::<f64>::derived(vec![source.erased()], |ctx: &Ctx| {
+        let m = g.node::<f64, _>(vec![source.erased()], |ctx: &Ctx| {
             ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         mids.push(m);
@@ -287,7 +291,7 @@ fn diamond_probe(legs: usize, waves: usize, runs: usize) {
     let deps = mids.iter().map(Node::erased).collect::<Vec<_>>();
     let join_runs = Rc::new(Cell::new(0usize));
     let jr = join_runs.clone();
-    let join = Node::<f64>::derived(deps, move |ctx: &Ctx| {
+    let join = g.node::<f64, _>(deps, move |ctx: &Ctx| {
         jr.set(jr.get() + 1);
         let mut acc = 0.0;
         for i in 0..ctx.dep_len() {
@@ -331,13 +335,14 @@ fn diamond_probe(legs: usize, waves: usize, runs: usize) {
 }
 
 fn frontier_probe(sources_n: usize, waves: usize, runs: usize) {
+    let g = graphrefly::graph();
     println!("--- Probe C: sparse vs dense frontier ({sources_n} sources, {waves} waves) ---");
     assert!(sources_n > 0, "frontier_probe requires sources_n > 0");
     let mut sources = Vec::with_capacity(sources_n);
     let mut unsubs: Vec<Box<dyn FnOnce()>> = Vec::with_capacity(sources_n);
     for _ in 0..sources_n {
-        let s = Node::<f64>::state(0.0);
-        let d = Node::<f64>::derived(vec![s.erased()], |ctx: &Ctx| {
+        let s = g.state::<f64>(0.0);
+        let d = g.node::<f64, _>(vec![s.erased()], |ctx: &Ctx| {
             ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
         });
         let u = d.subscribe(|_| {});
@@ -385,12 +390,13 @@ impl Drop for DropToken {
 }
 
 fn retained_heap_probe(rounds: usize, nodes_per_round: usize, payload_bytes: usize) {
+    let g = graphrefly::graph();
     println!(
         "--- Probe M: retained-heap proxy (rounds={rounds}, nodes/round={nodes_per_round}, payload={}B) ---",
         payload_bytes
     );
     let dropped = Rc::new(Cell::new(0usize));
-    let source = Node::<usize>::state(1);
+    let source = g.state::<usize>(1);
     let ms = {
         let mut per_round = Vec::with_capacity(rounds);
         for r in 0..rounds {
@@ -402,7 +408,7 @@ fn retained_heap_probe(rounds: usize, nodes_per_round: usize, payload_bytes: usi
                     dropped: dropped.clone(),
                 };
                 let payload = vec![0u8; payload_bytes];
-                let n = Node::<usize>::derived(vec![source.erased()], move |ctx: &Ctx| {
+                let n = g.node::<usize, _>(vec![source.erased()], move |ctx: &Ctx| {
                     black_box(payload.len());
                     black_box(&token);
                     ctx.emit(*ctx.dep(0).value::<usize>().unwrap() + 1);
@@ -441,10 +447,11 @@ fn retained_heap_probe(rounds: usize, nodes_per_round: usize, payload_bytes: usi
 }
 
 fn rewire_probe(iterations: usize, runs: usize) {
+    let g = graphrefly::graph();
     println!("--- Probe R: rewire churn ({iterations} alternating replace) ---");
-    let a = Node::<f64>::state(1.0);
-    let b = Node::<f64>::state(2.0);
-    let out = Node::<f64>::derived(vec![a.erased()], |ctx: &Ctx| {
+    let a = g.state::<f64>(1.0);
+    let b = g.state::<f64>(2.0);
+    let out = g.node::<f64, _>(vec![a.erased()], |ctx: &Ctx| {
         ctx.emit(*ctx.dep(0).value::<f64>().unwrap() + 1.0);
     });
     let counter = Rc::new(Cell::new(0u64));

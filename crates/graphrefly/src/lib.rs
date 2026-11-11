@@ -160,7 +160,7 @@ pub use adapters::wire_edge_group::{
 #[cfg(feature = "tokio")]
 pub use async_driver::TokioLocalDriver;
 pub use async_driver::{DriverCancel, LocalAsyncDriver};
-pub use batch::{batch, BatchCtx};
+pub use batch::BatchCtx;
 pub use cascading_cache::{
     reactive_cascading_cache, CascadingCacheEvent, CascadingCachePolicy, CascadingCacheStatus,
     ReactiveCascadingCache, ReactiveCascadingCacheLoadFn, ReactiveCascadingCacheOptions,
@@ -265,8 +265,8 @@ pub use node::{
     Policy, ReplaceOpts, State, StateWrite, Status,
 };
 pub use operators::{
-    catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
-    last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
+    catch_error, distinct_until_changed, element_at, filter, find, first, first_any, last,
+    last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
     settle, settle_by, skip, take, take_while, tap, tap_first, valve, Operator,
 };
 pub use patterns::{
