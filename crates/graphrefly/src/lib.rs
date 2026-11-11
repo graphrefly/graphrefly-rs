@@ -300,7 +300,7 @@ pub use render::{
     describe_to_mermaid, describe_to_mermaid_url, describe_to_mermaid_with_direction,
     describe_to_pretty, mermaid_live_url, DiagramDirection,
 };
-pub use report::{set_host_reporter, HostFailure, HostReporter};
+pub use report::{HostFailure, HostReporter};
 pub use resilience::{
     breaker_status_node, rate_limit_bundle, retry_status_node, timeout_bundle, BackoffPolicy,
     BreakerState, BreakerStatus, RateLimitBundle, RateLimitStatus, RetryEvent, RetryPolicy,

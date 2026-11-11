@@ -1300,10 +1300,7 @@ fn c44_a_wave_of_terminals_holds_a_fan_in() {
 #[test]
 fn c34_terminal_fanout_closes_the_lifetime() {
     let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
-    let previous = graphrefly::set_host_reporter(Some({
-        let reports = reports.clone();
-        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
-    }));
+    let g = reporting_graph(&reports);
 
     let close_order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
     // T is a source with no other dependent; its release is visible as its cleanup.
@@ -1312,7 +1309,8 @@ fn c34_terminal_fanout_closes_the_lifetime() {
     let t = {
         let t_released = t_released.clone();
         let keep = t_slot.clone();
-        Node::<i32>::producer_opts(
+        producer_in::<i32>(
+            &g,
             with_cleanup({
                 let close_order = close_order.clone();
                 move || {
@@ -1331,7 +1329,8 @@ fn c34_terminal_fanout_closes_the_lifetime() {
     let s = {
         let cleanup = cleanup.clone();
         let s_runs = s_runs.clone();
-        Node::<i32>::derived_opts(
+        derived_in::<i32>(
+            &g,
             vec![t.erased()],
             with_cleanup({
                 let close_order = close_order.clone();
@@ -1428,7 +1427,6 @@ fn c34_terminal_fanout_closes_the_lifetime() {
         graphrefly::OutputStatus::Completed,
         "and is not S's ERROR"
     );
-    graphrefly::set_host_reporter(previous);
 }
 
 /// R-terminals (phase 3 acceptance): under auto ERROR, an INVALIDATE that reached the
@@ -1565,16 +1563,14 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
         }
     }
     let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
-    let previous = graphrefly::set_host_reporter(Some({
-        let reports = reports.clone();
-        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
-    }));
+    let g = reporting_graph(&reports);
     let events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let a = Node::<i32>::state(1);
+    let a = state_in::<i32>(&g, 1);
     let p = {
         let events = events.clone();
-        Node::<i32>::derived_opts(
+        derived_in::<i32>(
+            &g,
             vec![a.erased()],
             graphrefly::NodeOpts::default().with_setup(move |_| {
                 let events = events.clone();
@@ -1599,7 +1595,8 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
         let late = late.clone();
         let state_dropped = state_dropped.clone();
         let n_runs = n_runs.clone();
-        Node::<i32>::derived_opts(
+        derived_in::<i32>(
+            &g,
             vec![p.erased()],
             graphrefly::NodeOpts {
                 partial: true,
@@ -1710,7 +1707,6 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
 
     a.complete();
     assert_eq!(n.status().output, OutputStatus::Completed);
-    graphrefly::set_host_reporter(previous);
     n_handle.borrow_mut().take();
 }
 
@@ -2050,7 +2046,8 @@ fn c35_rewire_keeps_the_instance_and_runs_between_waves() {
 /// C-37 — a closed lifetime revokes old work while the node and topology remain.
 #[test]
 fn c37_closed_lifetime_revokes_old_work() {
-    let g = graphrefly::graph();
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let g = reporting_graph(&reports);
     let a = g.state_opts(1i32, named("a"));
     let bb = g.state_opts(100i32, named("bb"));
     let kept: Rc<RefCell<Vec<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(Vec::new()));
@@ -2113,13 +2110,7 @@ fn c37_closed_lifetime_revokes_old_work() {
     *u3.borrow_mut() = Some(n.subscribe(|_| {}));
     *current.borrow_mut() = kept.borrow_mut().pop();
     assert!(current.borrow().is_some(), "the new lifetime ran");
-    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
-    let previous = graphrefly::set_host_reporter(Some({
-        let reports = reports.clone();
-        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
-    }));
     trigger.set(1);
-    graphrefly::set_host_reporter(previous);
     assert!(
         reports.borrow().is_empty(),
         "the dropped rewire is silent: {:?}",
@@ -2412,12 +2403,9 @@ fn c29_batch_delivers_nothing_before_commit() {
 #[test]
 fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
     let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
-    let previous = graphrefly::set_host_reporter(Some({
-        let reports = reports.clone();
-        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
-    }));
-    let a = Node::<i32>::state(0);
-    let other = Node::<i32>::state(0);
+    let g = reporting_graph(&reports);
+    let a = state_in::<i32>(&g, 0);
+    let other = state_in::<i32>(&g, 0);
     let order: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let late: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
     let _first = {
@@ -2456,7 +2444,7 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
 
     // Rejected submissions leave the earlier staging unchanged. (A State write cannot
     // carry RESOLVED at all; a kept ctx's output can, and is rejected.)
-    let (sp, slot) = driven();
+    let (sp, slot) = driven_in(&g);
     let (log, _u) = record_arrays(&sp);
     log.borrow_mut().clear();
     graphrefly::batch(|_| {
@@ -2470,7 +2458,7 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
     assert_eq!(arrays(&log), vec![shape(&["PENDING", "DATA", "COMPLETE"])]);
 
     // A sink that throws after a commit goes to the reporter; nothing rolls back.
-    let t = Node::<i32>::state(0);
+    let t = state_in::<i32>(&g, 0);
     let _boom = t.subscribe(|msgs: &[Message<AnyValue>]| {
         if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
             panic!("sink boom");
@@ -2479,7 +2467,6 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
     graphrefly::batch(|_| t.set(3));
     assert_eq!(t.cache(), Some(3));
     assert!(reports.borrow().iter().any(|r| r.error == "sink boom"));
-    graphrefly::set_host_reporter(previous);
 }
 
 // ── Checkpoint stage: R-checkpoint@1 (graphrefly:D802) ───────────────────────
@@ -3033,4 +3020,98 @@ fn record_values_json(
         );
     });
     (log, unsub)
+}
+
+/// A graph whose host reporter records into `reports` (R-failure@3: the reporter is
+/// the graph's `report` option, graphrefly-rs:D6).
+fn reporting_graph(reports: &Rc<RefCell<Vec<graphrefly::HostFailure>>>) -> graphrefly::Graph {
+    let reports = reports.clone();
+    graphrefly::graph_opts(
+        graphrefly::GraphOptions::default()
+            .with_report(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone())),
+    )
+}
+
+fn state_in<T: 'static>(g: &graphrefly::Graph, v: T) -> graphrefly::State<T> {
+    g.state_opts(v, graphrefly::GraphNodeOpts::default())
+}
+
+fn derived_in<T: 'static>(
+    g: &graphrefly::Graph,
+    deps: Vec<graphrefly::Core>,
+    opts: graphrefly::NodeOpts,
+    f: impl Fn(&graphrefly::Ctx) + 'static,
+) -> Node<T> {
+    g.node_opts::<T, _>(
+        deps,
+        f,
+        graphrefly::GraphNodeOpts::default().with_node(opts),
+    )
+}
+
+fn producer_in<T: 'static>(
+    g: &graphrefly::Graph,
+    opts: graphrefly::NodeOpts,
+    f: impl Fn(&graphrefly::Ctx) + 'static,
+) -> Node<T> {
+    g.producer_opts(f, graphrefly::GraphNodeOpts::default().with_node(opts))
+}
+
+/// [`driven`] in `g`.
+fn driven_in(g: &graphrefly::Graph) -> (Node<i32>, Rc<RefCell<Option<graphrefly::DeferredCtx>>>) {
+    let slot: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let keep = slot.clone();
+    let node = producer_in(g, graphrefly::NodeOpts::default(), move |ctx| {
+        *keep.borrow_mut() = Some(ctx.defer());
+    });
+    (node, slot)
+}
+
+/// R-failure@3 with R-graph-domain@2: the host reporter is the graph's `report` option.
+/// A failure goes to its own graph's reporter, never another's, and a node outside any
+/// graph (the default domain, which has no reporter) has its failures dropped.
+#[test]
+fn host_reporter_is_the_graph_option() {
+    let reports_a = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let reports_b = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let ga = reporting_graph(&reports_a);
+    let gb = reporting_graph(&reports_b);
+    let sa = ga.state_empty::<i32>();
+    let sb = state_in(&gb, 0i32);
+    let _ua = sa.subscribe(|msgs: &[Message<AnyValue>]| {
+        if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+            panic!("a sink");
+        }
+    });
+    let pb = producer_in::<i32>(&gb, with_cleanup(|| panic!("b cleanup")), |_| {});
+    let ub = pb.subscribe(|_| {});
+    sa.set(1);
+    ub();
+    sb.set(1);
+    let errors = |r: &Rc<RefCell<Vec<graphrefly::HostFailure>>>| {
+        r.borrow()
+            .iter()
+            .map(|f| (f.source.clone(), f.error.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        errors(&reports_a),
+        vec![("sink".to_owned(), "a sink".to_owned())]
+    );
+    assert_eq!(
+        errors(&reports_b),
+        vec![("cleanup".to_owned(), "b cleanup".to_owned())]
+    );
+
+    // Outside any graph: dropped, and nothing is kept.
+    let lone = Node::<i32>::state(0);
+    let _ul = lone.subscribe(|msgs: &[Message<AnyValue>]| {
+        if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+            panic!("lone sink");
+        }
+    });
+    lone.set(1);
+    assert_eq!(lone.cache(), Some(1));
+    assert_eq!(reports_a.borrow().len(), 1);
+    assert_eq!(reports_b.borrow().len(), 1);
 }

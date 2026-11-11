@@ -33,6 +33,10 @@ pub struct GraphOptions {
     pub environment: EnvironmentDrivers,
     /// `versioning` field for versioning.
     pub versioning: Option<NodeVersioningPolicy>,
+    /// The host reporter (R-failure@3): failures in this graph with no caller and no
+    /// node to end, such as a panicking sink or cleanup, go to it. Without one they
+    /// are dropped; a panicking reporter is ignored (graphrefly-rs:D6).
+    pub report: Option<crate::HostReporter>,
 }
 
 impl fmt::Debug for GraphOptions {
@@ -43,6 +47,7 @@ impl fmt::Debug for GraphOptions {
             .field("dispatcher", &self.dispatcher)
             .field("environment", &self.environment)
             .field("versioning", &self.versioning)
+            .field("report", &self.report.is_some())
             .finish()
     }
 }
@@ -56,7 +61,15 @@ impl GraphOptions {
             dispatcher: None,
             environment: EnvironmentDrivers::default(),
             versioning: None,
+            report: None,
         }
+    }
+
+    /// Returns these options with `report` as the graph's host reporter
+    /// (R-failure@3).
+    pub fn with_report(mut self, report: impl Fn(&crate::HostFailure) + 'static) -> Self {
+        self.report = Some(Rc::new(report));
+        self
     }
 }
 
@@ -429,7 +442,7 @@ impl Graph {
         Self {
             inner: Rc::new(GraphInner {
                 name: opts.name,
-                arena: GraphArena::new(),
+                arena: GraphArena::with_reporter(opts.report),
                 dispatcher,
                 environment,
                 versioning: opts.versioning,
@@ -2080,11 +2093,10 @@ mod tests {
         // R-failure@3: a cleanup's panic goes to the host reporter and the close
         // completes, so a later node's cleanup still runs and the release succeeds.
         let reports = Rc::new(RefCell::new(Vec::new()));
-        let previous = crate::set_host_reporter(Some({
+        let g = graph_opts(GraphOptions::default().with_report({
             let reports = reports.clone();
-            Rc::new(move |f: &crate::HostFailure| reports.borrow_mut().push(f.clone()))
+            move |f: &crate::HostFailure| reports.borrow_mut().push(f.clone())
         }));
-        let g = graph();
         let panic_node = producer_with_cleanup(&g, "panic", Rc::new(|| panic!("cleanup boom")));
         let later_released = Rc::new(Cell::new(false));
         let later_node = producer_with_cleanup(&g, "later", {
@@ -2096,7 +2108,6 @@ mod tests {
         u1();
         u2();
         g.release_nodes(&[later_node.erased(), panic_node.erased()], "test");
-        crate::set_host_reporter(previous);
 
         assert!(g.find("panic").is_none() && g.find("later").is_none());
         assert!(later_released.get());

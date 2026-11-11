@@ -396,6 +396,13 @@ impl GraphArena {
     pub(crate) fn default() -> Self {
         DEFAULT_GRAPH_CORE.with(|graph| Self(graph.clone()))
     }
+
+    /// A new arena whose failures go to `reporter` (a Graph's `report` option).
+    pub(crate) fn with_reporter(reporter: Option<crate::report::HostReporter>) -> Self {
+        let arena = Self::new();
+        arena.0.borrow_mut().reporter = reporter;
+        arena
+    }
 }
 
 struct GraphCore {
@@ -413,6 +420,8 @@ struct GraphCore {
     free: Vec<usize>,
     deferred_boundary: VecDeque<BoundaryTask>,
     draining_boundary: bool,
+    /// The domain's host reporter (R-failure@3, R-graph-domain@2).
+    reporter: Option<crate::report::HostReporter>,
 }
 
 type TakenNodeSlot = (
@@ -443,6 +452,7 @@ impl GraphCore {
             free: Vec::new(),
             deferred_boundary: VecDeque::new(),
             draining_boundary: false,
+            reporter: None,
         }
     }
 
@@ -1217,6 +1227,7 @@ impl NodeInner {
         call: &mut NodeCallSlot,
         edges: &mut DepEdges,
         aux: &mut NodeAux,
+        reporter: Option<crate::report::HostReporter>,
     ) {
         // B32: free this node's fn slot so the dispatcher pool no longer holds the fn —
         // and thus the upstream `Core`s the fn captured (e.g. a `Node: Clone` handle, the
@@ -1236,23 +1247,28 @@ impl NodeInner {
             lt.signal.abort();
         }
         for u in edges.unsubs.drain(..).flatten() {
-            run_reported("release", u);
+            run_reported(reporter.as_ref(), "release", u);
         }
         if let Some(cleanup) = lifetime.and_then(|lt| lt.cleanup) {
             let cctx = crate::lifetime::CleanupCtx {
                 state: aux.state.clone(),
             };
-            run_reported("cleanup", move || cleanup(&cctx));
+            run_reported(reporter.as_ref(), "cleanup", move || cleanup(&cctx));
         }
         aux.state = None;
     }
 }
 
-/// Runs `f`; a panic goes to the host reporter as `source` (R-failure@3).
-fn run_reported(source: &str, f: impl FnOnce()) {
+/// Runs `f`; a panic goes to the domain's host reporter as `source` (R-failure@3).
+fn run_reported(reporter: Option<&crate::report::HostReporter>, source: &str, f: impl FnOnce()) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(f)) {
-        crate::report::report(source, payload.as_ref());
+        crate::report::report(reporter, source, payload.as_ref());
     }
+}
+
+/// The host reporter of the domain `graph` is.
+fn graph_reporter(graph: &RefCell<GraphCore>) -> Option<crate::report::HostReporter> {
+    graph.try_borrow().ok().and_then(|g| g.reporter.clone())
 }
 
 /// A cloneable handle over a node slot in a shared graph arena. The reentrant
@@ -1511,7 +1527,7 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
         key.id.0,
         key.generation,
     ));
-    inner.cleanup_before_free(&mut call, &mut edges, &mut aux);
+    inner.cleanup_before_free(&mut call, &mut edges, &mut aux, graph_reporter(graph_ref));
     free_slot.armed = false;
     graph_ref.borrow_mut().free.push(key.id.0);
 }
@@ -2196,7 +2212,7 @@ fn panic_to_error(payload: Box<dyn std::any::Any + Send>) -> GraphError {
 thread_local! {
     /// Requests made while a wave is delivered, in the order they were made
     /// (R-request-order@2). The outermost wave owner runs them after its wave ends.
-    static REQUESTS: RefCell<VecDeque<Box<dyn FnOnce()>>> = const { RefCell::new(VecDeque::new()) };
+    static REQUESTS: RefCell<VecDeque<QueuedRequest>> = const { RefCell::new(VecDeque::new()) };
     static DRAINING_REQUESTS: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -2225,8 +2241,14 @@ fn subscribe_now(core: &Core, sink: Sink, kind: SubscriberKind) -> Unsub {
 }
 
 /// A host unsubscribe: during a wave it is a request that runs after the wave.
-fn requested_unsubscribe(unsub: Unsub) -> Unsub {
-    Box::new(move || request(unsub))
+fn requested_unsubscribe(domain: &Core, unsub: Unsub) -> Unsub {
+    // Only the domain's reporter is needed: a weak arena handle, so the handle holds
+    // no counted node reference.
+    let domain = Rc::downgrade(&domain.graph);
+    Box::new(move || {
+        let reporter = domain.upgrade().and_then(|graph| graph_reporter(&graph));
+        request_reporting(reporter, unsub);
+    })
 }
 
 /// A subscription asked for during a wave, before its request has run.
@@ -2236,12 +2258,24 @@ enum QueuedSubscription {
     Active(Unsub),
 }
 
-/// Runs `request` now between waves, or queues it until the current wave ends
-/// (R-request-order@2). Each queued request runs as its own wave, in order.
-pub(crate) fn request(request: impl FnOnce() + 'static) {
+/// A queued request and the reporter of the domain it was made for.
+pub(crate) type QueuedRequest = (Option<crate::report::HostReporter>, Box<dyn FnOnce()>);
+
+/// Runs `request` for `domain` now between waves, or queues it until the current
+/// wave ends (R-request-order@2). Each queued request runs as its own wave, in order;
+/// its panic goes to its domain's reporter.
+pub(crate) fn request(domain: &Core, request: impl FnOnce() + 'static) {
+    request_reporting(domain.reporter(), request);
+}
+
+/// [`request`] with the reporter given directly (a batch commit's first target's).
+pub(crate) fn request_reporting(
+    reporter: Option<crate::report::HostReporter>,
+    request: impl FnOnce() + 'static,
+) {
     // Inside a batch body a request waits for the commit (R-request-order@2).
     if wave_in_flight() || crate::batch::collecting_batch() {
-        REQUESTS.with(|q| q.borrow_mut().push_back(Box::new(request)));
+        REQUESTS.with(|q| q.borrow_mut().push_back((reporter, Box::new(request))));
     } else {
         request();
     }
@@ -2256,7 +2290,7 @@ pub(crate) fn request_mark() -> usize {
 
 /// Takes the requests queued after `mark`: a batch body's requests, which run after
 /// its commit, or are dropped when the body throws (R-request-order@2).
-pub(crate) fn take_requests_after(mark: usize) -> Vec<Box<dyn FnOnce()>> {
+pub(crate) fn take_requests_after(mark: usize) -> Vec<QueuedRequest> {
     REQUESTS.with(|q| {
         let mut q = q.borrow_mut();
         let keep = mark.min(q.len());
@@ -2271,8 +2305,8 @@ pub(crate) fn drop_requests_after(mark: usize) {
 }
 
 /// Runs one request taken from the queue; its panic goes to the host reporter.
-pub(crate) fn run_queued_request(request: Box<dyn FnOnce()>) {
-    run_reported("queued request", request);
+pub(crate) fn run_queued_request((reporter, request): QueuedRequest) {
+    run_reported(reporter.as_ref(), "queued request", request);
 }
 
 pub(crate) fn drain_requests() {
@@ -2288,7 +2322,7 @@ pub(crate) fn drain_requests() {
     DRAINING_REQUESTS.with(|d| d.set(true));
     let _draining = Draining;
     while let Some(next) = REQUESTS.with(|q| q.borrow_mut().pop_front()) {
-        run_reported("queued request", next);
+        run_queued_request(next);
     }
 }
 
@@ -2651,7 +2685,7 @@ impl Core {
         };
         unregister_backend_state_contributor(self);
         let (mut inner, _topology, mut call, _config, _run, mut edges, _version, mut aux) = slot;
-        inner.cleanup_before_free(&mut call, &mut edges, &mut aux);
+        inner.cleanup_before_free(&mut call, &mut edges, &mut aux, graph_reporter(&self.graph));
         free_slot.armed = false;
         self.graph.borrow_mut().free.push(key.id.0);
         true
@@ -3039,14 +3073,14 @@ impl Core {
     /// reporter and the close completes.
     fn finish_close(&self, unsubs: Vec<Unsub>, lifetime: Option<crate::lifetime::Lifetime>) {
         for u in unsubs {
-            run_reported("release", u);
+            run_reported(self.reporter().as_ref(), "release", u);
         }
         if let Some(cleanup) = lifetime.and_then(|lt| lt.cleanup) {
             let cctx = crate::lifetime::CleanupCtx {
                 state: self.get_state(),
             };
             self.with_aux_mut(|a| a.closing = true);
-            run_reported("cleanup", move || cleanup(&cctx));
+            run_reported(self.reporter().as_ref(), "cleanup", move || cleanup(&cctx));
             self.with_aux_mut(|a| a.closing = false);
         }
         let state = self.with_aux_mut(|a| a.state.take());
@@ -3078,7 +3112,7 @@ impl Core {
     /// has closed when it runs; the new list is computed from the current one then.
     pub(crate) fn request_lifetime_rewire(&self, lifetime: u64, change: LifetimeRewire) {
         let core = self.clone();
-        request(move || {
+        request(self, move || {
             if !core.lifetime_open(lifetime) {
                 return;
             }
@@ -3162,11 +3196,11 @@ impl Core {
                     }
                 }
                 for u in old_unsubs {
-                    run_reported("release", u);
+                    run_reported(self.reporter().as_ref(), "release", u);
                 }
                 if let Some(cleanup) = old_lifetime.and_then(|lt| lt.cleanup) {
                     let cctx = crate::lifetime::CleanupCtx { state: old_state };
-                    run_reported("cleanup", move || cleanup(&cctx));
+                    run_reported(self.reporter().as_ref(), "cleanup", move || cleanup(&cctx));
                 }
                 if active {
                     self.first_run_of_replace();
@@ -3194,6 +3228,11 @@ impl Core {
         if self.with_inner_edges(|_, e| e.value.terminal) {
             self.close_ended_lifetime();
         }
+    }
+
+    /// The host reporter of the domain this node runs in.
+    pub(crate) fn reporter(&self) -> Option<crate::report::HostReporter> {
+        graph_reporter(&self.graph)
     }
 
     /// Sets the instance's recipe unless it already has one.
@@ -3621,7 +3660,7 @@ impl Core {
             }
         }
         for u in released {
-            run_reported("release", u);
+            run_reported(self.reporter().as_ref(), "release", u);
         }
         self.notify_topology_deps_changed(&old_deps, &new_deps);
         drop(mut_guard);
@@ -3768,7 +3807,7 @@ impl Core {
                 // The lifetime closed while its setup ran: release what it opened.
                 if let Some(cleanup) = unplaced {
                     let cctx = crate::lifetime::CleanupCtx { state: None };
-                    run_reported("cleanup", move || cleanup(&cctx));
+                    run_reported(self.reporter().as_ref(), "cleanup", move || cleanup(&cctx));
                 }
             }
             if run_fn {
@@ -4014,7 +4053,9 @@ impl Core {
             return;
         }
         let core = self.clone();
-        request(move || with_wave_owner(&core, || core.down(msgs), || {}));
+        request(&core.clone(), move || {
+            with_wave_owner(&core, || core.down(msgs), || {})
+        });
     }
 
     /// Publishes arrays as one wave of their own, under a fresh wave owner.
@@ -4421,7 +4462,9 @@ impl<T: 'static> Node<T> {
             return;
         }
         let core = self.core.clone();
-        request(move || with_wave_owner(&core, || core.down(msgs), || {}));
+        request(&core.clone(), move || {
+            with_wave_owner(&core, || core.down(msgs), || {})
+        });
     }
 
     /// The current cached value (downcast), or `None` for SENTINEL.
@@ -4467,9 +4510,12 @@ impl<T: 'static> Node<T> {
 
     fn subscribe_with_kind(&self, sink: impl Fn(&[Msg]) + 'static, kind: SubscriberKind) -> Unsub {
         // R-failure@3: a user sink's panic goes to the host reporter, not into a node.
-        let sink: Sink = Rc::new(crate::report::guard_sink(sink));
+        let domain = Rc::downgrade(&self.core.graph);
+        let sink: Sink = Rc::new(crate::report::guard_sink(sink, move || {
+            domain.upgrade().and_then(|graph| graph_reporter(&graph))
+        }));
         if !wave_in_flight() && !crate::batch::collecting_batch() {
-            return requested_unsubscribe(subscribe_now(&self.core, sink, kind));
+            return requested_unsubscribe(&self.core, subscribe_now(&self.core, sink, kind));
         }
         // During a wave, or in a batch body, the subscription is a request that runs
         // after the wave or the commit (R-request-order@2); an unsubscribe before then
@@ -4477,16 +4523,20 @@ impl<T: 'static> Node<T> {
         let slot = Rc::new(RefCell::new(QueuedSubscription::Waiting));
         let core = self.core.clone();
         let pending = slot.clone();
-        request(move || {
+        request(&self.core, move || {
             if matches!(*pending.borrow(), QueuedSubscription::Waiting) {
                 let unsub = subscribe_now(&core, sink, kind);
                 *pending.borrow_mut() = QueuedSubscription::Active(unsub);
             }
         });
+        let domain_core = Rc::downgrade(&self.core.graph);
         Box::new(move || {
             let state = std::mem::replace(&mut *slot.borrow_mut(), QueuedSubscription::Cancelled);
             if let QueuedSubscription::Active(unsub) = state {
-                request(unsub);
+                let reporter = domain_core
+                    .upgrade()
+                    .and_then(|graph| graph_reporter(&graph));
+                request_reporting(reporter, unsub);
             }
         })
     }
@@ -4510,7 +4560,9 @@ impl<T: 'static> Node<T> {
         self.core.check_new_deps("replace", &deps);
         let core = self.core.clone();
         let f: NodeFn = Rc::new(f);
-        request(move || core.replace_instance(deps, f, opts.setup, opts.recipe));
+        request(&self.core, move || {
+            core.replace_instance(deps, f, opts.setup, opts.recipe)
+        });
     }
 
     /// The node's current definition (R-node): its declared dependencies, its current
@@ -4604,7 +4656,7 @@ impl<T: 'static> State<T> {
             return;
         }
         let core = self.node.core.clone();
-        request(move || {
+        request(&self.node.core, move || {
             if let Some(v) = erased(core.cache_any()) {
                 with_wave_owner(&core, || core.down(vec![Message::Data(v)]), || {});
             }
@@ -4806,14 +4858,19 @@ mod tests {
         // R-failure@3: a sink failure has no node to end. It goes to the host reporter,
         // the node keeps running, and the wave guard is clear afterwards.
         let reports = Rc::new(RefCell::new(Vec::<crate::HostFailure>::new()));
-        let previous = crate::set_host_reporter(Some({
+        let arena = GraphArena::with_reporter(Some({
             let reports = reports.clone();
             Rc::new(move |f: &crate::HostFailure| reports.borrow_mut().push(f.clone()))
         }));
-        let source = Node::<i32>::state_empty();
-        let derived: Node<i32> = Node::derived(vec![source.erased()], |ctx| {
-            let _ = ctx.data::<i32>(0).unwrap();
-        });
+        let source = Node::<i32>::state_empty_in_arena(&arena);
+        let derived: Node<i32> = Node::derived_opts_in_arena(
+            &arena,
+            vec![source.erased()],
+            NodeOpts::default(),
+            |ctx| {
+                let _ = ctx.data::<i32>(0).unwrap();
+            },
+        );
         let _u = derived.subscribe(
             move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
                 if msgs.iter().any(|m| matches!(m, Message::Resolved)) {
@@ -4824,7 +4881,6 @@ mod tests {
 
         source.set(1);
         source.set(2);
-        crate::set_host_reporter(previous);
 
         assert_eq!(
             *reports.borrow(),

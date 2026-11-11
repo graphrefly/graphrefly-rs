@@ -473,7 +473,12 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
                 // The body's own requests run right after its commit, before any
                 // request the commit wave makes.
                 let body_requests = crate::node::take_requests_after(request_mark);
-                crate::node::request(move || {
+                // A commit spanning domains reports to its first target's.
+                let reporter = targets
+                    .first()
+                    .and_then(BatchTarget::borrowed_core)
+                    .and_then(|core| core.reporter());
+                crate::node::request_reporting(reporter, move || {
                     committed.set(true);
                     let failed = match resolve(&targets, deferred) {
                         Ok(resolved) => {

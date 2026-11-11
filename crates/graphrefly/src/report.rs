@@ -2,11 +2,12 @@
 //! and no node to end, such as a sink that panics during a fanout. The kernel keeps
 //! no failure history; without a reporter such a failure is dropped.
 //!
-//! Rust-local shape (graphrefly-rs:D6): one reporter per thread, since the runtime
-//! is single-threaded (each thread runs its own waves).
+//! The reporter belongs to the graph, the concurrency domain (R-graph-domain@2): it
+//! is the `report` option of [`crate::GraphOptions`], as the reference's
+//! `createGraph({ report })` (graphrefly-rs:D6). Nodes built outside any Graph live in
+//! the default domain, which has no reporter, so their failures are dropped.
 
 use std::any::Any;
-use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
@@ -22,19 +23,10 @@ pub struct HostFailure {
 /// The host reporter callback.
 pub type HostReporter = Rc<dyn Fn(&HostFailure)>;
 
-thread_local! {
-    static REPORTER: RefCell<Option<HostReporter>> = const { RefCell::new(None) };
-}
-
-/// Install (or with `None` remove) this thread's host reporter; returns the previous one.
-pub fn set_host_reporter(reporter: Option<HostReporter>) -> Option<HostReporter> {
-    REPORTER.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), reporter))
-}
-
-/// Hands a failure to the host reporter, if one is installed. A reporter that panics
-/// is ignored, so it cannot break the wave it reports.
-pub(crate) fn report(source: &str, payload: &(dyn Any + Send)) {
-    let Some(reporter) = REPORTER.with(|slot| slot.borrow().clone()) else {
+/// Hands a failure to the domain's host reporter, if it has one. A reporter that
+/// panics is ignored, so it cannot break the wave it reports.
+pub(crate) fn report(reporter: Option<&HostReporter>, source: &str, payload: &(dyn Any + Send)) {
+    let Some(reporter) = reporter else {
         return;
     };
     let failure = HostFailure {
@@ -54,10 +46,14 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
 
 /// Wraps a user sink so its panic goes to the host reporter and the fanout goes on
 /// (R-failure@3): a sink failure has no node to end.
-pub(crate) fn guard_sink<M>(sink: impl Fn(&[M]) + 'static) -> impl Fn(&[M]) + 'static {
+/// `reporter` looks up the reporter of the domain the sink's node runs in.
+pub(crate) fn guard_sink<M>(
+    sink: impl Fn(&[M]) + 'static,
+    reporter: impl Fn() -> Option<HostReporter> + 'static,
+) -> impl Fn(&[M]) + 'static {
     move |msgs: &[M]| {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink(msgs))) {
-            report("sink", payload.as_ref());
+            report(reporter().as_ref(), "sink", payload.as_ref());
         }
     }
 }
