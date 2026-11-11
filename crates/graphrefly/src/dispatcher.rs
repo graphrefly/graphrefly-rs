@@ -95,14 +95,17 @@ impl Pool {
 
     /// Free a slot (drop its fn) + bump its generation + recycle it. A stale
     /// unregister (generation mismatch, or already free) is a no-op.
-    fn unregister(&mut self, id: u32, generation: u32) {
-        if let Some(slot) = self.slots.get_mut(id as usize) {
-            if slot.generation == generation && slot.f.is_some() {
-                slot.f = None;
-                slot.generation = slot.generation.wrapping_add(1);
-                self.free.push(id);
-            }
+    /// Returns the freed fn, for the caller to drop after its borrow ends: the fn may
+    /// hold the last handles to other nodes, whose drop unregisters their fns.
+    fn unregister(&mut self, id: u32, generation: u32) -> Option<NodeFn> {
+        let slot = self.slots.get_mut(id as usize)?;
+        if slot.generation != generation || slot.f.is_none() {
+            return None;
         }
+        let freed = slot.f.take();
+        slot.generation = slot.generation.wrapping_add(1);
+        self.free.push(id);
+        freed
     }
 
     /// Clone out the fn for a handle, iff the generation matches and the slot is live.
@@ -296,9 +299,14 @@ impl Dispatcher {
     /// holding a dropped node's fn (and thus its captured upstream `Core`s) alive for
     /// the whole process. Idempotent / generation-checked: a stale unregister is a no-op.
     pub fn unregister(&self, handle: Handle) {
-        let mut inner = self.0.borrow_mut();
-        inner.pools[handle.pool_id as usize].unregister(handle.handle_id, handle.generation);
-        inner.stats.remove(&handle);
+        let freed = {
+            let mut inner = self.0.borrow_mut();
+            let freed = inner.pools[handle.pool_id as usize]
+                .unregister(handle.handle_id, handle.generation);
+            inner.stats.remove(&handle);
+            freed
+        };
+        drop(freed);
     }
 
     /// Uniform sync-void invoke (R-sync-core / R-dispatch-all). Clones the fn out

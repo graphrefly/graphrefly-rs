@@ -15,7 +15,7 @@
 use std::rc::Rc;
 
 use crate::lifetime::AbortSignal;
-use crate::node::{Core, Node, NodeOpts, RewireRequest};
+use crate::node::{Core, LifetimeRewire, Node, NodeOpts};
 use crate::operators::Operator;
 use crate::protocol::{reject_kernel_only_output, AnyValue, Message, Wave};
 
@@ -255,41 +255,42 @@ impl Ctx {
         node
     }
 
-    /// Request a deferred self-rewire subscribe at the committed wave boundary (R-rewire-deferred /
-    /// D47): subscribe to `dep` (and swap the fn) AFTER the current wave settles — never in place, so
-    /// this is NOT the D37 mid-fn reject. Higher-order operators (*Map) use this to wire
-    /// runtime-created inner nodes as VISIBLE self-deps. `f` re-pairs the deps (SD-1 pairing).
-    pub fn rewire_next_subscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
+    /// Changes this node's own dependencies for the current lifetime
+    /// (R-request-order@2), keeping its instance, values, private state, function and
+    /// subscribers. A request: it runs after the wave, and is dropped if the lifetime
+    /// has closed by then. Kept dependencies keep their records, removed ones are
+    /// released silently, added ones are acquired; if an added one has a snapshot, the
+    /// snapshots are the function's input as one wave. When the lifetime closes, the
+    /// declared dependencies come back.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a duplicate dependency, another graph's node, the node itself, or a
+    /// node that depends on it through current or declared dependencies.
+    pub fn rewire(&self, deps: Vec<Core>) {
         if !self.open() {
             return;
         }
+        self.node.check_new_deps("rewire", &deps);
         self.node
-            .request_rewire_next(RewireRequest::Add(dep, Rc::new(f)));
+            .request_lifetime_rewire(self.lifetime, LifetimeRewire::Set(deps));
     }
 
-    /// Request a deferred self-rewire unsubscribe (R-rewire-deferred): if `dep` is still live at the
-    /// boundary, unsubscribe from it + swap the fn. If the identity is already absent at apply time, the
-    /// request is a full no-op, including no fn swap, so stale duplicate unsubscribes cannot desync
-    /// the live dep/fn pairing. A successful unsubscribe DRAINS the dep's edge + tears down its source
-    /// on last-subscriber (its lifetime cleanup) = the switchMap/abortInFlight cancellation + memory
-    /// bounding (D47 beta).
-    pub fn rewire_next_unsubscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
-        if !self.open() {
-            return;
+    /// [`Ctx::rewire`] adding `dep` to the list current when the rewire runs.
+    pub(crate) fn rewire_add(&self, dep: Core) {
+        if self.open() {
+            self.node
+                .request_lifetime_rewire(self.lifetime, LifetimeRewire::Add(dep));
         }
-        self.node
-            .request_rewire_next(RewireRequest::remove(&dep, Rc::new(f)));
     }
 
-    /// Request a deferred self-rewire replace (R-rewire-deferred): replace the whole dep set + swap
-    /// the fn at the boundary (the switch-variant — removes-before-adds keeps the tracked inner
-    /// list aligned across boundary waves).
-    pub fn rewire_next_replace_deps<F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F) {
-        if !self.open() {
-            return;
+    /// [`Ctx::rewire`] removing `dep` from the list current when the rewire runs; a
+    /// no-op if it is absent then.
+    pub(crate) fn rewire_remove(&self, dep: Core) {
+        if self.open() {
+            self.node
+                .request_lifetime_rewire(self.lifetime, LifetimeRewire::Remove(dep));
         }
-        self.node
-            .request_rewire_next(RewireRequest::Set(deps, Rc::new(f)));
     }
 
     /// Obtain an owned, `'static` deferred-emit handle for **async-pool** late emission
@@ -325,6 +326,21 @@ impl DeferredCtx {
     /// The lifetime's abort signal (R-lifetime@2).
     pub fn signal(&self) -> AbortSignal {
         self.signal.clone()
+    }
+
+    /// [`Ctx::rewire`] through this kept ctx: a request scoped to its lifetime, dropped
+    /// if the lifetime has closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Ctx::rewire`] does.
+    pub fn rewire(&self, deps: Vec<Core>) {
+        if !self.node.lifetime_open(self.lifetime) {
+            return;
+        }
+        self.node.check_new_deps("rewire", &deps);
+        self.node
+            .request_lifetime_rewire(self.lifetime, LifetimeRewire::Set(deps));
     }
 
     /// The raw input surface captured at defer time (R-invocation).
@@ -374,7 +390,8 @@ impl DeferredCtx {
     /// Emit one typed DATA downstream as the deferred async result.
     pub fn emit<T: 'static>(&self, v: T) {
         if self.node.lifetime_open(self.lifetime) {
-            self.node.owned_down(vec![Message::Data(Rc::new(v))]);
+            self.node
+                .owned_down_from(self.lifetime, vec![Message::Data(Rc::new(v))]);
         }
     }
 
@@ -389,7 +406,7 @@ impl DeferredCtx {
         reject_kernel_only_output(&msgs);
         // Output through a closed lifetime's ctx is dropped (R-lifetime@2).
         if self.node.lifetime_open(self.lifetime) {
-            self.node.owned_down(msgs);
+            self.node.owned_down_from(self.lifetime, msgs);
         }
     }
 }

@@ -515,8 +515,8 @@ pub struct WireBridgeBundle<TOutbound: Clone + 'static, TInbound: Clone + 'stati
     pub cursor: Node<u64>,
     /// `attempts` field for attempts.
     pub attempts: Node<WireBridgeAttempt>,
-    command_sources: Rc<RefCell<Vec<Core>>>,
-    inbound_sources: Rc<RefCell<Vec<Core>>>,
+    command_sources: Rc<crate::fan_in::FanInSources>,
+    inbound_sources: Rc<crate::fan_in::FanInSources>,
 }
 
 impl<TOutbound: Clone + 'static, TInbound: Clone + 'static> WireBridgeBundle<TOutbound, TInbound> {
@@ -978,7 +978,7 @@ pub struct RemoteResponderBundle<TRequest: Clone + 'static, TResponse: Clone + '
     pub errors: Node<RemoteCallError>,
     graph: Graph,
     bridge_command: Node<WireBridgeCommand<RemoteCallResponse<TResponse>>>,
-    command_sources: Rc<RefCell<Vec<Core>>>,
+    command_sources: Rc<crate::fan_in::FanInSources>,
     released: Cell<bool>,
 }
 
@@ -1126,22 +1126,32 @@ where
         "wire_bridge: session_id must be non-empty"
     );
     let name = opts.name.clone().unwrap_or_else(|| "wireBridge".to_owned());
-    let command_sources = Rc::new(RefCell::new(Vec::new()));
-    let inbound_sources = Rc::new(RefCell::new(Vec::new()));
-    let command = graph
-        .state_empty_opts::<WireBridgeCommand<TOutbound>>({
+    // The command and inbound inputs rewire themselves to the attached sources
+    // (graphrefly-rs:D8); the bundle's own methods write into them.
+    let command_sources = crate::fan_in::FanInSources::new();
+    let inbound_sources = crate::fan_in::FanInSources::new();
+    let command = graph.node_opts::<WireBridgeCommand<TOutbound>, _>(
+        Vec::new(),
+        command_sources.body::<WireBridgeCommand<TOutbound>>(),
+        {
             let mut opts = GraphNodeOpts::named(format!("{name}/command"));
             opts.node.partial = true;
             opts.node.complete = Policy::Manual;
             opts.node.error = Policy::Manual;
+            opts.node = command_sources.node_opts(opts.node);
             opts
-        })
-        .into_node();
-    let inbound_node = graph
-        .state_empty_opts::<WireBridgeIngress<TInbound>>(GraphNodeOpts::named(format!(
-            "{name}/inbound"
-        )))
-        .into_node();
+        },
+    );
+    let inbound_node = graph.node_opts::<WireBridgeIngress<TInbound>, _>(
+        Vec::new(),
+        inbound_sources.body::<WireBridgeIngress<TInbound>>(),
+        {
+            let mut opts = GraphNodeOpts::named(format!("{name}/inbound"));
+            opts.node.partial = true;
+            opts.node = inbound_sources.node_opts(opts.node);
+            opts
+        },
+    );
     let inbound = WireBridgeInbound {
         node: inbound_node.clone(),
         session_id: opts.session_id.clone(),
@@ -1326,7 +1336,7 @@ pub struct WireEdgeGroupBundle {
     topology: TopologyGroup,
     gate: Node<WireEdgeGroupGate>,
     bridge_command: Node<WireBridgeCommand<WireBridgeProtobufDataBody>>,
-    command_sources: Rc<RefCell<Vec<Core>>>,
+    command_sources: Rc<crate::fan_in::FanInSources>,
     commands: Node<WireBridgeCommand<WireBridgeProtobufDataBody>>,
     gate_retain: RefCell<Option<Box<dyn FnOnce()>>>,
     released: Cell<bool>,
@@ -3592,7 +3602,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> Option<String> {
 }
 
 fn is_graph_invariant_panic(message: &str) -> bool {
-    message.contains("R-reentrancy")
+    message.contains("R-request-order")
         || message.contains("R-rewire")
         || message.contains("D22")
         || message.contains("same graph")
@@ -3621,154 +3631,44 @@ fn attach_wire_bridge_inbound_source<TOutbound, TInbound>(
 
 fn attach_wire_bridge_command_source_parts<TOutbound>(
     command: &Node<WireBridgeCommand<TOutbound>>,
-    sources: &Rc<RefCell<Vec<Core>>>,
+    sources: &crate::fan_in::FanInSources,
     source: Core,
 ) where
     TOutbound: Clone + 'static,
 {
-    let previous = sources.borrow().clone();
-    {
-        let mut current = sources.borrow_mut();
-        if !current.iter().any(|candidate| candidate.ptr_eq(&source)) {
-            current.push(source.clone());
-        }
-    }
-    let command_sources = sources.borrow().clone();
-    let source_count = command_sources.len();
-    let rewire = catch_unwind(AssertUnwindSafe(|| {
-        command.replace_deps(
-            command_sources,
-            wire_bridge_command_body::<TOutbound>(source_count),
-        );
-    }));
-    if let Err(panic) = rewire {
-        *sources.borrow_mut() = previous.clone();
-        command.replace_deps(
-            previous,
-            wire_bridge_command_body::<TOutbound>(sources.borrow().len()),
-        );
-        resume_unwind(panic);
-    }
+    let _ = command;
+    sources.attach(source);
 }
 
 fn detach_wire_bridge_command_source<TOutbound>(
-    command: &Node<WireBridgeCommand<TOutbound>>,
-    sources: &Rc<RefCell<Vec<Core>>>,
+    _command: &Node<WireBridgeCommand<TOutbound>>,
+    sources: &crate::fan_in::FanInSources,
     source: Core,
 ) where
     TOutbound: Clone + 'static,
 {
-    let previous = sources.borrow().clone();
-    if !previous.iter().any(|candidate| candidate.ptr_eq(&source)) {
-        return;
-    }
-    let next = previous
-        .iter()
-        .filter(|candidate| !candidate.ptr_eq(&source))
-        .cloned()
-        .collect::<Vec<_>>();
-    *sources.borrow_mut() = next.clone();
-    let rewire = catch_unwind(AssertUnwindSafe(|| {
-        command.replace_deps(
-            next,
-            wire_bridge_command_body::<TOutbound>(sources.borrow().len()),
-        );
-    }));
-    if let Err(panic) = rewire {
-        *sources.borrow_mut() = previous.clone();
-        command.replace_deps(
-            previous,
-            wire_bridge_command_body::<TOutbound>(sources.borrow().len()),
-        );
-        resume_unwind(panic);
-    }
+    sources.detach(&source);
 }
 
 fn attach_wire_bridge_inbound_source_parts<TInbound>(
     inbound: &WireBridgeInbound<TInbound>,
-    sources: &Rc<RefCell<Vec<Core>>>,
+    sources: &crate::fan_in::FanInSources,
     source: Core,
 ) where
     TInbound: Clone + 'static,
 {
-    let previous = sources.borrow().clone();
-    {
-        let mut current = sources.borrow_mut();
-        if !current.iter().any(|candidate| candidate.ptr_eq(&source)) {
-            current.push(source.clone());
-        }
-    }
-    let inbound_sources = sources.borrow().clone();
-    let source_count = inbound_sources.len();
-    let rewire = catch_unwind(AssertUnwindSafe(|| {
-        inbound.node.replace_deps(
-            inbound_sources,
-            wire_bridge_inbound_body::<TInbound>(source_count),
-        );
-    }));
-    if let Err(panic) = rewire {
-        *sources.borrow_mut() = previous.clone();
-        inbound.node.replace_deps(
-            previous,
-            wire_bridge_inbound_body::<TInbound>(sources.borrow().len()),
-        );
-        resume_unwind(panic);
-    }
+    let _ = inbound;
+    sources.attach(source);
 }
 
 fn detach_wire_bridge_inbound_source<TInbound>(
-    inbound: &WireBridgeInbound<TInbound>,
-    sources: &Rc<RefCell<Vec<Core>>>,
+    _inbound: &WireBridgeInbound<TInbound>,
+    sources: &crate::fan_in::FanInSources,
     source: Core,
 ) where
     TInbound: Clone + 'static,
 {
-    let previous = sources.borrow().clone();
-    if !previous.iter().any(|candidate| candidate.ptr_eq(&source)) {
-        return;
-    }
-    let next = previous
-        .iter()
-        .filter(|candidate| !candidate.ptr_eq(&source))
-        .cloned()
-        .collect::<Vec<_>>();
-    *sources.borrow_mut() = next.clone();
-    let rewire = catch_unwind(AssertUnwindSafe(|| {
-        inbound.node.replace_deps(
-            next,
-            wire_bridge_inbound_body::<TInbound>(sources.borrow().len()),
-        );
-    }));
-    if let Err(panic) = rewire {
-        *sources.borrow_mut() = previous.clone();
-        inbound.node.replace_deps(
-            previous,
-            wire_bridge_inbound_body::<TInbound>(sources.borrow().len()),
-        );
-        resume_unwind(panic);
-    }
-}
-
-fn wire_bridge_inbound_body<TInbound: Clone + 'static>(
-    source_count: usize,
-) -> impl Fn(&Ctx) + 'static {
-    move |ctx: &Ctx| {
-        for index in 0..source_count {
-            for ingress in ctx.batch::<WireBridgeIngress<TInbound>>(index) {
-                ctx.emit((*ingress).clone());
-            }
-        }
-    }
-}
-
-fn wire_bridge_command_body<T: Clone + 'static>(source_count: usize) -> impl Fn(&Ctx) + 'static {
-    move |ctx: &Ctx| {
-        for index in 0..source_count {
-            for command in ctx.batch::<WireBridgeCommand<T>>(index) {
-                ctx.emit((*command).clone());
-            }
-        }
-    }
+    sources.detach(&source);
 }
 
 fn wire_bridge_events_node<TOutbound, TInbound>(

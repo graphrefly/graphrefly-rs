@@ -10,13 +10,12 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ctx::Ctx;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::identity::canonical_tuple_key;
 use crate::json::JsonValue;
@@ -1039,7 +1038,7 @@ pub struct MessageBus<T = AnyValue> {
     /// `issues` field for issues.
     pub issues: Node<DataIssue>,
     state: Rc<RefCell<MessageBusState<T>>>,
-    command_sources: Rc<RefCell<Vec<Core>>>,
+    command_sources: Rc<crate::fan_in::FanInSources>,
     _runtime_retain: Rc<RetainNode>,
 }
 
@@ -1164,11 +1163,14 @@ impl<T: Clone + 'static> MessageBus<T> {
     /// Creates or computes `with_options`.
     pub fn with_options(graph: &Graph, opts: MessageBusOptions) -> Self {
         let name = Rc::new(opts.name);
-        let command_sources = Rc::new(RefCell::new(Vec::new()));
+        // The input rewires itself to the attached command sources (graphrefly-rs:D8).
+        let command_sources = crate::fan_in::FanInSources::new();
+        let mut commands_opts = node_opts(format!("{name}/commands"), "messageBusCommands");
+        commands_opts.node = command_sources.node_opts(commands_opts.node);
         let commands = graph.node_opts::<MessageBusCommand<T>, _>(
             Vec::new(),
-            message_bus_command_body::<T>(0),
-            node_opts(format!("{name}/commands"), "messageBusCommands"),
+            command_sources.body::<MessageBusCommand<T>>(),
+            commands_opts,
         );
         let initial_topics = unique_topics(opts.topics);
         let state = Rc::new(RefCell::new(MessageBusState {
@@ -1597,25 +1599,7 @@ pub fn to_topic<T: Clone + 'static>(
         },
         node_opts(name.into(), "messageBusToTopic"),
     );
-    let command_source = commands.erased();
-    bus.command_sources
-        .borrow_mut()
-        .push(command_source.clone());
-    let command_sources = bus.command_sources.borrow().clone();
-    let command_source_count = command_sources.len();
-    let rewire = catch_unwind(AssertUnwindSafe(|| {
-        bus.commands.replace_deps(
-            command_sources,
-            message_bus_command_body::<T>(command_source_count),
-        );
-    }));
-    if let Err(panic) = rewire {
-        bus.command_sources
-            .borrow_mut()
-            .retain(|source| !source.ptr_eq(&command_source));
-        graph.release_nodes(&[commands.erased()], "toTopic failed command wiring");
-        resume_unwind(panic);
-    }
+    bus.command_sources.attach(commands.erased());
     ToTopicBundle { commands }
 }
 
@@ -1646,18 +1630,6 @@ pub(crate) fn attach_message_bus_deferred_command_sink<T: Clone + 'static>(
             }
         },
     )
-}
-
-fn message_bus_command_body<T: Clone + 'static>(
-    command_source_count: usize,
-) -> impl Fn(&Ctx) + 'static {
-    move |ctx| {
-        for index in 0..command_source_count {
-            for command in ctx.batch::<MessageBusCommand<T>>(index) {
-                ctx.emit((*command).clone());
-            }
-        }
-    }
 }
 
 fn reduce_message_bus_command<T: Clone + 'static>(
@@ -2610,7 +2582,9 @@ mod clean_slate_tests {
 
         bus.publish("orders", "o1".to_owned(), None, None, None);
         bus.publish("missing", "x".to_owned(), None, None, None);
-        catalog.snapshot_request.set(Default::default());
+        catalog
+            .snapshot_request
+            .set(MessageBusCatalogParams::default());
         topic.snapshot_request.set(MessageBusTopicParams {
             limit: Some(1),
             after_seq: None,

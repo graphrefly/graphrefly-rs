@@ -1508,7 +1508,7 @@ pub struct Explain {
 /// Read-only value-level view over a node fn's dependency snapshot (D27/R-primary-api-clean).
 ///
 /// `Values` exposes DATA-oriented dep state (`latest`, `prev`, `batch`, terminal state)
-/// without the ctx-level power surface (`up`, `down`, `rewire_next`). Graph `derived` and
+/// without the ctx-level power surface (`down`, `rewire`). Graph `derived` and
 /// `effect` use this canonical Rust value API; `node`/`producer` remain the ctx-level
 /// escape hatch.
 pub struct Values<'a> {

@@ -1,10 +1,9 @@
 //! Higher-order operator factories (D6/D24/B53).
 //!
 //! These are graph-layer sugar over the existing R-rewire-deferred substrate:
-//! inners are runtime deps added/removed with `ctx.rewire_next_*`, not hidden
+//! inners are runtime deps added/removed with a ctx rewire (R-request-order@2), not hidden
 //! subscriptions. Projectors must return graph-local nodes.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -15,7 +14,6 @@ use crate::operators::Operator;
 use crate::protocol::Message;
 
 type Body = Rc<dyn Fn(&Ctx)>;
-type BodyCell = Rc<RefCell<Option<Body>>>;
 type Project<TIn, TOut> = Rc<dyn Fn(&Ctx, &TIn) -> Node<TOut>>;
 
 #[derive(Clone, Copy)]
@@ -144,20 +142,16 @@ struct RepeatState {
 /// repeat: run a fresh source from `factory` `count` times in sequence.
 ///
 /// The factory must return a fresh node for each round. Reusing the same node is
-/// not a repeat in the clean-slate substrate: same-boundary
-/// unsubscribe_dep+subscribe_dep is a no-op under D47. D115 keeps the model to
-/// ordinary unsubscribe plus a later subscribe, so same-node repeat needs a
-/// separate future design.
+/// not a repeat: removing and re-adding the same dependency in one rewire is a
+/// no-op (R-request-order@2). D115 keeps the model to an ordinary removal plus a
+/// later addition, so same-node repeat needs a separate future design.
 pub fn repeat<T: 'static>(factory: impl Fn() -> Node<T> + 'static, count: usize) -> Operator<T> {
     assert!(count > 0, "repeat: count must be positive");
 
     let factory: Rc<dyn Fn() -> Node<T>> = Rc::new(factory);
-    let body_cell: BodyCell = Rc::new(RefCell::new(None));
-    let body_cell_for_body = body_cell.clone();
     let body: Body = Rc::new(move |ctx| {
-        run_repeat_body(ctx, &factory, count, &body_cell_for_body);
+        run_repeat_body(ctx, &factory, count);
     });
-    *body_cell.borrow_mut() = Some(body.clone());
 
     Operator::with_opts(
         "repeat",
@@ -177,12 +171,9 @@ fn map_operator<TIn: Clone + 'static, TOut: 'static>(
     concurrent: Option<usize>,
 ) -> Operator<TOut> {
     let project: Project<TIn, TOut> = Rc::new(project);
-    let body_cell: BodyCell = Rc::new(RefCell::new(None));
-    let body_cell_for_body = body_cell.clone();
     let body: Body = Rc::new(move |ctx| {
-        run_map_body(ctx, &project, mode, concurrent, &body_cell_for_body);
+        run_map_body(ctx, &project, mode, concurrent);
     });
-    *body_cell.borrow_mut() = Some(body.clone());
     Operator::with_opts(
         factory,
         NodeOpts {
@@ -200,7 +191,6 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
     project: &Project<TIn, TOut>,
     mode: Mode,
     concurrent: Option<usize>,
-    body_cell: &BodyCell,
 ) {
     let mut st = ctx
         .state_get::<MapState<TIn>>()
@@ -216,7 +206,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
     }
 
     if let Some(error) = first_error_terminal(ctx) {
-        cleanup_all_inners(ctx, &mut st, body_cell);
+        cleanup_all_inners(ctx, &mut st);
         ctx.state_set(st);
         ctx.down(vec![Message::Error(error.into())]);
         return;
@@ -247,7 +237,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
                     .expect("source_batch is not empty")
                     .as_ref()
                     .clone();
-                let Some(inner) = project_inner(ctx, project, &latest, &mut st, body_cell) else {
+                let Some(inner) = project_inner(ctx, project, &latest, &mut st) else {
                     return;
                 };
                 for live in &st.inners {
@@ -271,8 +261,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
                     }
                 } else {
                     for value in source_batch {
-                        let Some(inner) =
-                            project_inner(ctx, project, value.as_ref(), &mut st, body_cell)
+                        let Some(inner) = project_inner(ctx, project, value.as_ref(), &mut st)
                         else {
                             return;
                         };
@@ -296,8 +285,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
                         .expect("source_batch is not empty")
                         .as_ref()
                         .clone();
-                    let Some(inner) = project_inner(ctx, project, &first, &mut st, body_cell)
-                    else {
+                    let Some(inner) = project_inner(ctx, project, &first, &mut st) else {
                         return;
                     };
                     if !contains_core(&to_remove, &inner) {
@@ -312,7 +300,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
     if matches!(mode, Mode::Merge) {
         while !st.queue.is_empty() && concurrent.is_none_or(|max| st.inners.len() < max) {
             let value = st.queue.pop_front().expect("queue checked as non-empty");
-            let Some(inner) = project_inner(ctx, project, &value, &mut st, body_cell) else {
+            let Some(inner) = project_inner(ctx, project, &value, &mut st) else {
                 return;
             };
             if !contains_core(&st.inners, &inner) && !contains_core(&to_remove, &inner) {
@@ -324,7 +312,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
 
     if matches!(mode, Mode::Concat) && st.inners.is_empty() && to_add.is_empty() {
         if let Some(value) = st.queue.pop_front() {
-            let Some(inner) = project_inner(ctx, project, &value, &mut st, body_cell) else {
+            let Some(inner) = project_inner(ctx, project, &value, &mut st) else {
                 return;
             };
             if !contains_core(&to_remove, &inner) {
@@ -336,10 +324,10 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
 
     ctx.state_set(st.clone());
     for dep in to_remove {
-        ctx.rewire_next_unsubscribe_dep(dep, rewire_body(body_cell));
+        ctx.rewire_remove(dep);
     }
     for dep in to_add {
-        ctx.rewire_next_subscribe_dep(dep, rewire_body(body_cell));
+        ctx.rewire_add(dep);
     }
 
     if st.source_done && st.inners.is_empty() && st.queue.is_empty() {
@@ -347,12 +335,7 @@ fn run_map_body<TIn: Clone + 'static, TOut: 'static>(
     }
 }
 
-fn run_repeat_body<T: 'static>(
-    ctx: &Ctx,
-    factory: &Rc<dyn Fn() -> Node<T>>,
-    count: usize,
-    body_cell: &BodyCell,
-) {
+fn run_repeat_body<T: 'static>(ctx: &Ctx, factory: &Rc<dyn Fn() -> Node<T>>, count: usize) {
     let mut st = ctx
         .state_get::<RepeatState>()
         .map(|v| (*v).clone())
@@ -366,7 +349,7 @@ fn run_repeat_body<T: 'static>(
 
     if let Some(error) = first_error_terminal(ctx) {
         if let Some(inner) = st.inner.take() {
-            ctx.rewire_next_unsubscribe_dep(inner, rewire_body(body_cell));
+            ctx.rewire_remove(inner);
         }
         ctx.state_set(st);
         ctx.down(vec![Message::Error(error.into())]);
@@ -381,13 +364,13 @@ fn run_repeat_body<T: 'static>(
         st.round = 0;
         st.inner = Some(inner.clone());
         ctx.state_set(st);
-        ctx.rewire_next_subscribe_dep(inner, rewire_body(body_cell));
+        ctx.rewire_add(inner);
         return;
     }
 
     if st.inner.is_some() && is_complete(ctx.terminal(0)) {
         let old = st.inner.take().expect("repeat inner was checked as Some");
-        ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
+        ctx.rewire_remove(old);
         if st.round + 1 < count {
             st.round += 1;
             let Some(next) = make_repeat_inner(ctx, factory) else {
@@ -400,7 +383,7 @@ fn run_repeat_body<T: 'static>(
             };
             st.inner = Some(next.clone());
             ctx.state_set(st);
-            ctx.rewire_next_subscribe_dep(next, rewire_body(body_cell));
+            ctx.rewire_add(next);
         } else {
             ctx.state_set(RepeatState {
                 started: true,
@@ -427,12 +410,11 @@ fn project_inner<TIn: Clone + 'static, TOut: 'static>(
     project: &Project<TIn, TOut>,
     value: &TIn,
     st: &mut MapState<TIn>,
-    body_cell: &BodyCell,
 ) -> Option<Core> {
     match catch_unwind(AssertUnwindSafe(|| project(ctx, value).erased())) {
         Ok(core) => Some(core),
         Err(payload) => {
-            cleanup_all_inners(ctx, st, body_cell);
+            cleanup_all_inners(ctx, st);
             ctx.state_set(st.clone());
             ctx.down(vec![Message::Error(panic_payload(payload).into())]);
             None
@@ -440,11 +422,7 @@ fn project_inner<TIn: Clone + 'static, TOut: 'static>(
     }
 }
 
-fn cleanup_all_inners<TIn: Clone + 'static>(
-    ctx: &Ctx,
-    st: &mut MapState<TIn>,
-    body_cell: &BodyCell,
-) {
+fn cleanup_all_inners<TIn: Clone + 'static>(ctx: &Ctx, st: &mut MapState<TIn>) {
     let mut seen = Vec::new();
     for inner in st.inners.drain(..) {
         if !contains_core(&seen, &inner) {
@@ -454,19 +432,7 @@ fn cleanup_all_inners<TIn: Clone + 'static>(
     st.queue.clear();
     st.source_done = true;
     for inner in seen {
-        ctx.rewire_next_unsubscribe_dep(inner, rewire_body(body_cell));
-    }
-}
-
-fn rewire_body(body_cell: &BodyCell) -> impl Fn(&Ctx) + 'static {
-    let body_cell = body_cell.clone();
-    move |ctx| {
-        let body = body_cell
-            .borrow()
-            .as_ref()
-            .expect("higher-order body initialized")
-            .clone();
-        body(ctx);
+        ctx.rewire_remove(inner);
     }
 }
 

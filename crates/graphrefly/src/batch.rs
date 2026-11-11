@@ -7,13 +7,14 @@
 //!
 //! ## Interaction with message classes
 //!
-//! Value and later classes (DATA, RESOLVED, INVALIDATE, COMPLETE, ERROR) are held
-//! until the batch commits, then flushed as the committed boundary; a PENDING prefix
-//! still propagates within the batch. The deferred self-rewire drain
-//! (`ctx.rewire_next`, D47) applies AT the committed boundary — never on an
-//! un-committed view (C-11/C-22). graphrefly:D797 replaces this with a batch that
-//! delivers nothing before its commit (graphrefly-rs:D797-KERNEL-MIGRATION-RS
-//! phases 2 and 5).
+//! `batch(body)` runs `body` at once, also during a wave, and delivers nothing while
+//! it runs: host inputs are staged (a write function computes at the commit from the
+//! writes staged before it), and topology requests (subscribe, unsubscribe, replace,
+//! ctx.rewire) wait. When `body` returns, its inputs commit as one wave, and its
+//! requests then run in order (R-request-order@2). The commit is itself a request:
+//! during a wave it runs after the wave. A body that panics commits nothing and drops
+//! its requests; output a ctx staged through a lifetime that closed before the commit
+//! is dropped at the commit.
 //!
 //! Conformance touchpoints: C-3 (INVALIDATE fan-in idempotency exercised via
 //! batch) and C-22 (batch-before-rewire).
@@ -40,10 +41,39 @@ impl BatchCtx {
     }
 }
 
+/// A state write function staged in a batch: it computes from the value the writes
+/// staged before it leave, at the commit (R-request-order@2).
+pub(crate) type StagedWrite = Box<dyn FnOnce(Option<AnyValue>) -> Option<AnyValue>>;
+
+/// One staged item of a target, in staging order.
+enum Staged {
+    /// Messages, with the lifetime of the ctx that staged them, if any: output staged
+    /// through a lifetime that closed before the commit is dropped at the commit.
+    Msgs {
+        msgs: Wave<AnyValue>,
+        lifetime: Option<u64>,
+    },
+    /// A state write function.
+    Write(StagedWrite),
+}
+
+type StagedItems = Vec<Staged>;
+
+fn ends_with_terminal(items: &[Staged]) -> bool {
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            Staged::Msgs { msgs, .. } if !msgs.is_empty() => Some(msgs),
+            _ => None,
+        })
+        .is_some_and(|msgs| msgs.last().is_some_and(Message::is_terminal))
+}
+
 struct ActiveBatch {
     targets: Vec<BatchTarget>,
     order: Vec<usize>,
-    deferred: Vec<Option<Wave<AnyValue>>>,
+    deferred: Vec<Option<StagedItems>>,
     boundary_roots: Vec<BoundaryRoot>,
     committed: Rc<Cell<bool>>,
     rolled_back: Rc<Cell<bool>>,
@@ -111,6 +141,38 @@ pub(crate) fn register_boundary_root(target: &Core) {
 /// terminal already staged for the node: a terminal must be the last message of its
 /// array (R-wave).
 pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
+    stage(target, |staged| {
+        assert!(
+            wave.is_empty() || !ends_with_terminal(staged),
+            "batch: output staged after a terminal (R-wave)"
+        );
+        staged.push(Staged::Msgs {
+            msgs: wave,
+            lifetime: None,
+        });
+    })
+}
+
+/// [`defer_to_batch`] for output a ctx of `lifetime` staged.
+pub(crate) fn defer_to_batch_from(target: &Core, wave: Wave<AnyValue>, lifetime: u64) -> bool {
+    stage(target, |staged| {
+        assert!(
+            wave.is_empty() || !ends_with_terminal(staged),
+            "batch: output staged after a terminal (R-wave)"
+        );
+        staged.push(Staged::Msgs {
+            msgs: wave,
+            lifetime: Some(lifetime),
+        });
+    })
+}
+
+/// Stages a state write function for `target` in the collecting batch.
+pub(crate) fn stage_write(target: &Core, write: StagedWrite) -> bool {
+    stage(target, |staged| staged.push(Staged::Write(write)))
+}
+
+fn stage(target: &Core, push: impl FnOnce(&mut StagedItems)) -> bool {
     ACTIVE_BATCH.with(|b| {
         let mut active = b.borrow_mut();
         let Some(batch) = active.as_mut() else {
@@ -132,12 +194,7 @@ pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
                 index
             }
         };
-        let staged = batch.deferred[index].get_or_insert_with(Vec::new);
-        assert!(
-            wave.is_empty() || !staged.last().is_some_and(Message::is_terminal),
-            "batch: output staged after a terminal (R-wave)"
-        );
-        staged.extend(wave);
+        push(batch.deferred[index].get_or_insert_with(Vec::new));
         true
     })
 }
@@ -160,7 +217,7 @@ pub(crate) fn assert_stageable(target: &Core, wave: &[Message<AnyValue>]) {
                     .deferred
                     .get(index)
                     .and_then(Option::as_ref)
-                    .is_some_and(|staged| staged.last().is_some_and(Message::is_terminal))
+                    .is_some_and(|staged| ends_with_terminal(staged))
         });
         drop(active);
         assert!(
@@ -170,27 +227,10 @@ pub(crate) fn assert_stageable(target: &Core, wave: &[Message<AnyValue>]) {
     });
 }
 
-/// Return the active batch's commit token, but only when this target has an
-/// uncommitted settle slice in that batch (R-rewire-batch-boundary / D67).
-pub(crate) fn committed_after_batch_for_target(target: &Core) -> Option<Rc<Cell<bool>>> {
-    ACTIVE_BATCH.with(|b| {
-        let active = b.borrow();
-        let batch = active.as_ref()?;
-        if !batch.collecting
-            || !batch.targets.iter().enumerate().any(|(index, existing)| {
-                existing.matches(target) && batch.deferred.get(index).is_some_and(Option::is_some)
-            })
-        {
-            return None;
-        }
-        Some(batch.committed.clone())
-    })
-}
-
 struct BatchFinish {
     targets: Vec<BatchTarget>,
     order: Vec<usize>,
-    deferred: Vec<Option<Wave<AnyValue>>>,
+    deferred: Vec<Option<StagedItems>>,
     boundary_roots: Vec<BoundaryRoot>,
     committed: Rc<Cell<bool>>,
     explicit_rollback: bool,
@@ -218,12 +258,56 @@ fn clear_active() {
     });
 }
 
-fn commit(targets: &[BatchTarget], deferred: Vec<Option<Wave<AnyValue>>>) {
+/// Resolves each target's staged items into the one array it commits, before
+/// anything is delivered: output from a closed lifetime is dropped, and each write
+/// function computes from the value the items before it leave (an INVALIDATE leaves
+/// none). A panicking write function fails the whole commit.
+fn resolve(
+    targets: &[BatchTarget],
+    deferred: Vec<Option<StagedItems>>,
+) -> std::thread::Result<Vec<(usize, Wave<AnyValue>)>> {
+    let mut resolved = Vec::new();
+    for (index, items) in deferred.into_iter().enumerate() {
+        let Some(items) = items else { continue };
+        let Some(core) = targets[index].borrowed_core() else {
+            continue;
+        };
+        let mut current = core.cache_any();
+        let mut wave: Wave<AnyValue> = Vec::new();
+        for item in items {
+            match item {
+                Staged::Msgs { msgs, lifetime } => {
+                    if lifetime.is_some_and(|id| !core.lifetime_open(id)) {
+                        continue;
+                    }
+                    for m in &msgs {
+                        match m {
+                            Message::Data(v) => current = Some(v.clone()),
+                            Message::Invalidate => current = None,
+                            _ => {}
+                        }
+                    }
+                    wave.extend(msgs);
+                }
+                Staged::Write(write) => {
+                    let input = current.clone();
+                    if let Some(v) = catch_unwind(AssertUnwindSafe(move || write(input)))? {
+                        current = Some(v.clone());
+                        wave.push(Message::Data(v));
+                    }
+                }
+            }
+        }
+        resolved.push((index, wave));
+    }
+    Ok(resolved)
+}
+
+fn commit(targets: &[BatchTarget], resolved: Vec<(usize, Wave<AnyValue>)>) {
     commit_batched_waves(
-        deferred
+        resolved
             .into_iter()
-            .enumerate()
-            .filter_map(|(target_index, wave)| wave.map(|wave| (&targets[target_index], wave)))
+            .map(|(index, wave)| (&targets[index], wave))
             .collect(),
     );
 }
@@ -231,7 +315,7 @@ fn commit(targets: &[BatchTarget], deferred: Vec<Option<Wave<AnyValue>>>) {
 fn boundary_graph_roots(
     targets: &[BatchTarget],
     order: &[usize],
-    deferred: &[Option<Wave<AnyValue>>],
+    deferred: &[Option<StagedItems>],
 ) -> Vec<BoundaryRoot> {
     let mut roots: Vec<BoundaryRoot> = Vec::new();
     let mut push_unique = |target: &BatchTarget| {
@@ -355,6 +439,7 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
     let ctx = BatchCtx {
         rolled_back: rolled_back.clone(),
     };
+    let request_mark = crate::node::request_mark();
     let result = catch_unwind(AssertUnwindSafe(|| f(&ctx)));
     let finish = take_for_finish();
     let boundary_core_roots =
@@ -369,29 +454,76 @@ pub fn batch<R>(f: impl FnOnce(&BatchCtx) -> R) -> R {
     match result {
         Ok(value) => {
             if finish.explicit_rollback {
+                crate::node::drop_requests_after(request_mark);
                 if let Err(payload) =
                     rollback_and_cleanup(finish.targets, finish.order, boundary_task_roots)
                 {
                     resume_unwind(payload);
                 }
+            } else if crate::node::in_wave() {
+                // The commit is a request: during a wave it runs after the wave, and
+                // the body's topology requests run after it (R-request-order@2).
+                clear_active();
+                let BatchFinish {
+                    targets,
+                    deferred,
+                    committed,
+                    ..
+                } = finish;
+                // The body's own requests run right after its commit, before any
+                // request the commit wave makes.
+                let body_requests = crate::node::take_requests_after(request_mark);
+                crate::node::request(move || {
+                    committed.set(true);
+                    let failed = match resolve(&targets, deferred) {
+                        Ok(resolved) => {
+                            commit(&targets, resolved);
+                            None
+                        }
+                        Err(payload) => Some(payload),
+                    };
+                    // The body's topology requests run even when a write failed.
+                    drain_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
+                    for body_request in body_requests {
+                        crate::node::run_queued_request(body_request);
+                    }
+                    if let Some(payload) = failed {
+                        resume_unwind(payload);
+                    }
+                });
             } else {
-                let commit_result = catch_unwind(AssertUnwindSafe(|| {
-                    commit(&finish.targets, finish.deferred)
-                }));
+                let resolved = match resolve(&finish.targets, finish.deferred) {
+                    Ok(resolved) => resolved,
+                    Err(payload) => {
+                        // A failed write function commits nothing; the body's topology
+                        // requests still run, then the failure reaches the caller.
+                        finish.committed.set(true);
+                        clear_active();
+                        drain_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
+                        crate::node::drain_requests();
+                        resume_unwind(payload);
+                    }
+                };
+                let commit_result =
+                    catch_unwind(AssertUnwindSafe(|| commit(&finish.targets, resolved)));
                 let late_roots = take_late_boundary_roots();
                 append_boundary_roots(&mut boundary_task_roots, &boundary_core_roots, late_roots);
                 if let Err(payload) = commit_result {
                     clear_active();
                     clear_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
+                    crate::node::drain_requests();
                     resume_unwind(payload);
                 }
                 finish.committed.set(true);
                 clear_active();
                 drain_boundary_for_roots(&boundary_core_roots, &boundary_task_roots);
+                // Requests made during the commit's waves run after it.
+                crate::node::drain_requests();
             }
             value
         }
         Err(payload) => {
+            crate::node::drop_requests_after(request_mark);
             if let Err(rollback_payload) =
                 rollback_and_cleanup(finish.targets, finish.order, boundary_task_roots)
             {

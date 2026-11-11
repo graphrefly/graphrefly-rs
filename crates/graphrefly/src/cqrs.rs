@@ -1215,12 +1215,11 @@ fn cqrs_timestamp(now: &dyn Fn() -> u64) -> Result<u64, String> {
 
 fn is_graph_runtime_panic(panic: &Box<dyn std::any::Any + Send>) -> bool {
     let message = panic_message(panic);
-    message.contains("R-reentrancy")
+    message.contains("R-request-order")
         || message.contains("R-rewire")
         || message.contains("R-graph-domain")
         || message.contains("D22")
-        || message.contains("D37")
-        || message.contains("feedback cycle")
+        || message.contains("never reentered")
         || message.contains("different graph")
         || message.contains("cross-graph")
         || message.contains("wire bridge")

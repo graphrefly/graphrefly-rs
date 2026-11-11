@@ -662,7 +662,7 @@ pub struct ProcessBundle<
     pub error: Node<ProcessError<TCommand>>,
     /// `cursor` field for cursor.
     pub cursor: Node<ProcessCursor>,
-    command_sources: Rc<RefCell<Vec<Core>>>,
+    command_sources: Rc<crate::fan_in::FanInSources>,
     command_id: String,
     _retains: Rc<Vec<ProcessRetain>>,
 }
@@ -770,7 +770,7 @@ pub struct ProcessEffectRunnerBundle<
     process_command: Node<ProcessCommand<TCommand>>,
     process_command_id: String,
     name: String,
-    command_sources: Rc<RefCell<Vec<Core>>>,
+    command_sources: Rc<crate::fan_in::FanInSources>,
     released: Cell<bool>,
     retains: RefCell<Vec<ProcessRetain>>,
 }
@@ -884,16 +884,17 @@ pub fn process_bundle<
     let name = opts.name;
     let reduce = opts.reduce;
     let now = opts.now;
-    let command_sources = Rc::new(RefCell::new(Vec::new()));
+    let command_sources = crate::fan_in::FanInSources::new();
     let initial_state_json = state_to_json(&opts.initial_state)
         .unwrap_or_else(|message| panic!("process_bundle: {message}"));
 
     let command_id = format!("{name}/command");
     let command = graph.init_node::<ProcessCommand<TCommand>>(
+        // The input rewires itself to the attached command sources (graphrefly-rs:D8).
         Operator::with_opts(
             "processCommand",
-            no_terminal_opts(),
-            process_command_source_body::<TCommand>(0),
+            command_sources.node_opts(no_terminal_opts()),
+            command_sources.body::<ProcessCommand<TCommand>>(),
         ),
         Vec::new(),
         meta_opts(command_id.clone(), "command"),
@@ -1417,80 +1418,23 @@ where
 }
 
 fn attach_process_command_source_parts<TCommand>(
-    command: &Node<ProcessCommand<TCommand>>,
-    sources: &Rc<RefCell<Vec<Core>>>,
+    _command: &Node<ProcessCommand<TCommand>>,
+    sources: &crate::fan_in::FanInSources,
     source: Core,
 ) where
     TCommand: Clone + 'static,
 {
-    let previous = sources.borrow().clone();
-    {
-        let mut current = sources.borrow_mut();
-        if !current.iter().any(|candidate| candidate.ptr_eq(&source)) {
-            current.push(source.clone());
-        }
-    }
-    let command_sources = sources.borrow().clone();
-    let source_count = command_sources.len();
-    let rewire = catch_unwind(AssertUnwindSafe(|| {
-        command.replace_deps(
-            command_sources,
-            process_command_source_body::<TCommand>(source_count),
-        );
-    }));
-    if let Err(panic) = rewire {
-        *sources.borrow_mut() = previous.clone();
-        command.replace_deps(
-            previous,
-            process_command_source_body::<TCommand>(sources.borrow().len()),
-        );
-        resume_unwind(panic);
-    }
+    sources.attach(source);
 }
 
 fn detach_process_command_source<TCommand>(
-    command: &Node<ProcessCommand<TCommand>>,
-    sources: &Rc<RefCell<Vec<Core>>>,
+    _command: &Node<ProcessCommand<TCommand>>,
+    sources: &crate::fan_in::FanInSources,
     source: Core,
 ) where
     TCommand: Clone + 'static,
 {
-    let previous = sources.borrow().clone();
-    if !previous.iter().any(|candidate| candidate.ptr_eq(&source)) {
-        return;
-    }
-    let next = previous
-        .iter()
-        .filter(|candidate| !candidate.ptr_eq(&source))
-        .cloned()
-        .collect::<Vec<_>>();
-    *sources.borrow_mut() = next.clone();
-    let rewire = catch_unwind(AssertUnwindSafe(|| {
-        command.replace_deps(
-            next,
-            process_command_source_body::<TCommand>(sources.borrow().len()),
-        );
-    }));
-    if let Err(panic) = rewire {
-        *sources.borrow_mut() = previous.clone();
-        command.replace_deps(
-            previous,
-            process_command_source_body::<TCommand>(sources.borrow().len()),
-        );
-        resume_unwind(panic);
-    }
-}
-
-fn process_command_source_body<TCommand: Clone + 'static>(
-    source_count: usize,
-) -> impl Fn(&Ctx) + 'static {
-    move |ctx: &Ctx| {
-        for index in 0..source_count {
-            for command in ctx.batch::<ProcessCommand<TCommand>>(index) {
-                ctx.emit((*command).clone());
-            }
-        }
-    }
+    sources.detach(&source);
 }
 
 #[derive(Debug)]
@@ -2016,12 +1960,11 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 
 fn is_graph_runtime_panic(panic: &Box<dyn std::any::Any + Send>) -> bool {
     let message = panic_message(panic);
-    message.contains("R-reentrancy")
+    message.contains("R-request-order")
         || message.contains("R-rewire")
         || message.contains("R-graph-domain")
         || message.contains("D22")
-        || message.contains("D37")
-        || message.contains("feedback cycle")
+        || message.contains("never reentered")
         || message.contains("different graph")
         || message.contains("cross-graph")
         || message.contains("wire bridge")

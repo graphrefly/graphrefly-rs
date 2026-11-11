@@ -935,7 +935,9 @@ impl<T: Clone + 'static> ReactiveList<T> {
         let disposers = self.disposers.clone();
         let folder_for_dispose = folder.clone();
         Box::new(move || {
-            folder_for_dispose.unsubscribe_dep(src_core, |_| {});
+            // The bind ends: a new instance with no dependency detaches the source
+            // (graphrefly-rs:D8).
+            folder_for_dispose.replace(Vec::new(), |_| {}, crate::node::ReplaceOpts::default());
             if let Some(disposer) = disposers.borrow_mut().get_mut(slot).and_then(Option::take) {
                 disposer();
             }
@@ -1696,7 +1698,9 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         let disposers = self.disposers.clone();
         let folder_for_dispose = folder.clone();
         Box::new(move || {
-            folder_for_dispose.unsubscribe_dep(src_core, |_| {});
+            // The bind ends: a new instance with no dependency detaches the source
+            // (graphrefly-rs:D8).
+            folder_for_dispose.replace(Vec::new(), |_| {}, crate::node::ReplaceOpts::default());
             if let Some(disposer) = disposers.borrow_mut().get_mut(slot).and_then(Option::take) {
                 disposer();
             }

@@ -216,9 +216,13 @@ fn observe_topology_deps_changed_matches_describe_edges() {
         .observe_topology_path("d")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
-    d.replace_deps(vec![b.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap());
-    });
+    d.replace(
+        vec![b.erased()],
+        |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+        },
+        graphrefly::ReplaceOpts::default(),
+    );
 
     observer.unsubscribe();
     let events = events.borrow();
@@ -283,9 +287,13 @@ fn observe_topology_forwards_mounted_child_events_with_parent_paths() {
         |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
         GraphNodeOpts::named("d"),
     );
-    d.replace_deps(vec![b.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap());
-    });
+    d.replace(
+        vec![b.erased()],
+        |ctx| {
+            ctx.emit(*ctx.data::<i32>(0).unwrap());
+        },
+        graphrefly::ReplaceOpts::default(),
+    );
 
     observer.unsubscribe();
     let events = events.borrow();
@@ -1429,9 +1437,11 @@ fn substrate_rewire_rejects_cross_arena_deps() {
     let source = g1.state(1i32);
     let target = g2.derived::<i32, _>(vec![], |_| Some(0));
 
-    target.replace_deps(vec![source.erased()], |ctx| {
-        ctx.emit(*ctx.data::<i32>(0).unwrap())
-    });
+    target.replace(
+        vec![source.erased()],
+        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
+        graphrefly::ReplaceOpts::default(),
+    );
 }
 
 #[test]

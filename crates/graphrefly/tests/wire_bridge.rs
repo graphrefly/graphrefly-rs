@@ -309,6 +309,9 @@ fn wire_edge_group_emits_two_phase_frames_gates_release_describes_and_releases()
             ],
         ),
     );
+    // The command input rewires itself to its sources for its lifetime
+    // (graphrefly-rs:D8), so the edge shows while the bridge is active.
+    let _active = bridge2.events.subscribe(|_| {});
     assert!(g
         .describe()
         .edges

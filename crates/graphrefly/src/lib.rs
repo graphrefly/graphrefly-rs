@@ -72,6 +72,7 @@ pub mod data_structures;
 pub mod diagnostics;
 pub mod dispatcher;
 pub mod environment;
+mod fan_in;
 pub mod graph;
 pub mod higher_order;
 #[doc(hidden)]
@@ -256,7 +257,10 @@ pub use messaging::{
     CONTEXT_TOPIC, DEFERRED_TOPIC, INJECTIONS_TOPIC, PROMPTS_TOPIC, RESPONSES_TOPIC, SPAWNS_TOPIC,
     STANDARD_TOPICS, TODOS_TOPIC,
 };
-pub use node::{CacheStatus, Core, Lifecycle, Node, NodeOpts, OutputStatus, Policy, State, Status};
+pub use node::{
+    CacheStatus, Core, Lifecycle, Node, NodeDefinition, NodeOpts, OutputStatus, Policy,
+    ReplaceOpts, State, StateWrite, Status,
+};
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, init_node,
     last, last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,

@@ -4,7 +4,6 @@
 //! only in [`crate::sources::timer`]; helper timer nodes are created in the owning
 //! node's graph arena/dispatcher through a crate-private `Ctx` initializer.
 
-use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
@@ -16,7 +15,6 @@ use crate::protocol::Message;
 use crate::sources::{interval, timer};
 
 type Body = Rc<dyn Fn(&Ctx)>;
-type BodyCell = Rc<RefCell<Option<Body>>>;
 type AuditProject<S> = Rc<dyn Fn(&Ctx, &S) -> Core>;
 
 fn delayed_value<S: Clone + 'static>(ctx: &Ctx, value: S, ms: u64) -> Node<S> {
@@ -102,12 +100,9 @@ struct ThrottleState {
 }
 
 fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> Operator<S> {
-    let body_cell: BodyCell = Rc::new(RefCell::new(None));
-    let body_cell_for_body = body_cell.clone();
     let body: Body = Rc::new(move |ctx| {
-        run_throttle_body::<S>(ctx, ms, &body_cell_for_body);
+        run_throttle_body::<S>(ctx, ms);
     });
-    *body_cell.borrow_mut() = Some(body.clone());
 
     Operator::with_opts(
         factory,
@@ -121,7 +116,7 @@ fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> 
     )
 }
 
-fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, body_cell: &BodyCell) {
+fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64) {
     let mut st = ctx
         .state_get::<ThrottleState>()
         .map(|v| (*v).clone())
@@ -155,7 +150,7 @@ fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, body_cell: &BodyCel
             source_done: true,
         });
         for timer in to_remove {
-            ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
+            ctx.rewire_remove(timer);
         }
         ctx.down(vec![Message::Error(error.into())]);
         return;
@@ -184,16 +179,16 @@ fn run_throttle_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, body_cell: &BodyCel
 
     ctx.state_set(st.clone());
     for timer in to_remove {
-        ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
+        ctx.rewire_remove(timer);
     }
     if set_to_timer_only {
         let timer = st
             .timer
             .clone()
             .expect("source_done with live throttle timer");
-        ctx.rewire_next_replace_deps(vec![timer], rewire_body(body_cell));
+        ctx.rewire(vec![timer]);
     } else if let Some(timer) = to_add {
-        ctx.rewire_next_subscribe_dep(timer, rewire_body(body_cell));
+        ctx.rewire_add(timer);
     }
     if complete {
         ctx.down(vec![Message::Complete]);
@@ -219,12 +214,9 @@ fn audit_with_ctx<S: Clone + 'static>(
     factory: &'static str,
     duration_selector: AuditProject<S>,
 ) -> Operator<S> {
-    let body_cell: BodyCell = Rc::new(RefCell::new(None));
-    let body_cell_for_body = body_cell.clone();
     let body: Body = Rc::new(move |ctx| {
-        run_audit_body(ctx, &duration_selector, &body_cell_for_body);
+        run_audit_body(ctx, &duration_selector);
     });
-    *body_cell.borrow_mut() = Some(body.clone());
 
     Operator::with_opts(
         factory,
@@ -238,11 +230,7 @@ fn audit_with_ctx<S: Clone + 'static>(
     )
 }
 
-fn run_audit_body<S: Clone + 'static>(
-    ctx: &Ctx,
-    duration_selector: &AuditProject<S>,
-    body_cell: &BodyCell,
-) {
+fn run_audit_body<S: Clone + 'static>(ctx: &Ctx, duration_selector: &AuditProject<S>) {
     let mut st = ctx
         .state_get::<AuditState<S>>()
         .map(|v| (*v).clone())
@@ -269,13 +257,13 @@ fn run_audit_body<S: Clone + 'static>(
         st.latest = None;
         st.suppress_next_notifier = false;
         if let Some(old) = old {
-            ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
+            ctx.rewire_remove(old);
         }
     }
 
     if let Some(error) = first_error(ctx) {
         if let Some(old) = st.notifier.take() {
-            ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
+            ctx.rewire_remove(old);
         }
         ctx.state_set(AuditState::<S> {
             window_open: false,
@@ -296,7 +284,7 @@ fn run_audit_body<S: Clone + 'static>(
             ctx.down(vec![Message::Data(Rc::new(value))]);
         }
         if let Some(old) = st.notifier.take() {
-            ctx.rewire_next_unsubscribe_dep(old, rewire_body(body_cell));
+            ctx.rewire_remove(old);
         }
         ctx.state_set(AuditState::<S> {
             window_open: false,
@@ -317,7 +305,7 @@ fn run_audit_body<S: Clone + 'static>(
                         .as_ref()
                         .is_some_and(|old| old.ptr_eq(&notifier));
                     st.notifier = Some(notifier.clone());
-                    ctx.rewire_next_subscribe_dep(notifier, rewire_body(body_cell));
+                    ctx.rewire_add(notifier);
                 }
                 Err(payload) => {
                     ctx.state_set(AuditState::<S> {
@@ -341,20 +329,11 @@ fn run_audit_body<S: Clone + 'static>(
 pub fn timeout<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<S> {
     let source_core = source.erased();
     let initial_timer = scoped_timer(&source_core, ms).erased();
-    let body_cell: BodyCell = Rc::new(RefCell::new(None));
-    let body_cell_for_body = body_cell.clone();
     let initial_for_body = initial_timer.clone();
     let source_for_body = source_core.clone();
     let body: Body = Rc::new(move |ctx| {
-        run_timeout_body::<S>(
-            ctx,
-            ms,
-            &initial_for_body,
-            &source_for_body,
-            &body_cell_for_body,
-        );
+        run_timeout_body::<S>(ctx, ms, &initial_for_body, &source_for_body);
     });
-    *body_cell.borrow_mut() = Some(body.clone());
 
     let node = crate::operators::init_node_in_arena_with_dispatcher(
         Operator::with_opts("timeout", time_helper_opts(), move |ctx| {
@@ -369,13 +348,7 @@ pub fn timeout<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<S> {
     node
 }
 
-fn run_timeout_body<S: Clone + 'static>(
-    ctx: &Ctx,
-    ms: u64,
-    initial_timer: &Core,
-    source: &Core,
-    body_cell: &BodyCell,
-) {
+fn run_timeout_body<S: Clone + 'static>(ctx: &Ctx, ms: u64, initial_timer: &Core, source: &Core) {
     let mut st = ctx
         .state_get::<TimeoutState>()
         .map(|v| (*v).clone())
@@ -398,7 +371,7 @@ fn run_timeout_body<S: Clone + 'static>(
 
     if is_complete(ctx.terminal(1)) {
         if let Some(timer) = st.timer.take() {
-            ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
+            ctx.rewire_remove(timer);
         }
         ctx.state_set(TimeoutState { timer: None });
         ctx.down(vec![Message::Complete]);
@@ -407,7 +380,7 @@ fn run_timeout_body<S: Clone + 'static>(
 
     if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
         if let Some(timer) = st.timer.take() {
-            ctx.rewire_next_unsubscribe_dep(timer, rewire_body(body_cell));
+            ctx.rewire_remove(timer);
         }
         ctx.state_set(TimeoutState { timer: None });
         ctx.down(vec![Message::Error(error.to_string().into())]);
@@ -420,9 +393,9 @@ fn run_timeout_body<S: Clone + 'static>(
         st.timer = Some(next.clone());
         ctx.state_set(st);
         if old.is_some() {
-            ctx.rewire_next_replace_deps(vec![next, source.clone()], rewire_body(body_cell));
+            ctx.rewire(vec![next, source.clone()]);
         } else {
-            ctx.rewire_next_subscribe_dep(next, rewire_body(body_cell));
+            ctx.rewire_add(next);
         }
         return;
     }
@@ -442,13 +415,10 @@ fn run_timeout_body<S: Clone + 'static>(
 pub fn buffer_time<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<Vec<S>> {
     let source_core = source.erased();
     let interval_node = scoped_interval(&source_core, ms).erased();
-    let body_cell: BodyCell = Rc::new(RefCell::new(None));
-    let body_cell_for_body = body_cell.clone();
     let interval_for_body = interval_node.clone();
     let body: Body = Rc::new(move |ctx| {
-        run_buffer_time_body::<S>(ctx, &interval_for_body, &body_cell_for_body);
+        run_buffer_time_body::<S>(ctx, &interval_for_body);
     });
-    *body_cell.borrow_mut() = Some(body.clone());
 
     let node = crate::operators::init_node_in_arena_with_dispatcher(
         Operator::with_opts("bufferTime", time_helper_opts(), move |ctx| {
@@ -463,11 +433,7 @@ pub fn buffer_time<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<Vec<S>
     node
 }
 
-fn run_buffer_time_body<S: Clone + 'static>(
-    ctx: &Ctx,
-    initial_interval: &Core,
-    body_cell: &BodyCell,
-) {
+fn run_buffer_time_body<S: Clone + 'static>(ctx: &Ctx, initial_interval: &Core) {
     let mut st = ctx
         .state_get::<BufferTimeState<S>>()
         .map(|v| (*v).clone())
@@ -485,7 +451,7 @@ fn run_buffer_time_body<S: Clone + 'static>(
             ctx.down(vec![Message::Data(Rc::new(st.buffer.clone()))]);
         }
         if let Some(interval) = st.interval.take() {
-            ctx.rewire_next_unsubscribe_dep(interval, rewire_body(body_cell));
+            ctx.rewire_remove(interval);
         }
         ctx.state_set(BufferTimeState::<S> {
             buffer: Vec::new(),
@@ -497,7 +463,7 @@ fn run_buffer_time_body<S: Clone + 'static>(
 
     if let Some(DepTerminal::Error(error)) = ctx.terminal(1) {
         if let Some(interval) = st.interval.take() {
-            ctx.rewire_next_unsubscribe_dep(interval, rewire_body(body_cell));
+            ctx.rewire_remove(interval);
         }
         ctx.state_set(BufferTimeState::<S> {
             buffer: Vec::new(),
@@ -550,18 +516,6 @@ fn time_helper_opts() -> NodeOpts {
         complete: Policy::Manual,
         error: Policy::Manual,
         ..NodeOpts::default()
-    }
-}
-
-fn rewire_body(body_cell: &BodyCell) -> impl Fn(&Ctx) + 'static {
-    let body_cell = body_cell.clone();
-    move |ctx| {
-        let body = body_cell
-            .borrow()
-            .as_ref()
-            .expect("audit body initialized")
-            .clone();
-        body(ctx);
     }
 }
 

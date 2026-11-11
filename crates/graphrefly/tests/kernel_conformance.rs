@@ -818,8 +818,11 @@ fn driven() -> (Node<i32>, Rc<RefCell<Option<graphrefly::DeferredCtx>>>) {
 fn send(slot: &Rc<RefCell<Option<graphrefly::DeferredCtx>>>, wave: Vec<Message<AnyValue>>) {
     // Taken out for the call, so the sink side can never meet a held borrow.
     let ctx = slot.borrow_mut().take().expect("producer activated");
-    ctx.down(wave);
+    let sent = catch_unwind(AssertUnwindSafe(|| ctx.down(wave)));
     slot.borrow_mut().get_or_insert(ctx);
+    if let Err(panic) = sent {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 /// Node options whose setup returns a cleanup that runs `f` (R-lifetime@2).
@@ -1709,4 +1712,772 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
     assert_eq!(n.status().output, OutputStatus::Completed);
     graphrefly::set_host_reporter(previous);
     n_handle.borrow_mut().take();
+}
+
+// ── Phase 5: requests, batch, set fn, replace and ctx.rewire ─────────────────
+
+/// The current dependencies of `name`, as the graph describes them.
+fn deps_of(g: &graphrefly::Graph, name: &str) -> Vec<String> {
+    g.describe()
+        .edges
+        .iter()
+        .filter(|e| e.to == name)
+        .map(|e| e.from.clone())
+        .collect()
+}
+
+fn named(name: &str) -> graphrefly::GraphNodeOpts {
+    graphrefly::GraphNodeOpts::named(name)
+}
+
+/// C-6 — a function's write to its own upstream is a later request, never a reentry.
+#[test]
+fn c6_write_to_own_upstream_is_a_later_request() {
+    let s = Node::<i32>::state_empty();
+    let d = Node::<i32>::derived(vec![s.erased()], |ctx| {
+        ctx.emit(*ctx.data::<i32>(0).unwrap() + 1)
+    });
+    let running = Rc::new(Cell::new(false));
+    let reentered = Rc::new(Cell::new(false));
+    let e = {
+        let s = s.clone();
+        let (running, reentered) = (running.clone(), reentered.clone());
+        Node::<()>::derived(vec![d.erased()], move |ctx| {
+            reentered.set(reentered.get() || running.get());
+            running.set(true);
+            let v = *ctx.data::<i32>(0).unwrap();
+            if v < 3 {
+                s.set(v);
+            }
+            running.set(false);
+        })
+    };
+    let scan_runs = Rc::new(Cell::new(0usize));
+    let scan = {
+        let scan_runs = scan_runs.clone();
+        Node::<i32>::derived(vec![s.erased()], move |ctx| {
+            scan_runs.set(scan_runs.get() + 1);
+            let total = ctx.state_get::<i32>().map_or(0, |t| *t) + *ctx.data::<i32>(0).unwrap();
+            ctx.state_set(total);
+            ctx.emit(total);
+        })
+    };
+    let (e_log, _ue) = record_arrays(&e);
+    let (d_log, _ud) = record_values(&d);
+    let _us = scan.subscribe(|_| {});
+
+    s.set(0);
+    assert!(!reentered.get(), "no function is reentered");
+    assert_eq!(d.cache(), Some(3), "the loop ends once D reaches 3");
+    assert_eq!(s.cache(), Some(2));
+    let d_waves: Vec<Vec<i32>> = d_log
+        .borrow()
+        .iter()
+        .filter(|w| !w.is_empty())
+        .cloned()
+        .collect();
+    assert_eq!(
+        d_waves,
+        vec![vec![1], vec![2], vec![3]],
+        "each write reached E again in a later wave"
+    );
+    assert!(
+        arrays(&e_log).iter().flatten().all(|k| k != "ERROR"),
+        "nothing throws"
+    );
+    assert_eq!(scan_runs.get(), 3, "a scan over S runs once per wave");
+    assert_eq!(scan.cache(), Some(3));
+}
+
+/// C-11 — a node rewires itself from its function, for its lifetime.
+#[test]
+fn c11_a_node_rewires_itself_for_its_lifetime() {
+    let g = graphrefly::graph();
+    let s = g.state_opts(0i32, named("s"));
+    type Leaf = (
+        Node<i32>,
+        Rc<RefCell<Option<graphrefly::DeferredCtx>>>,
+        Rc<Cell<usize>>,
+    );
+    let leaf = |name: &str| -> Leaf {
+        let kept: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+        let cleanups = Rc::new(Cell::new(0usize));
+        let node = g.producer_opts(
+            {
+                let kept = kept.clone();
+                move |ctx: &graphrefly::Ctx| *kept.borrow_mut() = Some(ctx.defer())
+            },
+            named(name).with_node(with_cleanup({
+                let cleanups = cleanups.clone();
+                move || cleanups.set(cleanups.get() + 1)
+            })),
+        );
+        (node, kept, cleanups)
+    };
+    let (inner_a, a_ctx, a_cleanups) = leaf("inner_a");
+    let (inner_b, b_ctx, b_cleanups) = leaf("inner_b");
+    let op_runs = Rc::new(Cell::new(0usize));
+    let op = {
+        let (s_core, a, b) = (s.erased(), inner_a.erased(), inner_b.erased());
+        let op_runs = op_runs.clone();
+        g.node_opts::<i32, _>(
+            vec![s.erased()],
+            move |ctx| {
+                op_runs.set(op_runs.get() + 1);
+                let runs = ctx.state_get::<usize>().map_or(0, |n| *n) + 1;
+                ctx.state_set(runs);
+                let inner = match ctx.data::<i32>(0).map(|v| *v) {
+                    Some(1) => Some(a.clone()),
+                    Some(2) => Some(b.clone()),
+                    _ => None,
+                };
+                if let Some(inner) = inner {
+                    ctx.rewire(vec![s_core.clone(), inner]);
+                }
+                if ctx.dep_len() > 1 {
+                    for x in ctx.batch::<i32>(1) {
+                        ctx.emit(*x);
+                    }
+                }
+            },
+            graphrefly::GraphNodeOpts {
+                node: graphrefly::NodeOpts {
+                    partial: true,
+                    ..graphrefly::NodeOpts::default()
+                },
+                ..named("op")
+            },
+        )
+    };
+    let u = op.subscribe(|_| {});
+    assert_eq!(deps_of(&g, "op"), vec!["s"]);
+
+    s.set(1);
+    assert_eq!(
+        deps_of(&g, "op"),
+        vec!["s", "inner_a"],
+        "the rewire ran after the wave"
+    );
+    send(&a_ctx, vec![data(10)]);
+    assert_eq!(op.cache(), Some(10));
+
+    s.set(2);
+    assert_eq!(deps_of(&g, "op"), vec!["s", "inner_b"]);
+    assert_eq!(
+        a_cleanups.get(),
+        1,
+        "inner a deactivates and its cleanup runs"
+    );
+    assert_eq!(op.cache(), Some(10), "OP keeps its value across the rewire");
+    send(&b_ctx, vec![data(20)]);
+    assert_eq!(op.cache(), Some(20));
+    let runs_before_close = op_runs.get();
+
+    // The lifetime closes: the dependencies go back to the declared [S].
+    u();
+    assert_eq!(deps_of(&g, "op"), vec!["s"]);
+    assert_eq!(b_cleanups.get(), 1);
+    assert_eq!(
+        op.definition().deps.len(),
+        1,
+        "the declared dependencies stayed [S]"
+    );
+    // The new lifetime starts on [S] and rewires again from its first run.
+    let _u2 = op.subscribe(|_| {});
+    assert_eq!(deps_of(&g, "op"), vec!["s", "inner_b"]);
+    assert!(op_runs.get() > runs_before_close);
+}
+
+/// C-35 — rewire keeps the instance and runs between waves.
+#[test]
+fn c35_rewire_keeps_the_instance_and_runs_between_waves() {
+    let g = graphrefly::graph();
+    let b = g.state_opts(1i32, named("b"));
+    let c = g.state_opts(10i32, named("c"));
+    let e = g.state_opts(0i32, named("e"));
+    e.complete();
+    let gst = g.state_empty_opts::<i32>(named("g"));
+    let kept: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let runs = Rc::new(Cell::new(0usize));
+    let in_run_rewire: Rc<RefCell<Option<Vec<graphrefly::Core>>>> = Rc::new(RefCell::new(None));
+    let deps_during_run = Rc::new(Cell::new(usize::MAX));
+    let d = {
+        let (kept, runs) = (kept.clone(), runs.clone());
+        let (in_run_rewire, deps_during_run) = (in_run_rewire.clone(), deps_during_run.clone());
+        let ids = (b.erased(), c.erased(), gst.erased());
+        g.node_opts::<i32, _>(
+            vec![b.erased()],
+            move |ctx| {
+                runs.set(runs.get() + 1);
+                *kept.borrow_mut() = Some(ctx.defer());
+                ctx.state_set(runs.get());
+                if let Some(next) = in_run_rewire.borrow_mut().take() {
+                    ctx.rewire(next);
+                    deps_during_run.set(ctx.dep_len());
+                }
+                // Reads its dependencies by id.
+                let mut out = None;
+                for i in 0..ctx.dep_len() {
+                    if ctx.dep_is(i, &ids.0) || ctx.dep_is(i, &ids.1) || ctx.dep_is(i, &ids.2) {
+                        if let Some(v) = ctx.batch::<i32>(i).last() {
+                            out = Some(**v);
+                        }
+                    }
+                }
+                if let Some(v) = out {
+                    ctx.emit(v);
+                }
+            },
+            graphrefly::GraphNodeOpts {
+                node: graphrefly::NodeOpts {
+                    partial: true,
+                    ..graphrefly::NodeOpts::default()
+                },
+                ..named("d")
+            },
+        )
+    };
+    let (log, u) = record_arrays(&d);
+    assert_eq!(d.cache(), Some(1));
+    let rewire = |deps: Vec<graphrefly::Core>| {
+        let ctx = kept.borrow_mut().take().expect("kept ctx");
+        let asked = catch_unwind(AssertUnwindSafe(|| ctx.rewire(deps)));
+        kept.borrow_mut().get_or_insert(ctx);
+        if let Err(panic) = asked {
+            std::panic::resume_unwind(panic);
+        }
+    };
+    log.borrow_mut().clear();
+    let r0 = runs.get();
+
+    // Adding C: no START, one input wave, the function runs once; C then drives D.
+    rewire(vec![b.erased(), c.erased()]);
+    assert_eq!(deps_of(&g, "d"), vec!["b", "c"]);
+    assert_eq!(runs.get(), r0 + 1);
+    assert!(arrays(&log).iter().flatten().all(|k| k != "START"));
+    assert_eq!(d.cache(), Some(10));
+    c.set(11);
+    assert_eq!(d.cache(), Some(11));
+
+    // Reordering keeps the records: nothing runs.
+    let r1 = runs.get();
+    rewire(vec![c.erased(), b.erased()]);
+    assert_eq!(deps_of(&g, "d"), vec!["c", "b"]);
+    assert_eq!(runs.get(), r1);
+
+    // Removing B releases it without a wave; D keeps its value.
+    log.borrow_mut().clear();
+    rewire(vec![c.erased()]);
+    assert!(arrays(&log).is_empty(), "released without a wave");
+    b.set(2);
+    assert_eq!(d.cache(), Some(11), "B no longer drives D");
+    // Rewiring to the current list does nothing.
+    rewire(vec![c.erased()]);
+    assert_eq!(runs.get(), r1);
+
+    // Adding the ended E: its COMPLETE counts toward the policy (C is still open).
+    rewire(vec![c.erased(), e.erased()]);
+    assert_eq!(d.status().output, OutputStatus::Open);
+
+    // Adding G with no snapshot runs nothing; G's first value then drives D.
+    let r2 = runs.get();
+    rewire(vec![c.erased(), e.erased(), gst.erased()]);
+    assert_eq!(runs.get(), r2, "no snapshot, no run");
+    assert_eq!(d.cache(), Some(11));
+    gst.set(7);
+    assert_eq!(d.cache(), Some(7));
+
+    // Rewiring to no dependencies keeps D's value; later writes no longer reach D.
+    rewire(Vec::new());
+    assert_eq!(deps_of(&g, "d"), Vec::<String>::new());
+    c.set(12);
+    assert_eq!(d.cache(), Some(7));
+
+    // A rewire requested from D's function waits until the wave ends.
+    rewire(vec![b.erased()]);
+    *in_run_rewire.borrow_mut() = Some(vec![b.erased(), c.erased()]);
+    b.set(3);
+    assert_eq!(deps_during_run.get(), 1, "not applied during the run");
+    assert_eq!(deps_of(&g, "d"), vec!["b", "c"], "applied after the wave");
+
+    // Refused: the node itself, a duplicate, a node that depends on D.
+    let x = g.node_opts::<i32, _>(vec![d.erased()], |_| {}, named("x"));
+    for bad in [
+        vec![d.erased()],
+        vec![b.erased(), b.erased()],
+        vec![x.erased()],
+    ] {
+        let refused = catch_unwind(AssertUnwindSafe(|| rewire(bad)));
+        let message = refused
+            .err()
+            .and_then(|p| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("depend on itself") || message.contains("duplicate"),
+            "refused by the rewire check, got {message:?}"
+        );
+    }
+    assert_eq!(
+        d.definition().deps.len(),
+        1,
+        "the declared dependencies stay [B]"
+    );
+
+    // After the resubscription D is back on [B]; the closed lifetime's ctx is dropped.
+    let old_ctx = {
+        b.set(4);
+        kept.borrow_mut().take().expect("kept ctx")
+    };
+    u();
+    let (_log2, u2) = record_arrays(&d);
+    assert_eq!(deps_of(&g, "d"), vec!["b"]);
+    old_ctx.rewire(vec![b.erased(), c.erased()]);
+    assert_eq!(
+        deps_of(&g, "d"),
+        vec!["b"],
+        "a closed lifetime's rewire is dropped"
+    );
+
+    // After D ends, a rewire through its last ctx is dropped too.
+    let last = kept.borrow_mut().take().expect("kept ctx");
+    b.complete();
+    assert_eq!(d.status().output, OutputStatus::Completed);
+    last.rewire(vec![b.erased(), c.erased()]);
+    assert_eq!(deps_of(&g, "d"), vec!["b"]);
+    drop(u2);
+}
+
+/// C-37 — a closed lifetime revokes old work while the node and topology remain.
+#[test]
+fn c37_closed_lifetime_revokes_old_work() {
+    let g = graphrefly::graph();
+    let a = g.state_opts(1i32, named("a"));
+    let bb = g.state_opts(100i32, named("bb"));
+    let kept: Rc<RefCell<Vec<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(Vec::new()));
+    let n = {
+        let kept = kept.clone();
+        g.node_opts::<i32, _>(
+            vec![a.erased()],
+            move |ctx| kept.borrow_mut().push(ctx.defer()),
+            named("n"),
+        )
+    };
+    let (log, u) = record_values(&n);
+    let first = kept.borrow_mut().remove(0);
+    first.rewire(vec![a.erased(), bb.erased()]);
+    assert_eq!(deps_of(&g, "n"), vec!["a", "bb"]);
+    log.borrow_mut().clear();
+    first.down(vec![data(5)]);
+    assert_eq!(*log.borrow(), vec![vec![5]], "the rewire kept the lifetime");
+
+    kept.borrow_mut().clear();
+    a.set(2);
+    let old = kept.borrow_mut().remove(0);
+    u();
+    let (log2, u2) = record_values(&n);
+    assert_eq!(
+        deps_of(&g, "n"),
+        vec!["a"],
+        "the new lifetime starts on the declared deps"
+    );
+    log2.borrow_mut().clear();
+    old.down(vec![data(9)]);
+    assert!(log2.borrow().is_empty(), "the old ctx.down is dropped");
+    let fresh = kept.borrow_mut().pop().expect("new lifetime ran");
+    assert!(!fresh.signal().is_aborted());
+    assert!(
+        old.signal().is_aborted(),
+        "the old ctx is a distinct, closed one"
+    );
+
+    // A rewire asked for while the lifetime is open is dropped if the lifetime has
+    // closed by the time it runs: here an unsubscribe requested first closes it.
+    u2();
+    let u3: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
+    let current: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let trigger = Node::<i32>::state_empty();
+    let _ut = {
+        let (u3, current, bb, a) = (u3.clone(), current.clone(), bb.erased(), a.erased());
+        trigger.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                if let Some(u) = u3.borrow_mut().take() {
+                    u();
+                }
+                if let Some(ctx) = current.borrow().as_ref() {
+                    ctx.rewire(vec![a.clone(), bb.clone()]);
+                }
+            }
+        })
+    };
+    kept.borrow_mut().clear();
+    *u3.borrow_mut() = Some(n.subscribe(|_| {}));
+    *current.borrow_mut() = kept.borrow_mut().pop();
+    assert!(current.borrow().is_some(), "the new lifetime ran");
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let previous = graphrefly::set_host_reporter(Some({
+        let reports = reports.clone();
+        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
+    }));
+    trigger.set(1);
+    graphrefly::set_host_reporter(previous);
+    assert!(
+        reports.borrow().is_empty(),
+        "the dropped rewire is silent: {:?}",
+        reports.borrow()
+    );
+    assert_eq!(n.status().lifecycle, Lifecycle::Inactive);
+    assert_eq!(n.status().output, OutputStatus::Open, "and ends nothing");
+    assert_eq!(deps_of(&g, "n"), vec!["a"], "the late rewire was dropped");
+}
+
+/// C-40 — the replace clause: a replace gives an ended node a new instance.
+#[test]
+fn c40_replace_gives_an_ended_node_a_new_instance() {
+    let s = Node::<i32>::state(1);
+    s.complete();
+    let d = Node::<i32>::derived(vec![s.erased()], |ctx| {
+        ctx.emit(*ctx.data::<i32>(0).unwrap())
+    });
+    let (log, _u) = record_arrays(&d);
+    assert_eq!(d.status().output, OutputStatus::Completed);
+    let s2 = Node::<i32>::state(5);
+    log.borrow_mut().clear();
+    d.replace(
+        vec![s2.erased()],
+        |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap() * 2),
+        graphrefly::ReplaceOpts::default(),
+    );
+    assert_eq!(arrays(&log), vec![shape(&["START", "DATA"])]);
+    assert_eq!(d.cache(), Some(10));
+    assert_eq!(
+        d.status().output,
+        OutputStatus::Open,
+        "a terminal ends an instance, not the node"
+    );
+    s2.set(6);
+    assert_eq!(d.cache(), Some(12));
+}
+
+/// C-33 — the request-queue clauses: an unsubscribe asked for during an invocation
+/// waits until the wave ends; output staged through a lifetime that closes before the
+/// commit is dropped at the commit.
+#[test]
+fn c33_requests_wait_and_closed_lifetime_staging_is_dropped() {
+    let a = Node::<i32>::state(1);
+    let unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
+    let still_subscribed_in_run = Rc::new(Cell::new(false));
+    let n = {
+        let unsub = unsub.clone();
+        let flag = still_subscribed_in_run.clone();
+        Node::<i32>::derived(vec![a.erased()], move |ctx| {
+            let v = *ctx.data::<i32>(0).unwrap();
+            if v == 2 {
+                if let Some(u) = unsub.borrow_mut().take() {
+                    u();
+                    flag.set(true);
+                }
+            }
+            ctx.emit(v);
+        })
+    };
+    let (log, u) = record_values(&n);
+    *unsub.borrow_mut() = Some(u);
+    a.set(2);
+    assert!(still_subscribed_in_run.get());
+    assert_eq!(
+        log.borrow().last(),
+        Some(&vec![2]),
+        "the sink still got this wave: the unsubscribe waited until it ended"
+    );
+    assert_eq!(n.status().lifecycle, Lifecycle::Inactive, "then it ran");
+
+    // Staging through a lifetime that closes before the commit is dropped. During a
+    // wave the commit is a request; a replace requested before it closes P's
+    // lifetime first.
+    let (p, slot) = driven();
+    let (plog, _up) = record_values(&p);
+    let trigger = Node::<i32>::state_empty();
+    let replace_first = Rc::new(Cell::new(true));
+    let _ut = {
+        let (p, slot, replace_first) = (p.clone(), slot.clone(), replace_first.clone());
+        trigger.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if !msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                return;
+            }
+            if replace_first.get() {
+                p.replace(Vec::new(), |_| {}, graphrefly::ReplaceOpts::default());
+            }
+            graphrefly::batch(|_| send(&slot, vec![data(3)]));
+        })
+    };
+    // Control: without the replace the staged output commits after the wave.
+    replace_first.set(false);
+    trigger.set(1);
+    assert_eq!(plog.borrow().last(), Some(&vec![3]));
+    // With the replace first, the staged output of the closed lifetime is dropped.
+    replace_first.set(true);
+    plog.borrow_mut().clear();
+    trigger.set(2);
+    assert!(
+        plog.borrow().iter().all(|w| !w.contains(&3)),
+        "output staged by a closed lifetime is dropped at the commit: {:?}",
+        plog.borrow()
+    );
+}
+
+/// C-29 — a batch delivers nothing before commit, and its topology requests follow the
+/// commit. (Rust has no async batch body: `batch` takes a synchronous closure, so the
+/// async and promise-returning clauses do not apply.)
+#[test]
+fn c29_batch_delivers_nothing_before_commit() {
+    let g = graphrefly::graph();
+    let a = g.state_opts(1i32, named("a"));
+    let c = g.state_opts(100i32, named("c"));
+    let kept: Rc<RefCell<Option<graphrefly::DeferredCtx>>> = Rc::new(RefCell::new(None));
+    let b = {
+        let kept = kept.clone();
+        g.node_opts::<i32, _>(
+            vec![a.erased()],
+            move |ctx| {
+                *kept.borrow_mut() = Some(ctx.defer());
+                if let Some(v) = ctx.batch::<i32>(0).last() {
+                    ctx.emit(**v);
+                }
+            },
+            named("b"),
+        )
+    };
+    let (s_log, _us) = record_arrays(&b);
+    s_log.borrow_mut().clear();
+    let t_log: Rc<RefCell<Vec<Vec<i32>>>> = Rc::new(RefCell::new(Vec::new()));
+    let t_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
+    let read = graphrefly::batch(|_| {
+        a.set(2);
+        let t_log = t_log.clone();
+        *t_unsub.borrow_mut() = Some(b.subscribe(move |msgs: &[Message<AnyValue>]| {
+            t_log.borrow_mut().push(
+                msgs.iter()
+                    .filter_map(|m| match m {
+                        Message::Data(v) => v.downcast_ref::<i32>().copied(),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        }));
+        kept.borrow()
+            .as_ref()
+            .unwrap()
+            .rewire(vec![a.erased(), c.erased()]);
+        assert!(
+            arrays(&s_log).is_empty(),
+            "nothing is delivered in the body"
+        );
+        assert_eq!(deps_of(&g, "b"), vec!["a"], "nothing changes in the body");
+        a.cache()
+    });
+    assert_eq!(
+        read,
+        Some(1),
+        "the read in the body returns the retained value"
+    );
+    assert_eq!(
+        arrays(&s_log),
+        vec![shape(&["PENDING", "DATA"])],
+        "one commit wave"
+    );
+    assert_eq!(
+        t_log.borrow().first(),
+        Some(&vec![2]),
+        "t starts from the committed value"
+    );
+    assert_eq!(
+        deps_of(&g, "b"),
+        vec!["a", "c"],
+        "the rewire ran after the commit"
+    );
+
+    // A throwing body delivers nothing and drops its sets and requests.
+    s_log.borrow_mut().clear();
+    let thrown = catch_unwind(AssertUnwindSafe(|| {
+        graphrefly::batch(|_| {
+            a.set(9);
+            panic!("body boom");
+        })
+    }));
+    assert!(thrown.is_err());
+    assert!(arrays(&s_log).is_empty());
+    assert_eq!(a.cache(), Some(2));
+
+    // A nested batch joins the outer one and returns its value.
+    s_log.borrow_mut().clear();
+    let inner = graphrefly::batch(|_| {
+        a.set(3);
+        graphrefly::batch(|_| {
+            a.set(4);
+            7
+        })
+    });
+    assert_eq!(inner, 7);
+    assert_eq!(arrays(&s_log).len(), 1, "one commit wave");
+
+    // Write functions run at the commit, in staging order.
+    let seen: Rc<RefCell<Vec<Option<i32>>>> = Rc::new(RefCell::new(Vec::new()));
+    let record_and = |next: Option<i32>| {
+        let seen = seen.clone();
+        graphrefly::StateWrite::from_fn(move |cur: Option<&i32>| {
+            seen.borrow_mut().push(cur.copied());
+            next
+        })
+    };
+    graphrefly::batch(|_| {
+        a.set(record_and(Some(20)));
+        a.set(30);
+        a.set(record_and(Some(40)));
+        a.invalidate();
+        a.set(record_and(Some(50)));
+    });
+    assert_eq!(*seen.borrow(), vec![Some(4), Some(30), None]);
+    assert_eq!(a.cache(), Some(50));
+
+    // A throwing function commits nothing, not even the set of B's input.
+    let thrown = catch_unwind(AssertUnwindSafe(|| {
+        graphrefly::batch(|_| {
+            c.set(101);
+            a.set(graphrefly::StateWrite::from_fn(
+                |_: Option<&i32>| -> Option<i32> { panic!("write boom") },
+            ));
+        })
+    }));
+    assert!(thrown.is_err());
+    assert_eq!(c.cache(), Some(100));
+    assert_eq!(a.cache(), Some(50));
+
+    // A function returning None writes nothing; an equal plain value starts a wave.
+    s_log.borrow_mut().clear();
+    a.set(graphrefly::StateWrite::from_fn(|_: Option<&i32>| None));
+    assert!(arrays(&s_log).is_empty());
+    a.set(50);
+    assert_eq!(arrays(&s_log).len(), 1);
+
+    // From a sink callback during a wave: the body runs at once and its set commits
+    // after the current wave reached every subscriber.
+    let order: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let returned = Rc::new(Cell::new(0i32));
+    let first = Rc::new(Cell::new(true));
+    let _cb = {
+        let (a, order, returned, first) =
+            (a.clone(), order.clone(), returned.clone(), first.clone());
+        b.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if !msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                return;
+            }
+            order.borrow_mut().push("cb".into());
+            if first.replace(false) {
+                let r = graphrefly::batch(|_| {
+                    let seen = a.cache().unwrap_or(-1);
+                    a.set(60);
+                    seen
+                });
+                returned.set(r);
+            }
+        })
+    };
+    let _last = {
+        let order = order.clone();
+        b.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                order.borrow_mut().push("last".into());
+            }
+        })
+    };
+    order.borrow_mut().clear();
+    first.set(true);
+    a.set(55);
+    assert_eq!(
+        returned.get(),
+        55,
+        "the body read the value retained so far"
+    );
+    assert_eq!(
+        *order.borrow(),
+        vec!["cb", "last", "cb", "last"],
+        "the commit is a later wave, after this wave reached every subscriber"
+    );
+    assert_eq!(a.cache(), Some(60));
+}
+
+/// C-28 — the request and batch clauses: sink requests run after the whole fanout,
+/// rejected submissions leave the staging unchanged, and a sink that throws after a
+/// commit goes to the host reporter and rolls nothing back.
+#[test]
+fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
+    let reports = Rc::new(RefCell::new(Vec::<graphrefly::HostFailure>::new()));
+    let previous = graphrefly::set_host_reporter(Some({
+        let reports = reports.clone();
+        Rc::new(move |f: &graphrefly::HostFailure| reports.borrow_mut().push(f.clone()))
+    }));
+    let a = Node::<i32>::state(0);
+    let other = Node::<i32>::state(0);
+    let order: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let late: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
+    let _first = {
+        let (other, order, late, a2) = (other.clone(), order.clone(), late.clone(), a.clone());
+        a.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if !msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                return;
+            }
+            order.borrow_mut().push("first".into());
+            if late.borrow().is_none() && a2.cache() == Some(1) {
+                other.set(5);
+                let order = order.clone();
+                *late.borrow_mut() =
+                    Some(a2.subscribe(move |_| order.borrow_mut().push("late".into())));
+            }
+        })
+    };
+    let _second = {
+        let (order, other) = (order.clone(), other.clone());
+        a.subscribe(move |msgs: &[Message<AnyValue>]| {
+            if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+                order
+                    .borrow_mut()
+                    .push(format!("second other={:?}", other.cache()));
+            }
+        })
+    };
+    order.borrow_mut().clear();
+    a.set(1);
+    assert_eq!(
+        *order.borrow(),
+        vec!["first", "second other=Some(0)", "late"],
+        "the set and the subscription ran after the whole fanout"
+    );
+    assert_eq!(other.cache(), Some(5));
+
+    // Rejected submissions leave the earlier staging unchanged. (A State write cannot
+    // carry RESOLVED at all; a kept ctx's output can, and is rejected.)
+    let (sp, slot) = driven();
+    let (log, _u) = record_arrays(&sp);
+    log.borrow_mut().clear();
+    graphrefly::batch(|_| {
+        send(&slot, vec![data(7)]);
+        let resolved = catch_unwind(AssertUnwindSafe(|| send(&slot, vec![Message::Resolved])));
+        assert!(resolved.is_err(), "RESOLVED is the kernel's");
+        send(&slot, vec![Message::Complete]);
+        let after = catch_unwind(AssertUnwindSafe(|| send(&slot, vec![data(8)])));
+        assert!(after.is_err(), "nothing follows a staged terminal");
+    });
+    assert_eq!(arrays(&log), vec![shape(&["PENDING", "DATA", "COMPLETE"])]);
+
+    // A sink that throws after a commit goes to the reporter; nothing rolls back.
+    let t = Node::<i32>::state(0);
+    let _boom = t.subscribe(|msgs: &[Message<AnyValue>]| {
+        if msgs.iter().any(|m| matches!(m, Message::Data(_))) {
+            panic!("sink boom");
+        }
+    });
+    graphrefly::batch(|_| t.set(3));
+    assert_eq!(t.cache(), Some(3));
+    assert!(reports.borrow().iter().any(|r| r.error == "sink boom"));
+    graphrefly::set_host_reporter(previous);
 }

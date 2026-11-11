@@ -24,7 +24,7 @@
 //! DIRTY-to-DATA delivery, diamond joins, first-run gating, push-on-subscribe,
 //! lazy activation, ROM/RAM, INVALIDATE, PAUSE/RESUME locksets and pause modes,
 //! COMPLETE/ERROR/TEARDOWN terminal behavior, batch commit/rollback, LocalAsync
-//! boundaries, runtime rewire, pull/routed-up demand, `ctx.rewire_next`, and
+//! boundaries, the request queue, ctx.rewire and replace (R-request-order@2), and
 //! panic-to-ERROR recovery at the wave boundary. Every occurrence remains DATA;
 //! no-emit functions settle with substrate-synthesized undirty RESOLVED (D49).
 
@@ -35,8 +35,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
 use crate::batch::{
-    active_batch_committed_token, boundary_drains_blocked, collecting_batch,
-    committed_after_batch_for_target, defer_to_batch, register_boundary_root,
+    active_batch_committed_token, boundary_drains_blocked, collecting_batch, defer_to_batch,
+    register_boundary_root,
 };
 use crate::checkpoint::{
     unregister_backend_state_contributor, unregister_backend_state_contributor_key,
@@ -167,6 +167,9 @@ pub struct NodeOpts {
     /// The instance's setup (R-lifetime@2): runs once per lifetime, before the
     /// function's first run in it, and may return the lifetime's cleanup.
     pub setup: Option<crate::lifetime::Setup>,
+    /// The instance's recipe (R-node): an opaque description of how it was built, such
+    /// as a checkpoint's `{ ref, config }`. The kernel stores it and never reads it.
+    pub recipe: Option<serde_json::Value>,
 }
 
 impl NodeOpts {
@@ -195,6 +198,7 @@ impl Default for NodeOpts {
             invalidate: Policy::Auto,
             versioning: None,
             setup: None,
+            recipe: None,
         }
     }
 }
@@ -344,80 +348,6 @@ enum SettlePlan {
         quiet: bool,
         passthrough: bool,
     },
-}
-
-/// A deferred self-rewire request (R-rewire-deferred / D47), issued via `ctx.rewire_next`
-/// and applied at the committed wave boundary. The new dep set is computed at APPLY time (so
-/// multiple requests in one wave compose against the live deps), then the surgical R-rewire
-/// (D42) runs as a fresh wave. The fn re-pairs the deps (SD-1 fn-deps pairing).
-pub(crate) enum RewireRequest {
-    /// Add a dep (idempotent if already present) + swap the fn.
-    Add(Core, NodeFn),
-    /// Remove a live dep identity + swap the fn. If that identity is already absent
-    /// at boundary-apply time, the request is a full no-op, including no fn swap, so
-    /// stale duplicate removes cannot desync the live dep/fn pairing.
-    Remove(CoreIdentity, NodeFn),
-    /// Replace the whole dep set + swap the fn.
-    Set(Vec<Core>, NodeFn),
-}
-
-impl RewireRequest {
-    pub(crate) fn remove(dep: &Core, f: NodeFn) -> Self {
-        Self::Remove(CoreIdentity::from_core(dep), f)
-    }
-
-    fn validate_deps_same_graph(&self, owner: &Core) {
-        match self {
-            RewireRequest::Set(deps, _) => {
-                for dep in deps {
-                    assert!(
-                        dep.same_graph(owner),
-                        "rewire: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
-                    );
-                }
-            }
-            RewireRequest::Add(dep, _) => {
-                assert!(
-                    dep.same_graph(owner),
-                    "rewire: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
-                );
-            }
-            RewireRequest::Remove(_, _) => {}
-        }
-    }
-
-    fn project_deps(&self, current: Vec<Core>) -> Vec<Core> {
-        match self {
-            RewireRequest::Set(deps, _) => deps.clone(),
-            RewireRequest::Add(dep, _) => {
-                let mut next = current;
-                if !next.iter().any(|d| d.ptr_eq(dep)) {
-                    next.push(dep.clone());
-                }
-                next
-            }
-            RewireRequest::Remove(dep, _) => {
-                current.into_iter().filter(|d| !dep.matches(d)).collect()
-            }
-        }
-    }
-
-    fn into_deps_and_fn(self, current: Vec<Core>) -> (Vec<Core>, NodeFn) {
-        match self {
-            RewireRequest::Set(deps, f) => (deps, f),
-            RewireRequest::Add(dep, f) => {
-                let mut next = current;
-                if !next.iter().any(|d| d.ptr_eq(&dep)) {
-                    next.push(dep);
-                }
-                (next, f)
-            }
-            RewireRequest::Remove(dep, f) => {
-                let next = current.into_iter().filter(|d| !dep.matches(d)).collect();
-                (next, f)
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1112,6 +1042,7 @@ struct NodeConfigSlot {
     invalidate: Policy,
     versioning: Option<NodeVersioningPolicy>,
     setup: Option<crate::lifetime::Setup>,
+    recipe: Option<serde_json::Value>,
 }
 
 impl NodeConfigSlot {
@@ -1124,6 +1055,7 @@ impl NodeConfigSlot {
             invalidate: opts.invalidate,
             versioning: opts.versioning.clone(),
             setup: opts.setup.clone(),
+            recipe: opts.recipe.clone(),
         }
     }
 
@@ -1219,7 +1151,11 @@ pub(crate) struct NodeRestoreRuntime {
 type TopologyDepsChangedObserver = Rc<dyn Fn(&[Core], &[Core])>;
 
 struct NodeTopologySlot {
+    /// The current dependencies: the declared ones, or a ctx.rewire's for the open
+    /// lifetime (R-request-order@2).
     deps: Vec<Core>,
+    /// The instance's declared dependencies; a closing lifetime puts them back.
+    declared: Vec<Core>,
     topology_deps_changed: Option<TopologyDepsChangedObserver>,
 }
 
@@ -1618,7 +1554,7 @@ impl BatchTarget {
         self.pin.boundary_root()
     }
 
-    fn borrowed_core(&self) -> Option<Core> {
+    pub(crate) fn borrowed_core(&self) -> Option<Core> {
         self.pin.borrowed_core()
     }
 }
@@ -1914,16 +1850,6 @@ struct PinnedBorrowedCore {
 }
 
 enum BoundaryTask {
-    Rewire {
-        target: CoreToken,
-        req: RewireRequest,
-        committed: Rc<Cell<bool>>,
-    },
-    ExternalRewire {
-        target: CoreToken,
-        req: RewireRequest,
-        committed: Rc<Cell<bool>>,
-    },
     Down {
         target: CoreToken,
         frames: Vec<Wave<AnyValue>>,
@@ -1934,9 +1860,7 @@ enum BoundaryTask {
 impl BoundaryTask {
     fn committed(&self) -> bool {
         match self {
-            BoundaryTask::Rewire { committed, .. }
-            | BoundaryTask::ExternalRewire { committed, .. }
-            | BoundaryTask::Down { committed, .. } => committed.get(),
+            BoundaryTask::Down { committed, .. } => committed.get(),
         }
     }
 }
@@ -1972,8 +1896,8 @@ pub(crate) fn boundary_root_for(target: &Core) -> BoundaryRoot {
     BoundaryRoot::from_core(target)
 }
 
-/// Reset `inside_run_wave` on scope exit — including unwind, so the feedback-cycle
-/// panic (D37) leaves the flag clean per frame (mirrors TS's try/finally around
+/// Reset `inside_run_wave` on scope exit — including unwind, so a panicking function
+/// leaves the flag clean per frame (mirrors TS's try/finally around
 /// `dispatcher.invoke`). The *other* stale wave-flags an unwinding panic leaves on
 /// the source / intermediate frames (`emitted_dirty` / `dep_batch` / `dep_dirty` /
 /// `pending`) are cleaned at the wave-owner catch via the [`WaveScope`] touched-set
@@ -2009,20 +1933,17 @@ impl Drop for DepMutationGuard {
 /// layer yet, so the catch lives at the substrate wave-owner).
 ///
 /// A `panic!` is the Rust analogue of a value-level `throw` (the fn signature is
-/// `Fn(&Ctx) -> ()` — no `Result` channel; R-reentrancy mandates an *unwind*, not a
-/// graceful return). The **outermost** public mutating entry (`subscribe` / `down` /
+/// `Fn(&Ctx) -> ()` — no `Result` channel; a throw is an *unwind*, not a graceful
+/// return). The **outermost** public mutating entry (`subscribe` / `down` /
 /// `up` / `set`) becomes the wave OWNER: it installs a scope, runs the cascade under
 /// `catch_unwind`, and on a caught panic resets every participating node's transient
 /// wave-flags before emitting `[[ERROR,e]]` from the
 /// `blamed` node. Nested re-entrant calls see the active scope and just run.
 ///
-/// `blamed` is the innermost node whose fn actually ran ([`Core::run_wave`] records
-/// it right before `invoke`), so a sync feedback cycle blames a node ON the cycle
-/// (C-6) — the value-level catch "nearest the throw", impl-determined per
-/// R-reentrancy. Falls back to the wave `owner` if no fn ran.
-///
-/// Forward-looking: this wave-owner boundary is the same "committed wave boundary"
-/// that batch (D12) and the `ctx.rewire_next` deferred drain (D47) will reuse.
+/// `blamed` is the innermost node whose fn actually ran (recorded right before
+/// `invoke`) — the catch nearest the throw. Falls back to the wave `owner` if no fn
+/// ran. When the outermost owner's wave ends, it drains the boundary tasks and then
+/// the queued requests (R-request-order@2).
 struct WaveScope {
     owner_graph_id: usize,
     /// Process-local wave id used to mark arena nodes once per wave without a
@@ -2234,12 +2155,111 @@ fn panic_to_error(payload: Box<dyn std::any::Any + Send>) -> GraphError {
     msg.into()
 }
 
+thread_local! {
+    /// Requests made while a wave is delivered, in the order they were made
+    /// (R-request-order@2). The outermost wave owner runs them after its wave ends.
+    static REQUESTS: RefCell<VecDeque<Box<dyn FnOnce()>>> = const { RefCell::new(VecDeque::new()) };
+    static DRAINING_REQUESTS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True while a wave is being delivered on this thread.
+pub(crate) fn in_wave() -> bool {
+    wave_in_flight()
+}
+
+/// Subscribes `sink` to `core` now, under a wave owner.
+fn subscribe_now(core: &Core, sink: Sink, kind: SubscriberKind) -> Unsub {
+    // Record the subscriber id before activation so the error path hands back a real
+    // unsubscribe instead of leaking the just-registered sink (no orphaned sink).
+    let id_cell: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+    let body_cell = id_cell.clone();
+    with_wave_owner(
+        core,
+        || core.subscribe_recording_id_with_kind(sink, kind, &body_cell),
+        move || match id_cell.get() {
+            Some(id) => {
+                let err_core = core.clone();
+                Box::new(move || err_core.unsubscribe(id)) as Unsub
+            }
+            None => Box::new(|| {}) as Unsub,
+        },
+    )
+}
+
+/// A host unsubscribe: during a wave it is a request that runs after the wave.
+fn requested_unsubscribe(unsub: Unsub) -> Unsub {
+    Box::new(move || request(unsub))
+}
+
+/// A subscription asked for during a wave, before its request has run.
+enum QueuedSubscription {
+    Waiting,
+    Cancelled,
+    Active(Unsub),
+}
+
+/// Runs `request` now between waves, or queues it until the current wave ends
+/// (R-request-order@2). Each queued request runs as its own wave, in order.
+pub(crate) fn request(request: impl FnOnce() + 'static) {
+    // Inside a batch body a request waits for the commit (R-request-order@2).
+    if wave_in_flight() || crate::batch::collecting_batch() {
+        REQUESTS.with(|q| q.borrow_mut().push_back(Box::new(request)));
+    } else {
+        request();
+    }
+}
+
+/// Runs the queued requests in order; a request queued while one runs joins the end.
+/// A request's panic has no caller left, so it goes to the host reporter.
+/// How many requests are queued now, for [`drop_requests_after`].
+pub(crate) fn request_mark() -> usize {
+    REQUESTS.with(|q| q.borrow().len())
+}
+
+/// Takes the requests queued after `mark`: a batch body's requests, which run after
+/// its commit, or are dropped when the body throws (R-request-order@2).
+pub(crate) fn take_requests_after(mark: usize) -> Vec<Box<dyn FnOnce()>> {
+    REQUESTS.with(|q| {
+        let mut q = q.borrow_mut();
+        let keep = mark.min(q.len());
+        q.drain(keep..).collect()
+    })
+}
+
+/// Drops the requests queued after `mark`: a batch body that throws drops its
+/// requests (R-request-order@2).
+pub(crate) fn drop_requests_after(mark: usize) {
+    drop(take_requests_after(mark));
+}
+
+/// Runs one request taken from the queue; its panic goes to the host reporter.
+pub(crate) fn run_queued_request(request: Box<dyn FnOnce()>) {
+    run_reported("queued request", request);
+}
+
+pub(crate) fn drain_requests() {
+    if DRAINING_REQUESTS.with(Cell::get) {
+        return;
+    }
+    struct Draining;
+    impl Drop for Draining {
+        fn drop(&mut self) {
+            DRAINING_REQUESTS.with(|d| d.set(false));
+        }
+    }
+    DRAINING_REQUESTS.with(|d| d.set(true));
+    let _draining = Draining;
+    while let Some(next) = REQUESTS.with(|q| q.borrow_mut().pop_front()) {
+        run_reported("queued request", next);
+    }
+}
+
 /// Run `body` as a wave, with `owner` the wave-owner if no wave is yet in flight.
 /// The outermost caller installs a [`WaveScope`] + `catch_unwind`; on a caught
 /// panic it resets every touched node's wave-flags (B25) and emits `[[ERROR,e]]`
-/// from the blamed cycle node (D30), then returns `on_error()`. Nested calls (a
-/// re-entrant `subscribe`/`down` during the cascade) just run `body` — the outer
-/// owner owns the single catch.
+/// from the blamed cycle node (D30), then returns `on_error()`. Nested calls (kernel-internal
+/// work inside the cascade) just run `body` — the outer owner owns the single catch;
+/// host requests made during the wave are queued instead (R-request-order@2).
 fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnOnce() -> R) -> R {
     if wave_in_flight() {
         return body();
@@ -2297,12 +2317,12 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
         }
     };
     drop(std::mem::take(&mut scope.touched));
-    // Committed wave boundary (R-rewire-deferred / D47): drain any `ctx.rewire_next` queued
-    // during this wave, each applied as a FRESH wave. Batch holds this drain until AFTER
-    // the outermost commit/rollback, so topology never mutates on an uncommitted view
-    // (R-rewire-batch-boundary / D67).
+    // The wave has ended: drain the boundary tasks (a quiet node's later output) and
+    // then the requests made during the wave, each as a wave of its own
+    // (R-request-order@2). An open batch frame holds the drain until its commit.
     if !boundary_drains_blocked() {
         drain_committed_boundaries(std::slice::from_ref(owner), &boundary_roots);
+        drain_requests();
     }
     ret
 }
@@ -2427,29 +2447,6 @@ fn drain_deferred_rewires_for_graph(graph: &Rc<RefCell<GraphCore>>) {
 
 fn run_boundary_task(graph: &Rc<RefCell<GraphCore>>, task: BoundaryTask) -> Option<BoundaryTask> {
     match task {
-        BoundaryTask::Rewire {
-            target,
-            req,
-            committed,
-        } => {
-            if !committed.get() {
-                return None;
-            }
-            if let Some(node) = target.pinned_borrowed_core(graph) {
-                node.core.apply_rewire_next(req);
-            }
-        }
-        BoundaryTask::ExternalRewire {
-            target,
-            req,
-            committed,
-        } => {
-            if committed.get() {
-                if let Some(node) = target.pinned_borrowed_core(graph) {
-                    node.core.apply_external_rewire(req);
-                }
-            }
-        }
         BoundaryTask::Down {
             target,
             frames,
@@ -2722,6 +2719,7 @@ impl Core {
             );
         }
         let topology = NodeTopologySlot {
+            declared: deps.clone(),
             deps,
             topology_deps_changed: None,
         };
@@ -2840,7 +2838,7 @@ impl Core {
             a.activated = true;
             a.lifetime = Some(crate::lifetime::Lifetime::open());
             e.unsubs = (0..n.deps.len()).map(|_| None).collect();
-            // placeholder boxes (distinct Rcs); subscribe_dep overwrites each with the
+            // placeholder boxes (distinct Rcs); each dependency subscription overwrites its
             // real box its callback captures.
             e.idx_boxes = (0..n.deps.len())
                 .map(|_| Rc::new(Cell::new(-1i64)))
@@ -2896,7 +2894,7 @@ impl Core {
     }
 
     fn deactivate(&self) {
-        let (unsubs, lifetime) = self.with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
+        let (unsubs, lifetime, restored) = self.with_node_state_aux_mut(|n, c, _cfg, r, e, a| {
             a.activated = false;
             let lifetime = a.lifetime.take();
             if let Some(lt) = &lifetime {
@@ -2910,13 +2908,17 @@ impl Core {
             if is_compute && !e.value.terminal {
                 e.value.clear_values();
             }
+            let restored = restore_declared(n);
             e.state = DepState::new(n.deps.len());
             e.wave.pending = false;
             e.wave.run_out.clear();
             r.has_called_fn_once = false;
-            (unsubs, lifetime)
+            (unsubs, lifetime, restored)
         });
         self.finish_close(unsubs, lifetime);
+        if let Some((old, new)) = restored {
+            self.notify_topology_deps_changed(&old, &new);
+        }
     }
 
     /// The rest of closing a lifetime, after its signal was aborted (R-lifetime@2):
@@ -2940,6 +2942,146 @@ impl Core {
         drop(state);
     }
 
+    /// Refuses a dependency list for a replace or a rewire (R-request-order@2): a
+    /// duplicate, another graph's node, the node itself, or a node that depends on it
+    /// through current or declared dependencies.
+    pub(crate) fn check_new_deps(&self, op: &str, deps: &[Core]) {
+        for (i, dep) in deps.iter().enumerate() {
+            assert!(
+                !deps[..i].iter().any(|d| d.ptr_eq(dep)),
+                "{op}: duplicate dependency (R-request-order)"
+            );
+            assert!(
+                dep.same_graph(self),
+                "{op}: dependency belongs to a different graph; cross-graph deps require a wire bridge (R-graph-domain)"
+            );
+            assert!(
+                !dep.ptr_eq(self) && !reachable_upstream(dep, self),
+                "{op}: the node would depend on itself (R-request-order)"
+            );
+        }
+    }
+
+    /// Queues a ctx.rewire of `lifetime` (R-request-order@2): dropped if the lifetime
+    /// has closed when it runs; the new list is computed from the current one then.
+    pub(crate) fn request_lifetime_rewire(&self, lifetime: u64, change: LifetimeRewire) {
+        let core = self.clone();
+        request(move || {
+            if !core.lifetime_open(lifetime) {
+                return;
+            }
+            let current = core.deps();
+            let next = match change {
+                LifetimeRewire::Set(deps) => deps,
+                LifetimeRewire::Add(dep) => {
+                    let mut next = current.clone();
+                    if !next.iter().any(|d| d.ptr_eq(&dep)) {
+                        next.push(dep);
+                    }
+                    next
+                }
+                LifetimeRewire::Remove(dep) => current
+                    .iter()
+                    .filter(|d| !d.ptr_eq(&dep))
+                    .cloned()
+                    .collect(),
+            };
+            if same_ordered_deps(&current, &next) {
+                return;
+            }
+            core.check_new_deps("rewire", &next);
+            with_wave_owner(&core, || core.rewire_apply(next, None), || {});
+        });
+    }
+
+    /// A new instance under the same node (R-request-order@2, R-node): the current
+    /// lifetime closes, the instance's deps, function, setup, recipe, values and terminal
+    /// are replaced, and an active node starts the new instance as on a first
+    /// activation; its subscribers receive START and the new snapshot.
+    pub(crate) fn replace_instance(
+        &self,
+        deps: Vec<Core>,
+        fn_: NodeFn,
+        setup: Option<crate::lifetime::Setup>,
+        recipe: Option<serde_json::Value>,
+    ) {
+        let active = self.with_aux(|a| a.activated);
+        let (old_unsubs, old_lifetime, old_state, old_deps) =
+            self.with_node_state_aux_mut(|n, _c, cfg, r, e, a| {
+                let lifetime = a.lifetime.take();
+                if let Some(lt) = &lifetime {
+                    lt.signal.abort();
+                }
+                for b in &e.idx_boxes {
+                    b.set(-1);
+                }
+                let unsubs: Vec<Unsub> = e.unsubs.drain(..).flatten().collect();
+                e.idx_boxes.clear();
+                let old_deps = std::mem::replace(&mut n.deps, deps.clone());
+                n.declared = deps.clone();
+                cfg.setup = setup;
+                cfg.recipe = recipe;
+                e.value = NodeValueState::new();
+                e.wave = NodeWaveState::new();
+                e.state = DepState::new(deps.len());
+                r.has_called_fn_once = false;
+                (unsubs, lifetime, a.state.take(), old_deps)
+            });
+        self.swap_fn_preserving_pool(fn_);
+        with_wave_owner(
+            self,
+            || {
+                if active {
+                    // The new dependencies are acquired before the old ones are
+                    // released, so a shared upstream stays active.
+                    self.with_inner_edges_aux_mut(|n, e, a| {
+                        a.lifetime = Some(crate::lifetime::Lifetime::open());
+                        e.unsubs = (0..n.deps.len()).map(|_| None).collect();
+                        e.idx_boxes = (0..n.deps.len())
+                            .map(|_| Rc::new(Cell::new(-1i64)))
+                            .collect();
+                        e.wave.in_dep_mutation = true;
+                    });
+                    let _mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
+                    for (idx, dep) in deps.iter().enumerate() {
+                        self.subscribe_dep(idx, dep);
+                    }
+                }
+                for u in old_unsubs {
+                    run_reported("release", u);
+                }
+                if let Some(cleanup) = old_lifetime.and_then(|lt| lt.cleanup) {
+                    let cctx = crate::lifetime::CleanupCtx { state: old_state };
+                    run_reported("cleanup", move || cleanup(&cctx));
+                }
+                if active {
+                    self.first_run_of_replace();
+                }
+            },
+            || {},
+        );
+        self.notify_topology_deps_changed(&old_deps, &deps);
+    }
+
+    /// The new instance's first run, applied without delivering; then its subscribers
+    /// receive START and its snapshot, dependents marked pending first.
+    fn first_run_of_replace(&self) {
+        let out = self.first_run_frames();
+        let out = self.apply_out(out);
+        drop(out);
+        let snapshot = self.with_inner_edges(|_, e| snapshot_array(&e.value));
+        let has_snapshot = snapshot.len() > 1;
+        if has_snapshot {
+            self.mark_as_source();
+        }
+        let subs = self.with_aux(snapshot_subscribers);
+        with_delivery_scope(|| deliver_subscriber_snapshot(subs, &[snapshot]));
+        self.with_inner_edges_mut(|_, e| e.wave.pending = false);
+        if self.with_inner_edges(|_, e| e.value.terminal) {
+            self.close_ended_lifetime();
+        }
+    }
+
     /// Whether `id` is this node's open lifetime: output and requests through a ctx
     /// of a closed lifetime are dropped (R-lifetime@2).
     pub(crate) fn lifetime_open(&self, id: u64) -> bool {
@@ -2957,6 +3099,9 @@ impl Core {
             return;
         }
         let frame: Vec<InMsg> = msgs.iter().filter_map(InMsg::from_message).collect();
+        // A START array is a snapshot: the record starts afresh (a replaced
+        // dependency's new instance, R-request-order@2).
+        let snapshot = matches!(msgs.first(), Some(Message::Start));
         let ready = self.with_inner_edges_mut(|_, e| {
             if e.value.terminal {
                 return false;
@@ -2964,6 +3109,11 @@ impl Core {
             let Some(input) = e.state.inputs.get_mut(idx) else {
                 return false;
             };
+            if snapshot {
+                input.has = false;
+                input.value = None;
+                input.ended = None;
+            }
             let settles = input.record(frame);
             if settles && input.pending {
                 input.pending = false;
@@ -3168,6 +3318,14 @@ impl Core {
     /// A lifetime's first run, on the dependencies' snapshots (R-lifetime). Waiting for
     /// every dependency to have a value is the Rust first-run gate (sugar).
     fn first_run(&self) {
+        let all = self.first_run_frames();
+        if !all.is_empty() {
+            self.publish(all);
+        }
+    }
+
+    /// What the first run of a lifetime outputs, before it is published.
+    fn first_run_frames(&self) -> Vec<Wave<AnyValue>> {
         let plan = self.with_node_state_aux_mut(|n, c, cfg, r, e, _a| {
             if e.value.terminal {
                 return None;
@@ -3188,7 +3346,7 @@ impl Core {
             ))
         });
         let Some((dep_error, runs, passthrough, auto_complete)) = plan else {
-            return;
+            return Vec::new();
         };
         let out = if let Some(err) = dep_error {
             vec![vec![Message::Error(err.to_string().into())]]
@@ -3204,9 +3362,7 @@ impl Core {
         if auto_complete && !all.iter().flatten().any(Message::is_terminal) {
             all.push(vec![Message::Complete]);
         }
-        if !all.is_empty() {
-            self.publish(all);
-        }
+        all
     }
 
     /// A node with dependencies and no function relays dependency 0's DATA, one array
@@ -3231,138 +3387,7 @@ impl Core {
         })
     }
 
-    // ── runtime topology rewire (R-rewire / D42, C-8) ──
-
-    /// Runtime topology rewire — the public substrate entry (called by `Node::replace_deps`/
-    /// `subscribe_dep`/`unsubscribe_dep`). The validation REJECTS run first and panic: called
-    /// EXTERNALLY (no wave in flight) the panic propagates to the caller (idiomatic
-    /// error); called MID-FN (inside a wave) the panic is caught by the running wave-owner
-    /// → `[[ERROR,e]]` (R-reentrancy/D37 — a fn mutating its own topology mid-wave is the
-    /// feedback cycle). The surgical Option-C mutation + atomic settle then run under a
-    /// FRESH wave-owner so a user-fn panic during dep-activation/settle becomes ERROR
-    /// (D30). INTRA-graph only (D22). Requires an explicit fn (SD-1 fn-deps pairing).
-    pub(crate) fn rewire(&self, new_deps: Vec<Core>, fn_: NodeFn) {
-        self.external_rewire(RewireRequest::Set(new_deps, fn_));
-    }
-
-    fn external_rewire(&self, req: RewireRequest) {
-        req.validate_deps_same_graph(self);
-        if let Some(committed) = committed_after_batch_for_target(self) {
-            defer_boundary(
-                self,
-                BoundaryTask::ExternalRewire {
-                    target: CoreToken::from_core(self),
-                    req,
-                    committed,
-                },
-            );
-            return;
-        }
-        self.apply_external_rewire(req);
-    }
-
-    fn apply_external_rewire(&self, req: RewireRequest) {
-        let current = self.deps();
-        let (new_deps, fn_) = req.into_deps_and_fn(current);
-        self.rewire_inner(new_deps, fn_, false);
-    }
-
-    fn project_pending_external_rewire_deps(&self) -> Vec<Core> {
-        let target = CoreToken::from_core(self);
-        let mut deps = self.deps();
-        let graph = self.graph.borrow();
-        for task in &graph.deferred_boundary {
-            let BoundaryTask::ExternalRewire {
-                target: queued_target,
-                req,
-                ..
-            } = task
-            else {
-                continue;
-            };
-            if queued_target.graph_id == target.graph_id && queued_target.key == target.key {
-                deps = req.project_deps(deps);
-            }
-        }
-        deps
-    }
-
-    fn rewire_inner(&self, new_deps: Vec<Core>, fn_: NodeFn, allow_terminal_owner: bool) {
-        let new_deps = dedup_cores(new_deps);
-        for dep in &new_deps {
-            assert!(
-                dep.same_graph(self),
-                "rewire: dep belongs to a different graph; cross-graph deps require a wire bridge (D22/R-graph-domain)"
-            );
-        }
-        if !allow_terminal_owner {
-            if let Some(committed) = committed_after_batch_for_target(self) {
-                defer_boundary(
-                    self,
-                    BoundaryTask::ExternalRewire {
-                        target: CoreToken::from_core(self),
-                        req: RewireRequest::Set(new_deps, fn_),
-                        committed,
-                    },
-                );
-                return;
-            }
-        }
-        {
-            let (terminal, inside_run_wave, in_dep_mutation) = self.with_inner_edges(|_n, e| {
-                (
-                    e.value.terminal,
-                    e.wave.inside_run_wave,
-                    e.wave.in_dep_mutation,
-                )
-            });
-            assert!(
-                allow_terminal_owner || !terminal,
-                "rewire: node is terminal (completed/errored) — cannot rewire (R-rewire / D42)"
-            );
-            assert!(
-                !inside_run_wave,
-                "rewire: mid-fn topology mutation — a fn mutating its own deps mid-wave is the feedback cycle (R-rewire / D37)"
-            );
-            assert!(
-                !in_dep_mutation,
-                "rewire: reentrant dep mutation — another replace_deps/subscribe_dep/unsubscribe_dep is in flight (R-rewire)"
-            );
-        }
-        assert!(
-            !new_deps.iter().any(|d| d.ptr_eq(self)),
-            "rewire: self-dependency rejected (R-rewire / D42)"
-        );
-        let old_deps = self.borrow().deps.clone();
-        for d in new_deps
-            .iter()
-            .filter(|d| !old_deps.iter().any(|o| o.ptr_eq(d)))
-        {
-            assert!(
-                !reachable_upstream(d, self),
-                "rewire: would create a cycle — dep already transitively depends on this node (R-rewire / D42)"
-            );
-        }
-        with_wave_owner(self, || self.rewire_apply(new_deps, fn_), || {});
-    }
-
-    // ── deferred self-rewire (R-rewire-deferred / D47): ctx.rewire_next ──
-
-    /// Enqueue a deferred self-rewire (`ctx.rewire_next`). Applied at the committed wave
-    /// boundary by the wave-owner drain, NEVER in place — the immediate `replace_deps`/`subscribe_dep`/
-    /// `unsubscribe_dep` still panics mid-fn (D37/R-reentrancy). The drain runs each as a fresh
-    /// wave; this is the substrate affordance the higher-order *Map operators wire inners with.
-    pub(crate) fn request_rewire_next(&self, req: RewireRequest) {
-        defer_boundary(
-            self,
-            BoundaryTask::Rewire {
-                target: CoreToken::from_core(self),
-                req,
-                committed: active_batch_committed_token()
-                    .unwrap_or_else(|| Rc::new(Cell::new(true))),
-            },
-        );
-    }
+    // ── boundary tasks ──
 
     pub(crate) fn request_down_next(&self, msgs: Wave<AnyValue>) {
         defer_boundary(
@@ -3376,54 +3401,22 @@ impl Core {
         );
     }
 
-    /// Apply one queued self-rewire at the boundary (a drain thunk). D62: terminal seals output
-    /// but does NOT cancel queued topology intent. The dep set is composed
-    /// against the LIVE deps at apply time (so several requests in one wave compose). A rewire
-    /// reject (cycle/self/non-resubscribable terminal dep) panics — caught here and surfaced as
-    /// `[[ERROR,e]]` on this node (D30-consistent) so it does not strand the rest of the drain.
-    fn apply_rewire_next(&self, req: RewireRequest) {
-        let (new_deps, fn_) = match req {
-            RewireRequest::Set(deps, f) => (deps, f),
-            RewireRequest::Add(dep, f) => {
-                let mut next = self.deps();
-                if !next.iter().any(|d| d.ptr_eq(&dep)) {
-                    next.push(dep);
-                }
-                (next, f)
-            }
-            RewireRequest::Remove(dep, f) => {
-                let current = self.borrow().deps.clone();
-                if !current.iter().any(|d| dep.matches(d)) {
-                    return;
-                }
-                let next: Vec<Core> = current.into_iter().filter(|d| !dep.matches(d)).collect();
-                (next, f)
-            }
-        };
-        // rewire() dedups + validates + applies under its own wave-owner (a fn-panic during the
-        // apply becomes ERROR on the blamed node there). Only the PRE-apply validation rejects
-        // panic OUT of rewire() — caught here → ERROR on this node, via owned_down (a fresh
-        // wave-owner; the drain runs outside any live wave).
-        let outcome = catch_unwind(AssertUnwindSafe(|| self.rewire_inner(new_deps, fn_, true)));
-        if let Err(payload) = outcome {
-            let err = panic_to_error(payload);
-            self.owned_down(vec![Message::Error(err)]);
-        }
-    }
-
     /// The surgical Option-C mutation + settle (D42), run under a wave-owner. Kept deps
     /// keep their subscription, input record and idx-box (rerouted O(1)); removed deps
     /// drain (box→-1, unsub) and drop their pending mark; added deps are acquired, their
     /// snapshots recorded as one input wave, and the node settles on them once.
-    fn rewire_apply(&self, new_deps: Vec<Core>, fn_: NodeFn) {
+    fn rewire_apply(&self, new_deps: Vec<Core>, fn_: Option<NodeFn>) {
         let old_deps = self.borrow().deps.clone();
         self.with_inner_edges_mut(|_, e| e.wave.in_dep_mutation = true);
         // QA-F1: clear `in_dep_mutation` on EVERY exit, including a panic unwind during
         // the mutation (an added dep's activation or a removed dep's cleanup).
         let mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
         // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister
-        // the old handle so the rewired-away closure (and its captures) is freed.
-        self.swap_fn_preserving_pool(fn_);
+        // the old handle so the rewired-away closure (and its captures) is freed. A
+        // ctx.rewire keeps the function (R-request-order@2).
+        if let Some(fn_) = fn_ {
+            self.swap_fn_preserving_pool(fn_);
+        }
         if same_ordered_deps(&old_deps, &new_deps) {
             return;
         }
@@ -3441,7 +3434,9 @@ impl Core {
             }
         }
         let activated = self.with_aux(|a| a.activated);
-        // removed deps: drop their pending mark, then drain (box→-1, unsubscribe).
+        // removed deps: drop their pending mark and drain (box→-1); their release runs
+        // after the added deps are acquired, so a shared upstream stays active.
+        let mut released: Vec<Unsub> = Vec::new();
         for (old_idx, _) in old_kept.iter().enumerate().filter(|(_, kept)| !**kept) {
             let unsub = {
                 let mut graph = self.graph.borrow_mut();
@@ -3460,7 +3455,7 @@ impl Core {
                 edges.unsubs.get_mut(old_idx).and_then(Option::take)
             };
             if let Some(u) = unsub {
-                u();
+                released.push(u);
             }
         }
         // rebuild the per-dep records in new order; kept deps carry theirs.
@@ -3497,6 +3492,9 @@ impl Core {
                     self.subscribe_dep(idx, dep);
                 }
             }
+        }
+        for u in released {
+            run_reported("release", u);
         }
         self.notify_topology_deps_changed(&old_deps, &new_deps);
         drop(mut_guard);
@@ -3546,14 +3544,12 @@ impl Core {
         // B25: enroll in the wave touched-set before any mutation so a panic-abort
         // can reset our flags.
         wave_register(self);
-        if self.with_inner_edges(|_, e| e.wave.inside_run_wave) {
-            // R-reentrancy (D37): a fn re-driving its own dep mid-wave is the
-            // synchronous feedback cycle. Reject by panicking — the enclosing run turns
-            // it into ERROR on a node ON the cycle (C-6).
-            panic!(
-                "synchronous feedback cycle: node fn re-entered its own wave (R-reentrancy / D37)"
-            );
-        }
+        // A running function is never reentered: every request it makes waits until
+        // the wave ends (R-invocation@2, R-request-order@2).
+        debug_assert!(
+            !self.with_inner_edges(|_, e| e.wave.inside_run_wave),
+            "kernel invariant: a running function is never reentered"
+        );
         // Build ctx + call snapshot under one short arena borrow, then invoke
         // borrow-free through the dispatcher (R-dispatch-all / R-sync-core).
         let (handle, dispatcher, ctx, setup) =
@@ -3828,7 +3824,7 @@ impl Core {
     /// releases its dependencies, runs its cleanup and drops its private state, and
     /// keeps its values, terminal and subscribers.
     fn close_ended_lifetime(&self) {
-        let (unsubs, lifetime) = self.with_inner_edges_aux_mut(|n, e, a| {
+        let (unsubs, lifetime, restored) = self.with_inner_edges_aux_mut(|n, e, a| {
             let lifetime = a.lifetime.take();
             if let Some(lt) = &lifetime {
                 lt.signal.abort();
@@ -3837,17 +3833,49 @@ impl Core {
                 b.set(-1);
             }
             let unsubs: Vec<Unsub> = e.unsubs.iter_mut().filter_map(Option::take).collect();
+            let restored = restore_declared(n);
+            if restored.is_some() {
+                e.unsubs = (0..n.deps.len()).map(|_| None).collect();
+                e.idx_boxes = (0..n.deps.len())
+                    .map(|_| Rc::new(Cell::new(-1i64)))
+                    .collect();
+            }
             e.state = DepState::new(n.deps.len());
-            (unsubs, lifetime)
+            (unsubs, lifetime, restored)
         });
         self.finish_close(unsubs, lifetime);
+        if let Some((old, new)) = restored {
+            self.notify_topology_deps_changed(&old, &new);
+        }
     }
 
     /// External deferred emit — the async-pool late-emit path used by
     /// [`crate::ctx::DeferredCtx`]: a FRESH wave from this node, under its own
     /// wave-owner boundary (D30).
+    /// Output through a kept ctx of `lifetime`: in a batch body it is staged with
+    /// its lifetime, so it is dropped at the commit if that lifetime has closed by
+    /// then (R-request-order@2).
+    pub(crate) fn owned_down_from(&self, lifetime: u64, msgs: Wave<AnyValue>) {
+        if crate::batch::collecting_batch() {
+            if self.with_inner_edges(|_, e| e.value.terminal) {
+                return;
+            }
+            let flat: Wave<AnyValue> = prepare_output(msgs).into_iter().flatten().collect();
+            if !flat.is_empty() {
+                crate::batch::defer_to_batch_from(self, flat, lifetime);
+            }
+            return;
+        }
+        self.owned_down(msgs);
+    }
+
     pub(crate) fn owned_down(&self, msgs: Wave<AnyValue>) {
-        with_wave_owner(self, || self.down(msgs), || {});
+        if crate::batch::collecting_batch() || !wave_in_flight() {
+            with_wave_owner(self, || self.down(msgs), || {});
+            return;
+        }
+        let core = self.clone();
+        request(move || with_wave_owner(&core, || core.down(msgs), || {}));
     }
 
     /// Publishes arrays as one wave of their own, under a fresh wave owner.
@@ -3935,25 +3963,61 @@ fn reachable_upstream(from: &Core, target: &Core) -> bool {
         if key == target_key {
             return true;
         }
+        // Through current and declared dependencies: a closing lifetime puts the
+        // declared ones back (R-request-order@2).
         let topology = graph.get(key);
-        for dep in &topology.deps {
+        for dep in topology.deps.iter().chain(&topology.declared) {
             stack.push(dep.key());
         }
     }
     false
 }
 
-/// Dedup a dep list by node identity, preserving first-seen order — a dep
-/// appearing twice in a rewire collapses to one (Option-C; matches the TS `_dedupDeps`).
-fn dedup_cores(deps: Vec<Core>) -> Vec<Core> {
-    let mut out: Vec<Core> = Vec::with_capacity(deps.len());
-    let mut seen: HashSet<ArenaNodeKey> = HashSet::with_capacity(deps.len());
-    for d in deps {
-        if seen.insert(d.arena_node_key()) {
-            out.push(d);
-        }
+/// The options of [`Node::replace`]: the new instance's setup and recipe.
+#[derive(Debug, Clone, Default)]
+pub struct ReplaceOpts {
+    /// The new instance's setup (R-lifetime@2).
+    pub setup: Option<crate::lifetime::Setup>,
+    /// The new instance's recipe (R-node).
+    pub recipe: Option<serde_json::Value>,
+}
+
+/// A node's current definition, as [`Node::definition`] reads it (R-node).
+#[derive(Clone)]
+pub struct NodeDefinition {
+    /// The declared dependencies.
+    pub deps: Vec<Core>,
+    /// Whether the node has a function (a state node has none).
+    pub has_function: bool,
+    /// The current instance's setup.
+    pub setup: Option<crate::lifetime::Setup>,
+    /// The current instance's recipe.
+    pub recipe: Option<serde_json::Value>,
+    /// The COMPLETE policy.
+    pub complete: Policy,
+    /// The ERROR policy.
+    pub error: Policy,
+    /// The INVALIDATE policy.
+    pub invalidate: Policy,
+    /// Whether the node is quiet.
+    pub quiet: bool,
+}
+
+/// A ctx.rewire change, applied to the dependency list current when it runs.
+pub(crate) enum LifetimeRewire {
+    Set(Vec<Core>),
+    Add(Core),
+    Remove(Core),
+}
+
+/// Puts a closing lifetime's declared dependencies back (R-request-order@2); returns
+/// the old and new lists when a rewire had changed them.
+fn restore_declared(n: &mut NodeTopologySlot) -> Option<(Vec<Core>, Vec<Core>)> {
+    if same_ordered_deps(&n.deps, &n.declared) {
+        return None;
     }
-    out
+    let old = std::mem::replace(&mut n.deps, n.declared.clone());
+    Some((old, n.deps.clone()))
 }
 
 fn same_ordered_deps(old_deps: &[Core], new_deps: &[Core]) -> bool {
@@ -4203,7 +4267,14 @@ impl<T: 'static> Node<T> {
         reject_kernel_only_output(&msgs);
         check_output_shape(&msgs);
         crate::batch::assert_stageable(&self.core, &msgs);
-        with_wave_owner(&self.core, || self.core.down(msgs), || {});
+        // Inside a batch body the input is staged at once; during a wave it is a
+        // request that runs after the wave (R-request-order@2).
+        if crate::batch::collecting_batch() || !wave_in_flight() {
+            with_wave_owner(&self.core, || self.core.down(msgs), || {});
+            return;
+        }
+        let core = self.core.clone();
+        request(move || with_wave_owner(&core, || core.down(msgs), || {}));
     }
 
     /// The current cached value (downcast), or `None` for SENTINEL.
@@ -4231,10 +4302,10 @@ impl<T: 'static> Node<T> {
     /// deactivates when the last subscriber leaves, R-rom-ram).
     ///
     /// This is also a wave-owner boundary: the activation cascade it drives runs under
-    /// the D30 catch, so a synchronous feedback cycle surfaces as `[[ERROR,e]]` on a
-    /// cycle node instead of escaping the subscribe call (C-6). Even on that error path
-    /// the returned handle is a REAL unsubscribe (the sink is registered before the
-    /// panicking activation, so the caller can always detach it).
+    /// the D30 catch, so a panicking activation surfaces as `[[ERROR,e]]` instead of
+    /// escaping the subscribe call. Even on that error path the returned handle is a
+    /// REAL unsubscribe. During a wave or in a batch body the subscription is a request
+    /// that runs after the wave or the commit (R-request-order@2).
     ///
     /// Panics (R-terminal / D17): subscribing to a non-resubscribable **terminal** node
     /// is rejected — the stream is permanently over. (Resubscribable opt-in reset is a
@@ -4249,61 +4320,67 @@ impl<T: 'static> Node<T> {
 
     fn subscribe_with_kind(&self, sink: impl Fn(&[Msg]) + 'static, kind: SubscriberKind) -> Unsub {
         // R-failure@3: a user sink's panic goes to the host reporter, not into a node.
-        let sink = Rc::new(crate::report::guard_sink(sink));
-        // Record the subscriber id before activation so the error path hands back a real
-        // unsubscribe instead of leaking the just-registered sink (no orphaned sink).
-        let id_cell: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-        let body_cell = id_cell.clone();
-        with_wave_owner(
-            &self.core,
-            || {
-                self.core
-                    .subscribe_recording_id_with_kind(sink, kind, &body_cell)
-            },
-            move || match id_cell.get() {
-                Some(id) => {
-                    let err_core = self.core.clone();
-                    Box::new(move || err_core.unsubscribe(id)) as Unsub
-                }
-                None => Box::new(|| {}) as Unsub,
-            },
-        )
-    }
-
-    /// R-rewire (D42): replace this node's deps atomically (surgical Option-C). Kept deps
-    /// keep their subscription + per-dep state; only removed deps unsubscribe + drain, only
-    /// added deps fresh-subscribe (push-on-subscribe for an added cached dep). The first-run
-    /// gate + cache are PRESERVED. Requires an explicit fn (SD-1 fn-deps pairing — user fns
-    /// read deps positionally). INTRA-graph only (D22). Deps are erased ([`Core`]).
-    ///
-    /// Rejects (R-rewire): self-dep, a cycle, a terminal `self`, a (non-resubscribable)
-    /// terminal added dep, a reentrant rewire — these panic (propagate to the caller). A
-    /// mid-fn rewire (during this node's own fn run) is the D37 feedback cycle → caught by
-    /// the running wave-owner as `[[ERROR,e]]`, not a propagated panic.
-    pub fn replace_deps<F: Fn(&Ctx) + 'static>(&self, new_deps: Vec<Core>, f: F) {
-        self.core.rewire(new_deps, Rc::new(f));
-    }
-
-    /// Subscribe to one dep (special case of [`Node::replace_deps`]); returns its index. fn required (SD-1).
-    pub fn subscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) -> usize {
-        let mut next = self.core.project_pending_external_rewire_deps();
-        if !next.iter().any(|d| d.ptr_eq(&dep)) {
-            next.push(dep.clone());
+        let sink: Sink = Rc::new(crate::report::guard_sink(sink));
+        if !wave_in_flight() && !crate::batch::collecting_batch() {
+            return requested_unsubscribe(subscribe_now(&self.core, sink, kind));
         }
-        let index = next
-            .iter()
-            .position(|d| d.ptr_eq(&dep))
-            .expect("subscribe_dep next shape contains dep");
-        self.core
-            .external_rewire(RewireRequest::Add(dep, Rc::new(f)));
-        index
+        // During a wave, or in a batch body, the subscription is a request that runs
+        // after the wave or the commit (R-request-order@2); an unsubscribe before then
+        // cancels it.
+        let slot = Rc::new(RefCell::new(QueuedSubscription::Waiting));
+        let core = self.core.clone();
+        let pending = slot.clone();
+        request(move || {
+            if matches!(*pending.borrow(), QueuedSubscription::Waiting) {
+                let unsub = subscribe_now(&core, sink, kind);
+                *pending.borrow_mut() = QueuedSubscription::Active(unsub);
+            }
+        });
+        Box::new(move || {
+            let state = std::mem::replace(&mut *slot.borrow_mut(), QueuedSubscription::Cancelled);
+            if let QueuedSubscription::Active(unsub) = state {
+                request(unsub);
+            }
+        })
     }
 
-    /// Unsubscribe from one dep (special case of [`Node::replace_deps`]); idempotent if absent (the fn
-    /// swap still applies). fn required (SD-1).
-    pub fn unsubscribe_dep<F: Fn(&Ctx) + 'static>(&self, dep: Core, f: F) {
-        self.core
-            .external_rewire(RewireRequest::remove(&dep, Rc::new(f)));
+    /// Gives the node a new instance under the same id and subscribers
+    /// (R-request-order@2): the current lifetime closes, and the new instance has
+    /// `deps`, `f`, and the setup and recipe of `opts` (or none); the node's policies
+    /// stay. An active node starts the new instance as on a first activation, and its
+    /// subscribers receive START and the new snapshot. A request: during a wave it runs
+    /// after the wave.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a state node, a duplicate dependency, another graph's node, the node
+    /// itself, or a node that depends on it through current or declared dependencies.
+    pub fn replace<F: Fn(&Ctx) + 'static>(&self, deps: Vec<Core>, f: F, opts: ReplaceOpts) {
+        assert!(
+            !self.core.is_state(),
+            "replace: a state node has no function to replace (R-request-order)"
+        );
+        self.core.check_new_deps("replace", &deps);
+        let core = self.core.clone();
+        let f: NodeFn = Rc::new(f);
+        request(move || core.replace_instance(deps, f, opts.setup, opts.recipe));
+    }
+
+    /// The node's current definition (R-node): its declared dependencies, its current
+    /// instance's setup and recipe, and its policies. Reading changes nothing.
+    pub fn definition(&self) -> NodeDefinition {
+        let deps = self.core.with_inner_edges(|n, _| n.declared.clone());
+        let has_function = self.core.with_call(|c| c.handle.is_some());
+        self.core.with_config(|cfg| NodeDefinition {
+            deps,
+            has_function,
+            setup: cfg.setup.clone(),
+            recipe: cfg.recipe.clone(),
+            complete: cfg.complete,
+            error: cfg.error,
+            invalidate: cfg.invalidate,
+            quiet: cfg.quiet,
+        })
     }
 
     /// The erased core, for wiring this node as a dep of a `derived` node.
@@ -4346,16 +4423,45 @@ impl<T: 'static> State<T> {
         self.node
     }
 
-    /// Writes `v` as one DATA wave. Every occurrence stays DATA, an equal value
-    /// included (D49).
+    /// Writes a value, or a value computed by [`StateWrite::from_fn`], as one DATA
+    /// wave (R-request-order@2). A value is written as it is: every occurrence stays
+    /// DATA, an equal value included. A function runs when the write runs, in request
+    /// order, on the state's value then (in a batch body, on the writes staged before
+    /// it, at the commit); returning `None` writes nothing.
     ///
     /// # Panics
     ///
     /// Panics when the state has ended: host input to an ended node is refused
-    /// (R-terminals). The same holds for every host input below.
-    pub fn set(&self, v: T) {
+    /// (R-terminals). The same holds for every host input below. A panic in a write
+    /// function fails that write (in a batch, every write of the commit) and reaches
+    /// the write's caller, or the host reporter when the write was queued.
+    pub fn set(&self, write: impl Into<StateWrite<T>>) {
         self.assert_open();
-        self.node.set(v);
+        match write.into().0 {
+            StateWriteKind::Value(v) => self.node.set(v),
+            StateWriteKind::Fn(f) => self.set_with(f),
+        }
+    }
+
+    fn set_with(&self, f: Box<WriteFn<T>>) {
+        let erased: crate::batch::StagedWrite = Box::new(move |current: Option<AnyValue>| {
+            let current = current.as_ref().and_then(|v| v.downcast_ref::<T>());
+            f(current).map(|v| Rc::new(v) as AnyValue)
+        });
+        if crate::batch::collecting_batch() {
+            // A write after a terminal staged for this state is refused, as a value
+            // write is (R-wave: a terminal is last).
+            crate::batch::assert_stageable(&self.node.core, &[Message::Complete]);
+            let staged = crate::batch::stage_write(&self.node.core, erased);
+            debug_assert!(staged, "a collecting batch stages the write");
+            return;
+        }
+        let core = self.node.core.clone();
+        request(move || {
+            if let Some(v) = erased(core.cache_any()) {
+                with_wave_owner(&core, || core.down(vec![Message::Data(v)]), || {});
+            }
+        });
     }
 
     /// Removes the retained value, if any, as one INVALIDATE wave (R-invalidation).
@@ -4381,6 +4487,31 @@ impl<T: 'static> State<T> {
             !self.node.core.with_inner_edges(|_, e| e.value.terminal),
             "host input to an ended state is refused (R-terminals)"
         );
+    }
+}
+
+/// A write to a [`State`]: a plain value, or a function of the state's value when the
+/// write runs (graphrefly-rs:D3).
+pub struct StateWrite<T>(StateWriteKind<T>);
+
+/// The function of a [`StateWrite::from_fn`] write.
+type WriteFn<T> = dyn FnOnce(Option<&T>) -> Option<T>;
+
+enum StateWriteKind<T> {
+    Value(T),
+    Fn(Box<WriteFn<T>>),
+}
+
+impl<T> StateWrite<T> {
+    /// A write computed from the state's value when it runs; `None` writes nothing.
+    pub fn from_fn(f: impl FnOnce(Option<&T>) -> Option<T> + 'static) -> Self {
+        Self(StateWriteKind::Fn(Box::new(f)))
+    }
+}
+
+impl<T> From<T> for StateWrite<T> {
+    fn from(value: T) -> Self {
+        Self(StateWriteKind::Value(value))
     }
 }
 
@@ -5460,9 +5591,10 @@ mod tests {
             |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
         );
 
+        // Current and declared dependencies each hold the dep (R-request-order@2).
         assert_eq!(
             refs.get(),
-            2,
+            3,
             "inactive topology retains the declared dep in addition to the caller handle"
         );
         assert_eq!(derived.core.borrow().deps.len(), 1);
@@ -5472,7 +5604,7 @@ mod tests {
             arena.0.borrow().is_live_key(source_key),
             "declared topology keeps the dep live after the original handle is dropped"
         );
-        assert_eq!(refs.get(), 1);
+        assert_eq!(refs.get(), 2);
         assert_eq!(derived.core.deps().len(), 1);
 
         let u = derived.subscribe(|_| {});
@@ -5503,18 +5635,19 @@ mod tests {
             NodeOpts::default(),
             |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap() + 1),
         );
-        assert_eq!(refs.get(), 2);
+        // The caller's handle, plus current and declared dependencies.
+        assert_eq!(refs.get(), 3);
 
         let u = derived.subscribe(|_| {});
         assert!(
-            refs.get() > 2,
+            refs.get() > 3,
             "activation should add a subscription-owned counted dep handle"
         );
         assert_eq!(derived.cache(), Some(2));
         u();
         assert_eq!(
             refs.get(),
-            2,
+            3,
             "deactivation releases only the subscription-owned dep handle"
         );
     }
@@ -5555,119 +5688,6 @@ mod tests {
     }
 
     #[test]
-    fn boundary_owner_actions_do_not_pin_core_while_queued() {
-        // DR-8/B54: `ctx.up_next` / `ctx.rewire_next` boundary tasks store a
-        // generation-checked owner token while queued, not a counted owner `Core`.
-        // The drain upgrades to a counted handle only for execution, preserving
-        // callback/drop safety without retaining the owner for the queue lifetime.
-        let source = Node::<i32>::state(1);
-        let refs = source.core.refs.clone();
-
-        with_wave_owner(
-            &source.core,
-            || {
-                let owner_refs = refs.get();
-                source.core.request_down_next(vec![Message::Invalidate]);
-                assert_eq!(
-                    refs.get(),
-                    owner_refs,
-                    "queued up_next stores an owner token, not a counted Core"
-                );
-
-                source
-                    .core
-                    .request_rewire_next(RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(2i32))));
-                assert_eq!(
-                    refs.get(),
-                    owner_refs,
-                    "queued rewire_next stores an owner token, not a counted Core"
-                );
-            },
-            || {},
-        );
-
-        assert_eq!(
-            refs.get(),
-            1,
-            "boundary execution releases its temporary counted handle"
-        );
-    }
-
-    #[test]
-    fn boundary_rewire_task_executes_with_borrowed_pinned_owner() {
-        // Same owner-execution invariant for the rewire boundary task. The added cached
-        // dep drives the queued fn during boundary drain, where old code had both a
-        // task-level counted promotion and a rewire_inner pre-clone.
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(10);
-        let observed_refs = Rc::new(Cell::new(usize::MAX));
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-        let refs = d.core.refs.clone();
-        let refs_before = refs.get();
-
-        with_wave_owner(
-            &d.core,
-            || {
-                let observed_refs = observed_refs.clone();
-                let refs = refs.clone();
-                d.core.request_rewire_next(RewireRequest::Set(
-                    vec![b.erased()],
-                    Rc::new(move |ctx| {
-                        observed_refs.set(refs.get());
-                        ctx.emit(*ctx.data::<i32>(0).unwrap());
-                    }),
-                ));
-            },
-            || {},
-        );
-
-        assert_eq!(
-            observed_refs.get(),
-            refs_before,
-            "boundary rewire task should run without counted owner promotions"
-        );
-        assert_eq!(refs.get(), refs_before);
-        assert_eq!(d.cache(), Some(10));
-    }
-
-    #[test]
-    fn deferred_rewire_remove_does_not_pin_removed_dep_while_queued() {
-        // DR-8/B54: a queued remove only needs dep identity. Add/Set must retain
-        // runtime-created deps until the boundary, but Remove should not add another
-        // counted dep pin while waiting to apply.
-        let dep = Node::<i32>::state(1);
-        let derived: Node<i32> = Node::derived(vec![dep.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = derived.subscribe(|_| {});
-        let refs = dep.core.refs.clone();
-
-        with_wave_owner(
-            &derived.core,
-            || {
-                let before = refs.get();
-                derived
-                    .core
-                    .request_rewire_next(RewireRequest::remove(&dep.core, Rc::new(|_| {})));
-                assert_eq!(
-                    refs.get(),
-                    before,
-                    "queued remove stores dep identity, not a counted dep Core"
-                );
-            },
-            || {},
-        );
-
-        assert!(
-            derived.core.deps().is_empty(),
-            "queued remove still applies at the committed boundary"
-        );
-    }
-
-    #[test]
     fn core_identity_does_not_match_reused_slot_generation() {
         // CoreIdentity is used by queued remove requests: it must be graph+generation
         // identity, not just a slot id, or a stale remove could target a later occupant.
@@ -5683,59 +5703,6 @@ mod tests {
         assert!(
             !old_identity.matches(&reused.core),
             "stale identity must not match a reused arena slot"
-        );
-    }
-
-    #[test]
-    fn queued_remove_identity_noops_after_prior_remove_and_preserves_later_add() {
-        // Multiple ctx.rewire_next requests compose at apply time. A later remove of
-        // an already-removed dep must be a no-op and must not remove a replacement dep
-        // that was added in between.
-        let old = Node::<i32>::state(1);
-        let replacement = Node::<i32>::state(2);
-        let derived: Node<i32> = Node::derived(vec![old.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = derived.subscribe(|_| {});
-
-        with_wave_owner(
-            &derived.core,
-            || {
-                derived
-                    .core
-                    .request_rewire_next(RewireRequest::remove(&old.core, Rc::new(|_| {})));
-                derived.core.request_rewire_next(RewireRequest::Add(
-                    replacement.erased(),
-                    Rc::new(|ctx| {
-                        if let Some(v) = ctx.data::<i32>(0) {
-                            ctx.emit(*v);
-                        }
-                    }),
-                ));
-                derived
-                    .core
-                    .request_rewire_next(RewireRequest::remove(&old.core, Rc::new(|_| {})));
-            },
-            || {},
-        );
-
-        let deps = derived.core.deps();
-        assert_eq!(deps.len(), 1);
-        assert!(
-            deps[0].ptr_eq(&replacement.core),
-            "second stale remove must not disturb the replacement dep"
-        );
-        assert_eq!(
-            derived.cache(),
-            Some(2),
-            "replacement add should install the replacement fn"
-        );
-
-        replacement.set(3);
-        assert_eq!(
-            derived.cache(),
-            Some(3),
-            "stale remove must not swap in its stale fn after the replacement add"
         );
     }
 
@@ -5765,53 +5732,6 @@ mod tests {
     }
 
     #[test]
-    fn nested_cross_arena_boundary_task_drains_at_outer_committed_boundary() {
-        // Nested public calls into another GraphArena share the thread-local WAVE scope.
-        // A boundary task queued by the inner arena must still drain at the outer
-        // committed boundary, not wait for a later wave in that inner arena.
-        let arena_a = GraphArena::new();
-        let arena_b = GraphArena::new();
-        let outer = Node::<i32>::state_empty_in_arena(&arena_a);
-        let inner_src = Node::<i32>::state_empty_in_arena(&arena_b);
-        let inner_dep = inner_src.erased();
-        let replacement_dep = inner_dep.clone();
-        let inner: Node<i32> =
-            Node::derived_opts_in_arena(&arena_b, vec![inner_dep.clone()], NodeOpts::default(), {
-                let replacement_dep = replacement_dep.clone();
-                move |ctx| {
-                    ctx.rewire_next_replace_deps(vec![replacement_dep.clone()], |next| {
-                        next.emit(*next.data::<i32>(0).unwrap() * 10)
-                    });
-                    ctx.emit(*ctx.data::<i32>(0).unwrap());
-                }
-            });
-        let _inner_sub = inner.subscribe(|_| {});
-        let inner_src_for_outer = inner_src.clone();
-        let _outer_sub = outer.subscribe(
-            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
-                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
-                    if matches!(m, Message::Data(_)) {
-                        inner_src_for_outer.set(1);
-                    }
-                };
-                for m in msgs {
-                    handle(m);
-                }
-            },
-        );
-
-        outer.set(1);
-        assert_eq!(inner.cache(), Some(1));
-
-        inner_src.set(2);
-        assert_eq!(
-            inner.cache(),
-            Some(20),
-            "inner arena rewire_next must have drained before the next inner wave"
-        );
-    }
-
-    #[test]
     fn batch_boundary_root_tracking_does_not_pin_queued_owner() {
         // DR-8/B54: batch needs to remember which graph queues boundary work, but that
         // graph-root bookkeeping must not retain the node owner. Owner liveness remains
@@ -5830,182 +5750,6 @@ mod tests {
         });
 
         assert_eq!(refs.get(), 1);
-    }
-
-    #[test]
-    fn batch_deferred_external_rewire_does_not_pin_owner_while_queued() {
-        // D67 queues an external rewire until after the target's batched settle commits.
-        // DR-8/B54: that queued owner action uses a weak generation token, not a counted
-        // owner Core captured by a generic thunk.
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(2);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-
-        crate::batch::batch(|_| {
-            a.set(3);
-            let refs_after_batched_settle = d.core.refs.get();
-            d.replace_deps(vec![b.erased()], |ctx| {
-                ctx.emit(*ctx.data::<i32>(0).unwrap() * 10)
-            });
-            assert_eq!(
-                d.core.refs.get(),
-                refs_after_batched_settle,
-                "queued batch-deferred external rewire must not retain a counted owner Core"
-            );
-        });
-
-        assert_eq!(
-            d.cache(),
-            Some(20),
-            "batch-deferred external rewire still drains at the committed boundary"
-        );
-    }
-
-    #[test]
-    fn batch_deferred_subscribe_dep_returns_intended_index_while_queued() {
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(2);
-        let c = Node::<i32>::state(3);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-
-        crate::batch::batch(|_| {
-            d.down(vec![Message::Data(Rc::new(5i32))]);
-            let index = d.subscribe_dep(b.erased(), |ctx| {
-                ctx.emit(*ctx.data::<i32>(1).unwrap() * 10)
-            });
-            assert_eq!(
-                index, 1,
-                "queued subscribe_dep returns the requested next-shape index"
-            );
-            let c_index = d.subscribe_dep(c.erased(), |ctx| {
-                ctx.emit(*ctx.data::<i32>(2).unwrap() * 100)
-            });
-            assert_eq!(
-                c_index, 2,
-                "queued subscribe_dep composes with earlier queued external rewire intents"
-            );
-            assert_eq!(
-                d.core.deps().len(),
-                1,
-                "D67 keeps the live dep shape old until batch commit"
-            );
-        });
-
-        assert_eq!(
-            d.cache(),
-            Some(300),
-            "old-shape batch commit precedes fresh subscribeDep boundary waves in FIFO order"
-        );
-        assert_eq!(
-            d.core.deps().len(),
-            3,
-            "queued subscribeDep requests compose instead of replacing one another"
-        );
-    }
-
-    #[test]
-    fn batch_deferred_subscribe_then_unsubscribe_composes_while_queued() {
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(2);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-
-        crate::batch::batch(|_| {
-            d.down(vec![Message::Data(Rc::new(5i32))]);
-            d.subscribe_dep(b.erased(), |ctx| {
-                ctx.emit(*ctx.data::<i32>(1).unwrap() * 10)
-            });
-            d.unsubscribe_dep(b.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
-            assert_eq!(
-                d.core.deps().len(),
-                1,
-                "D67 keeps the live dep shape old until batch commit"
-            );
-        });
-
-        assert_eq!(
-            d.core.deps().len(),
-            1,
-            "queued unsubscribeDep composes with an earlier queued subscribeDep"
-        );
-        let before_removed_dep_set = d.cache();
-        b.set(9);
-        assert_eq!(
-            d.cache(),
-            before_removed_dep_set,
-            "removed queued dep no longer drives"
-        );
-        a.set(6);
-        assert_eq!(
-            d.cache(),
-            Some(6),
-            "original dep remains live after composed drain"
-        );
-    }
-
-    #[test]
-    fn batch_boundary_task_executes_after_last_public_owner_drops() {
-        // DR-8/B54: a queued boundary task can run while the public handle is gone,
-        // as long as the batch target pin keeps the arena slot live during commit.
-        let arena = GraphArena::new();
-        let graph = arena.0.clone();
-        let dep = Node::<i32>::state_in_arena(&arena, 10);
-        let source = Node::<i32>::state_in_arena(&arena, 1);
-        source.core.activate();
-        let key = source.core.key();
-        let refs = source.core.refs.clone();
-        let seen_refs = Rc::new(Cell::new(usize::MAX));
-
-        crate::batch::batch({
-            let dep = dep.erased();
-            let graph = graph.clone();
-            let refs = refs.clone();
-            let seen_refs = seen_refs.clone();
-            move |_| {
-                let owned = source;
-                owned.set(2);
-                owned.replace_deps(vec![dep], {
-                    let refs = refs.clone();
-                    let seen_refs = seen_refs.clone();
-                    move |ctx| {
-                        seen_refs.set(refs.get());
-                        ctx.emit(*ctx.data::<i32>(0).expect("cached added dep data"));
-                    }
-                });
-                drop(owned);
-                assert_eq!(
-                    refs.get(),
-                    0,
-                    "batch-deferred external rewire owner can drop to zero while queued"
-                );
-                assert!(
-                    graph.borrow().pin_count(key) >= 1,
-                    "batch target pin keeps the arena slot live during commit"
-                );
-                assert!(
-                    graph.borrow().is_live_key(key),
-                    "batch target pin keeps slot live during committed-boundary drain"
-                );
-            }
-        });
-
-        assert_eq!(
-            seen_refs.get(),
-            0,
-            "batch-deferred external rewire executes from borrowed pin when refs reach zero"
-        );
-        assert!(
-            !graph.borrow().is_live_key(key),
-            "batch pin should release when commit finishes"
-        );
     }
 
     #[test]
@@ -6139,186 +5883,6 @@ mod tests {
         assert!(
             graph.borrow().is_live_key(reused.core.key()),
             "reused slot is live with the new generation"
-        );
-    }
-
-    #[test]
-    fn stale_external_rewire_token_does_not_target_reused_slot() {
-        // DR-8/B54 boundary freshness: ExternalRewire queues carry a weak generation
-        // token for the owner. A stale queued owner must no-op after slot reuse, never
-        // apply a topology/fn swap to the new occupant.
-        let arena = GraphArena::new();
-        let old = Node::<i32>::state_in_arena(&arena, 1);
-        let old_key = old.core.key();
-        let committed = Rc::new(Cell::new(true));
-        defer_boundary(
-            &old.core,
-            BoundaryTask::ExternalRewire {
-                target: CoreToken::from_core(&old.core),
-                req: RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(999i32))),
-                committed,
-            },
-        );
-        drop(old);
-
-        let reused = Node::<i32>::state_in_arena(&arena, 2);
-        assert_eq!(old_key.id, reused.core.key().id);
-        assert_ne!(old_key.generation, reused.core.key().generation);
-
-        drain_committed_boundary(&reused.core);
-
-        assert_eq!(reused.cache(), Some(2));
-        assert_eq!(
-            reused.status().cache,
-            crate::CacheStatus::Ready,
-            "stale ExternalRewire token must not disturb the reused slot occupant"
-        );
-        assert!(
-            reused.core.deps().is_empty(),
-            "state node topology remains unchanged after stale external rewire drains"
-        );
-    }
-
-    #[test]
-    fn boundary_task_queued_during_batch_commit_drains_before_next_wave() {
-        // A batch commit wave can synchronously enter another arena while ACTIVE_BATCH is
-        // still installed (`collecting=false`). Roots registered during that commit must
-        // be merged before clear/drain, or the inner queued rewire waits for a later wave.
-        let arena_a = GraphArena::new();
-        let arena_b = GraphArena::new();
-        let outer = Node::<i32>::state_empty_in_arena(&arena_a);
-        let inner_src = Node::<i32>::state_empty_in_arena(&arena_b);
-        let inner_dep = inner_src.erased();
-        let replacement_dep = inner_dep.clone();
-        let inner: Node<i32> =
-            Node::derived_opts_in_arena(&arena_b, vec![inner_dep.clone()], NodeOpts::default(), {
-                let replacement_dep = replacement_dep.clone();
-                move |ctx| {
-                    ctx.rewire_next_replace_deps(vec![replacement_dep.clone()], |next| {
-                        next.emit(*next.data::<i32>(0).unwrap() * 10)
-                    });
-                    ctx.emit(*ctx.data::<i32>(0).unwrap());
-                }
-            });
-        let _inner_sub = inner.subscribe(|_| {});
-        let inner_src_for_commit = inner_src.clone();
-        let _outer_sub = outer.subscribe(
-            move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
-                let handle = |m: &crate::protocol::Message<crate::protocol::AnyValue>| {
-                    if matches!(m, Message::Data(_)) {
-                        inner_src_for_commit.set(1);
-                    }
-                };
-                for m in msgs {
-                    handle(m);
-                }
-            },
-        );
-
-        crate::batch::batch(|_| {
-            outer.set(1);
-        });
-        assert_eq!(inner.cache(), Some(1));
-
-        inner_src.set(2);
-        assert_eq!(
-            inner.cache(),
-            Some(20),
-            "inner rewire queued during batch commit must drain before the next inner wave"
-        );
-    }
-
-    #[test]
-    fn wave_boundary_drains_later_roots_after_earlier_root_panics() {
-        // Boundary drains isolate panics per queued task and per graph root: the first
-        // panic still escapes, but not before every registered root reaches its boundary.
-        let arena_a = GraphArena::new();
-        let arena_b = GraphArena::new();
-        let a = Node::<i32>::state_in_arena(&arena_a, 1);
-        let b_src = Node::<i32>::state_in_arena(&arena_b, 2);
-        let b: Node<i32> = Node::derived_opts_in_arena(
-            &arena_b,
-            vec![b_src.erased()],
-            NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
-        );
-        let _u = b.subscribe(|_| {});
-        let committed = Rc::new(Cell::new(true));
-
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            with_wave_owner(
-                &a.core,
-                || {
-                    defer_boundary(
-                        &a.core,
-                        BoundaryTask::ExternalRewire {
-                            target: CoreToken::from_core(&a.core),
-                            req: RewireRequest::Set(vec![a.erased()], Rc::new(|_| {})),
-                            committed: committed.clone(),
-                        },
-                    );
-                    defer_boundary(
-                        &b.core,
-                        BoundaryTask::ExternalRewire {
-                            target: CoreToken::from_core(&b.core),
-                            req: RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(99i32))),
-                            committed: committed.clone(),
-                        },
-                    );
-                },
-                || {},
-            );
-        }));
-
-        assert!(result.is_err());
-        assert!(
-            b.core.borrow().deps.is_empty(),
-            "a panic in the owner graph's boundary queue must not strand later graph roots"
-        );
-    }
-
-    #[test]
-    fn batch_boundary_drains_later_roots_after_earlier_root_panics() {
-        // Same isolation as the wave boundary, but through the batch committed-boundary
-        // root set. A panicking root must not skip later roots before the panic escapes.
-        let arena_a = GraphArena::new();
-        let arena_b = GraphArena::new();
-        let a = Node::<i32>::state_in_arena(&arena_a, 1);
-        let b_src = Node::<i32>::state_in_arena(&arena_b, 2);
-        let b: Node<i32> = Node::derived_opts_in_arena(
-            &arena_b,
-            vec![b_src.erased()],
-            NodeOpts::default(),
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
-        );
-        let _u = b.subscribe(|_| {});
-        let committed = Rc::new(Cell::new(true));
-
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            crate::batch::batch(|_| {
-                defer_boundary(
-                    &a.core,
-                    BoundaryTask::ExternalRewire {
-                        target: CoreToken::from_core(&a.core),
-                        req: RewireRequest::Set(vec![a.erased()], Rc::new(|_| {})),
-                        committed: committed.clone(),
-                    },
-                );
-                defer_boundary(
-                    &b.core,
-                    BoundaryTask::ExternalRewire {
-                        target: CoreToken::from_core(&b.core),
-                        req: RewireRequest::Set(vec![], Rc::new(|ctx| ctx.emit(99i32))),
-                        committed: committed.clone(),
-                    },
-                );
-            });
-        }));
-
-        assert!(result.is_err());
-        assert!(
-            b.core.borrow().deps.is_empty(),
-            "a panic in one batch boundary root must not strand later graph roots"
         );
     }
 
@@ -6496,491 +6060,6 @@ mod tests {
     }
 
     // ── rewire (R-rewire / D42, C-8) ──
-
-    #[test]
-    fn rewire_subscribe_dep_sentinel_dep_does_not_rearm_gate() {
-        // Q2: adding a never-emitted (SENTINEL) dep delivers START only — no recompute — and
-        // does NOT re-arm the first-run gate (a alone re-drives d, not waiting for b).
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state_empty(); // SENTINEL, never emits
-        let runs = Rc::new(Cell::new(0usize));
-        let d = {
-            let r = runs.clone();
-            Node::<i32>::derived(vec![a.erased()], move |ctx| {
-                r.set(r.get() + 1);
-                ctx.emit(*ctx.data::<i32>(0).unwrap() * 10);
-            })
-        };
-        let (_log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        assert_eq!(d.cache(), Some(10));
-        runs.set(0);
-
-        let r2 = runs.clone();
-        d.subscribe_dep(b.erased(), move |ctx| {
-            r2.set(r2.get() + 1);
-            let bv = ctx.data::<i32>(1).map(|v| *v).unwrap_or(0); // SENTINEL guard
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 10 + bv);
-        });
-        assert_eq!(
-            runs.get(),
-            0,
-            "a SENTINEL added dep delivers START only — no recompute"
-        );
-
-        a.set(2); // gate NOT re-armed: a alone re-drives d
-        assert_eq!(runs.get(), 1);
-        assert_eq!(d.cache(), Some(20)); // 2*10 + 0 (b still SENTINEL)
-    }
-
-    #[test]
-    fn rewire_unsubscribe_dep_drains_and_preserves_cache() {
-        // Q3/Q7: unsubscribe_dep of a non-dirty dep preserves cache (no recompute) + drains the
-        // removed edge (it no longer drives the node); the swapped fn runs on the next wave.
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(2);
-        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
-        });
-        let (_log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        assert_eq!(d.cache(), Some(3));
-
-        d.unsubscribe_dep(b.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
-        assert_eq!(d.cache(), Some(3)); // preserved (unsubscribe_dep of a non-dirty dep: no recompute)
-
-        b.set(99); // drained — must NOT drive d
-        assert_eq!(d.cache(), Some(3));
-
-        a.set(5); // d recomputes with the swapped a-only fn
-        assert_eq!(d.cache(), Some(5));
-    }
-
-    #[test]
-    fn rewire_unsubscribe_dep_to_zero_deps_is_inert() {
-        // SD-3: unsubscribe_dep to zero deps → degenerate fn-no-deps, cache preserved, no auto-fire.
-        let a = Node::<i32>::state(7);
-        let runs = Rc::new(Cell::new(0usize));
-        let d = {
-            let r = runs.clone();
-            Node::<i32>::derived(vec![a.erased()], move |ctx| {
-                r.set(r.get() + 1);
-                ctx.emit(*ctx.data::<i32>(0).unwrap());
-            })
-        };
-        let (_log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        assert_eq!(d.cache(), Some(7));
-        runs.set(0);
-
-        let r2 = runs.clone();
-        d.unsubscribe_dep(a.erased(), move |ctx| {
-            r2.set(r2.get() + 1);
-            ctx.emit(-1i32);
-        });
-        assert_eq!(d.cache(), Some(7)); // preserved
-        assert_eq!(runs.get(), 0); // inert — does not fire
-
-        a.set(8); // a is no longer a dep
-        assert_eq!(d.cache(), Some(7));
-        assert_eq!(runs.get(), 0);
-    }
-
-    #[test]
-    fn rewire_replace_deps_reorders_kept_deps() {
-        // Option-C / DepRecord-ref dispatch: reorder kept deps without losing state; a kept
-        // dep's callback reroutes to its new index via the shared idx-box (O(1)).
-        fn combine(ctx: &Ctx) {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 100 + *ctx.data::<i32>(1).unwrap());
-        }
-        let a = Node::<i32>::state(10);
-        let b = Node::<i32>::state(20);
-        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], combine);
-        let (_log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        assert_eq!(d.cache(), Some(1020)); // dep0=a=10, dep1=b=20
-
-        d.replace_deps(vec![b.erased(), a.erased()], combine); // reorder; kept state preserved
-        a.set(11); // a is now dep1; reroutes correctly
-        assert_eq!(d.cache(), Some(2011)); // dep0=b=20, dep1=a=11 → 20*100+11
-    }
-
-    #[test]
-    fn rewire_same_order_fn_swap_rejects_reentrant_rewire_from_old_fn_drop() {
-        struct ReenterOnDrop {
-            target: Rc<RefCell<Option<Node<i32>>>>,
-            dep: Core,
-            saw_guard: Rc<Cell<bool>>,
-        }
-
-        impl Drop for ReenterOnDrop {
-            fn drop(&mut self) {
-                let Some(target) = self.target.borrow().as_ref().cloned() else {
-                    return;
-                };
-                self.saw_guard
-                    .set(target.core.with_inner_edges(|_, e| e.wave.in_dep_mutation));
-                target.replace_deps(vec![self.dep.clone()], |_| {});
-            }
-        }
-
-        let a = Node::<i32>::state(1);
-        let holder: Rc<RefCell<Option<Node<i32>>>> = Rc::new(RefCell::new(None));
-        let saw_guard = Rc::new(Cell::new(false));
-        let drop_probe = ReenterOnDrop {
-            target: holder.clone(),
-            dep: a.erased(),
-            saw_guard: saw_guard.clone(),
-        };
-        let d: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
-            let _keep = &drop_probe;
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
-        });
-        *holder.borrow_mut() = Some(d.clone());
-        let _u = d.subscribe(|_| {});
-
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            d.replace_deps(vec![a.erased()], |ctx| {
-                ctx.emit(*ctx.data::<i32>(0).unwrap() + 1);
-            });
-        }));
-
-        assert!(saw_guard.get(), "old fn Drop should see the rewire guard");
-        assert!(
-            !d.core.with_inner_edges(|_, e| e.wave.in_dep_mutation),
-            "DepMutationGuard must clear the fast-path mutation guard after panic"
-        );
-        *holder.borrow_mut() = None;
-    }
-
-    #[test]
-    fn rewire_replace_deps_all_replaced_fast_path() {
-        // DR-8/B54 no-kept fast path: same-length rewire where every old dep is dropped
-        // and replaced by new deps should re-subscribe to the fresh edge set, drop the old
-        // callback transport, and run once on the fresh push-on-subscribe wave.
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(2);
-        let c = Node::<i32>::state(10);
-        let e = Node::<i32>::state(20);
-        let runs = Rc::new(Cell::new(0usize));
-        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], {
-            let runs = runs.clone();
-            move |ctx| {
-                runs.set(runs.get() + 1);
-                ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-            }
-        });
-        let _u = d.subscribe(|_| {});
-        assert_eq!(d.cache(), Some(3));
-        runs.set(0);
-
-        let runs2 = runs.clone();
-        d.replace_deps(vec![c.erased(), e.erased()], move |ctx| {
-            runs2.set(runs2.get() + 1);
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap() + 100);
-        });
-        assert_eq!(
-            runs.get(),
-            1,
-            "one recompute after full no-kept replacement"
-        );
-        assert_eq!(d.cache(), Some(130));
-
-        assert_eq!(
-            a.core.subscriber_count(),
-            0,
-            "old dep A edge is fully drained"
-        );
-        assert_eq!(
-            b.core.subscriber_count(),
-            0,
-            "old dep B edge is fully drained"
-        );
-        assert_eq!(c.core.subscriber_count(), 1, "new dep C edge is active");
-        assert_eq!(e.core.subscriber_count(), 1, "new dep E edge is active");
-
-        // Old deps no longer drive cache.
-        a.set(99);
-        b.set(99);
-        assert_eq!(runs.get(), 1);
-        assert_eq!(d.cache(), Some(130));
-
-        // New deps continue to drive and preserve atomic settle.
-        c.set(11);
-        assert_eq!(runs.get(), 2);
-        assert_eq!(d.cache(), Some(131));
-    }
-
-    #[test]
-    fn rewire_removed_cleanup_panic_is_reported_and_releases_remaining_edges() {
-        // R-failure@3: a removed dependency's cleanup panic goes to the host reporter;
-        // the rewire completes, the later old edge is released and the node stays open.
-        let b_deactivated = Rc::new(Cell::new(false));
-        let a =
-            Node::<i32>::producer_opts(with_cleanup(|| panic!("removed cleanup boom")), |ctx| {
-                ctx.emit(1i32);
-            });
-        let b = {
-            let flag = b_deactivated.clone();
-            Node::<i32>::producer_opts(with_cleanup(move || flag.set(true)), |ctx| {
-                ctx.emit(2i32);
-            })
-        };
-        let c = Node::<i32>::state(10);
-        let e = Node::<i32>::state(20);
-
-        let d: Node<i32> = Node::derived(vec![a.erased(), b.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-        });
-        let _u = d.subscribe(|_| {});
-        assert_eq!(d.cache(), Some(3));
-        assert_eq!(b.core.subscriber_count(), 1);
-
-        d.replace_deps(vec![c.erased(), e.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap());
-        });
-        assert_eq!(d.status().output, crate::OutputStatus::Open);
-        assert_eq!(d.cache(), Some(30));
-        assert!(
-            b_deactivated.get(),
-            "the later old edge's cleanup still runs"
-        );
-        assert_eq!(
-            b.core.subscriber_count(),
-            0,
-            "the later old edge is released"
-        );
-    }
-
-    #[test]
-    fn rewire_atomic_multi_add_settles_once() {
-        // P2: adding ≥2 cached deps in ONE replace_deps settles ATOMICALLY — the fn fires once,
-        // never on a partial view (an added dep still SENTINEL at invocation = the bug).
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(10);
-        let c = Node::<i32>::state(100);
-        let runs = Rc::new(Cell::new(0usize));
-        let saw_partial = Rc::new(Cell::new(false));
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let (_log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        runs.set(0);
-
-        let r = runs.clone();
-        let sp = saw_partial.clone();
-        d.replace_deps(vec![a.erased(), b.erased(), c.erased()], move |ctx| {
-            r.set(r.get() + 1);
-            if ctx.data::<i32>(1).is_none() || ctx.data::<i32>(2).is_none() {
-                sp.set(true);
-            }
-            ctx.emit(
-                *ctx.data::<i32>(0).unwrap()
-                    + *ctx.data::<i32>(1).unwrap()
-                    + *ctx.data::<i32>(2).unwrap(),
-            );
-        });
-        assert_eq!(
-            runs.get(),
-            1,
-            "ONE atomic settle, not one fire per added dep"
-        );
-        assert!(
-            !saw_partial.get(),
-            "never fired with an added dep still SENTINEL"
-        );
-        assert_eq!(d.cache(), Some(111)); // 1 + 10 + 100
-    }
-
-    #[test]
-    fn rewire_settle_emits_dirty_before_data() {
-        // D1 / R-dirty-before-data: a rewire-triggered settle is a wave — DIRTY precedes DATA.
-        let a = Node::<i32>::state(1);
-        let b = Node::<i32>::state(100);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let (log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        log.borrow_mut().clear(); // isolate the rewire wave
-
-        d.subscribe_dep(b.erased(), |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() + *ctx.data::<i32>(1).unwrap())
-        });
-        assert_eq!(*log.borrow(), vec!["PENDING", "DATA"]); // glitch-free two-phase
-        assert_eq!(d.cache(), Some(101));
-    }
-
-    #[test]
-    #[should_panic(expected = "self-dependency")]
-    fn rewire_rejects_self_dep() {
-        let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-        d.replace_deps(vec![d.erased()], |_| {}); // self-dep → panic
-    }
-
-    #[test]
-    #[should_panic(expected = "cycle")]
-    fn rewire_rejects_cycle() {
-        let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let e: Node<i32> = Node::derived(vec![d.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = e.subscribe(|_| {}); // e depends on d (→ a)
-        d.subscribe_dep(e.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
-        // would close d→e→d
-    }
-
-    #[test]
-    fn rewire_adding_ended_dep_delivers_its_terminal() {
-        // R-terminals: an ended node stays subscribable, so adding it as a dep is allowed;
-        // under the auto COMPLETE policy the node ends once every dep has completed.
-        let term: Node<i32> = Node::producer(|ctx| ctx.down(vec![Message::Complete]));
-        let _ut = term.subscribe(|_| {});
-        assert_eq!(term.status().output, crate::OutputStatus::Completed);
-        let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        });
-        let _u = d.subscribe(|_| {});
-        d.subscribe_dep(term.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
-        assert_ne!(
-            d.status().output,
-            crate::OutputStatus::Completed,
-            "a live dep keeps the node open"
-        );
-        a.down(vec![Message::Complete]);
-        assert_eq!(d.status().output, crate::OutputStatus::Completed);
-    }
-
-    #[test]
-    fn rewire_midfn_becomes_error_not_panic() {
-        // A fn mutating its OWN deps mid-wave is the D37 feedback cycle. The Rust substrate
-        // bundles the D30 catch at the wave-owner, so this surfaces as [[ERROR,e]] on the node
-        // (R-reentrancy), NOT a propagated panic (the externally-called rejects DO panic).
-        let a = Node::<i32>::state(1);
-        let x = Node::<i32>::state(9);
-        let slot: Rc<RefCell<Option<Node<i32>>>> = Rc::new(RefCell::new(None));
-        let slot2 = slot.clone();
-        let d: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
-            if let Some(dh) = slot2.borrow().as_ref() {
-                // mid-fn self-rewire — illegal (R-rewire / D37)
-                dh.subscribe_dep(x.erased(), |c| c.emit(*c.data::<i32>(0).unwrap()));
-            }
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
-        });
-        *slot.borrow_mut() = Some(d.clone());
-        let (log, sink) = recorder();
-        let _u = d.subscribe(sink); // activate → fn → mid-fn subscribe_dep → reject → wave-owner → ERROR
-        assert_eq!(d.status().output, crate::OutputStatus::Errored);
-        assert!(
-            log.borrow().iter().any(|k| k == "ERROR"),
-            "mid-fn rewire surfaces as ERROR (got {:?})",
-            *log.borrow()
-        );
-    }
-
-    #[test]
-    fn rewire_fnswap_frees_old_fn_handle() {
-        // B32 (rewire fn-swap GC): a rewire re-registers the fn → a new handle and
-        // unregisters the OLD handle, freeing the rewired-away closure + its captures.
-        struct DropFlag(Rc<Cell<bool>>);
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.0.set(true);
-            }
-        }
-        let old_fn_dropped = Rc::new(Cell::new(false));
-        let a = Node::<i32>::state(1);
-        let guard = DropFlag(old_fn_dropped.clone());
-        let d: Node<i32> = Node::derived(vec![a.erased()], move |ctx| {
-            let _hold = &guard; // the OLD fn captures the guard
-            ctx.emit(*ctx.data::<i32>(0).unwrap());
-        });
-        let _u = d.subscribe(|_| {});
-        assert!(!old_fn_dropped.get(), "old fn is live before the swap");
-
-        d.replace_deps(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap())
-        }); // fn swap
-        assert!(
-            old_fn_dropped.get(),
-            "the rewired-away fn (and its capture) is freed on swap (B32)"
-        );
-    }
-
-    #[test]
-    fn rewire_panic_in_added_dep_activation_does_not_wedge_node() {
-        // QA-F1 regression: adding a dep whose ACTIVATION fn panics. The wave-owner catch
-        // blames the added producer (its fn ran) → ERROR lands on IT. The partially
-        // registered edge is rolled back so `boom` does not retain an orphaned subscriber.
-        // Without the DepMutationGuard, `d` would be left in_dep_mutation=true forever
-        // → every future maybe_run defers (never recomputes) + every future rewire is
-        // rejected as reentrant. With the guard `d` recovers cleanly.
-        //
-        // `d` ABSORBS a dep error (errorWhenDepsError:false) so this test isolates the QA-F1
-        // GUARD concern (in_dep_mutation cleared on the unwind, observed via the recompute
-        // below) from the orthogonal R-deps-terminal auto-error-cascade (C-15): under the
-        // default errorWhenDepsError:true, boom's activation-panic→ERROR would correctly
-        // cascade and TERMINATE d, making "d recovers" un-observable. The guard fires on the
-        // unwind identically either way; absorbing just keeps d alive to prove it.
-        let a = Node::<i32>::state(1);
-        let d: Node<i32> = Node::derived_opts(
-            vec![a.erased()],
-            NodeOpts {
-                error: Policy::Manual,
-                ..NodeOpts::default()
-            },
-            |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()),
-        );
-        let (_log, sink) = recorder();
-        let _u = d.subscribe(sink);
-        assert_eq!(d.cache(), Some(1));
-
-        // boom: a producer whose activation fn panics — added as a dep of d.
-        let boom = Node::<i32>::producer(|_ctx| panic!("boom on activation"));
-        d.subscribe_dep(boom.erased(), |ctx| ctx.emit(*ctx.data::<i32>(0).unwrap()));
-
-        // R-failure: the panic in boom's first run is boom's ERROR; nothing unwinds into
-        // the rewire, and boom stays d's (ended) dependency.
-        assert_eq!(boom.status().output, crate::OutputStatus::Errored);
-        assert_eq!(boom.core.subscriber_count(), 1);
-
-        // d is NOT terminal; the QA-F1 guard cleared in_dep_mutation on the unwind so
-        // d is not wedged.
-        assert_ne!(
-            d.status().output,
-            crate::OutputStatus::Errored,
-            "d absorbs the dep error (errorWhenDepsError:false) and survives the rewire panic"
-        );
-
-        // NOT WEDGED: d still recomputes from its live dep a (in_dep_mutation was cleared by
-        // the guard on the unwind). Without the guard this stays Some(1) (deferred forever).
-        a.set(5);
-        assert_eq!(
-            d.cache(),
-            Some(5),
-            "d recovers and recomputes — a stuck in_dep_mutation would have deferred this"
-        );
-
-        // And a follow-up rewire is NOT rejected as reentrant (the flag is clear).
-        d.replace_deps(vec![a.erased()], |ctx| {
-            ctx.emit(*ctx.data::<i32>(0).unwrap() * 2)
-        });
-        a.set(3);
-        assert_eq!(
-            d.cache(),
-            Some(6),
-            "a later rewire works (not 'reentrant'-rejected)"
-        );
-    }
 
     #[test]
     fn d109_default_v0_advances_only_on_data() {

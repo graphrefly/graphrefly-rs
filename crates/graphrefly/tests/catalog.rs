@@ -2641,7 +2641,7 @@ fn throttle_waits_for_open_window_before_source_complete() {
 }
 
 #[test]
-fn throttle_completion_window_survives_deactivation_without_resubscribing_source() {
+fn throttle_reactivation_starts_a_new_lifetime_on_the_completed_snapshot() {
     let driver = Rc::new(ManualDriver::default());
     let g = graphrefly::graph_opts(GraphOptions {
         environment: EnvironmentDrivers::new().with_local_async(driver.clone()),
@@ -2710,15 +2710,14 @@ fn throttle_completion_window_survives_deactivation_without_resubscribing_source
             }
         });
 
-    assert!(
-        second_events.borrow().is_empty(),
-        "reactivation should not duplicate the leading DATA from the completed source"
-    );
+    // R-lifetime@2: deactivation dropped the private state, so the new lifetime runs
+    // on the completed source's snapshot and its leading DATA goes out again.
+    assert_eq!(*second_events.borrow(), vec!["DATA:1"]);
     driver.fire_sleepers();
     assert_eq!(
         *second_events.borrow(),
-        vec!["COMPLETE"],
-        "the retained helper timer should close the pending completion window"
+        vec!["DATA:1", "COMPLETE"],
+        "the new lifetime's timer closes the completion window"
     );
     assert_eq!(
         throttled.status().output,

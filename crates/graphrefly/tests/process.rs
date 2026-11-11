@@ -291,7 +291,7 @@ fn process_bundle_surfaces_reducer_failures_without_mutating_state() {
 }
 
 #[test]
-#[ignore = "phase 5 of graphrefly-rs:D797-KERNEL-MIGRATION-RS: the host cleared the command cone with an INVALIDATE on the computed command node, which the D797 kernel does not allow; the command input's shape is decided with the host-level rewire call sites"]
+#[ignore = "checkpoint stage of graphrefly-rs:D797-KERNEL-MIGRATION-RS (graphrefly:D802, graphrefly-rs:D5): the process command input and fact nodes retain their last non-JSON value under R-subscription@3, so whether and how a process bundle is checkpointed is decided with R-checkpoint@1"]
 fn process_bundle_keeps_runtime_state_checkpoint_friendly() {
     let g = graph();
     let process = graphrefly::process_bundle::<i32, ProcessState, String, String>(

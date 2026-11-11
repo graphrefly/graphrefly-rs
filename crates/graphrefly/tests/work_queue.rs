@@ -246,7 +246,8 @@ fn explicit_expiry_retry_and_dead_letter_are_recorded() {
     )));
     let dead = queue.dead_letter();
     let _dead_sub = dead.snapshot.subscribe(|_| {});
-    dead.snapshot_request.set(Default::default());
+    dead.snapshot_request
+        .set(graphrefly::WorkQueueDeadLetterParams::default());
     assert_eq!(dead.snapshot.cache().unwrap().entries.len(), 1);
 }
 
