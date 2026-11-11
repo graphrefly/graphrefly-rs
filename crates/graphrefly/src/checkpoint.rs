@@ -58,21 +58,6 @@ pub type GraphCheckpointJson = Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-/// `GraphCheckpointValue` variants.
-pub enum GraphCheckpointValue {
-    #[serde(rename = "SENTINEL")]
-    /// `Sentinel` variant.
-    Sentinel,
-    #[serde(rename = "DATA")]
-    /// `Data` variant.
-    Data {
-        /// `data` field for `Data`.
-        data: GraphCheckpointJson,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
 /// `GraphCheckpointTerminal` variants.
 pub enum GraphCheckpointTerminal {
     #[serde(rename = "none")]
