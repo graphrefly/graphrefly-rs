@@ -324,7 +324,7 @@ fn memory_retrieval_bundle_exposes_snapshot_and_projection_topology() {
         MemoryRetrievalBundleOptions::new(fragments.clone(), query.clone()).named("memory"),
     );
 
-    let edges = g.topology().edges;
+    let edges = graphrefly::topology::snapshot(&g).edges();
     assert!(edges
         .iter()
         .any(|edge| edge.from == "fragments" && edge.to == "memory/snapshot"));
@@ -337,7 +337,7 @@ fn memory_retrieval_bundle_exposes_snapshot_and_projection_topology() {
     assert!(edges
         .iter()
         .any(|edge| edge.from == "memory/snapshot" && edge.to == "memory/status"));
-    let described = g.topology();
+    let described = graphrefly::topology::snapshot(&g);
     assert!(described
         .nodes
         .iter()
@@ -685,21 +685,21 @@ fn agentic_memory_bundle_projects_records_to_retrieval_and_context_metadata() {
         AgenticMemoryBundleOptions::new(records.clone(), query.clone()).named("memory"),
     );
 
-    let described = g.topology();
+    let described = graphrefly::topology::snapshot(&g);
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "records" && edge.to == "memory/projection"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "memory/projection" && edge.to == "memory/fragments"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "memory/fragments" && edge.to == "memory/retrieval/snapshot"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "memory/retrieval/snapshot" && edge.to == "memory/context"));
     assert!(described
@@ -941,13 +941,13 @@ fn agentic_memory_kg_projection_validates_drafts_and_exposes_topology() {
         &g,
         AgenticMemoryKgProjectionBundleOptions::new(records, drafts).named("kg"),
     );
-    let described = g.topology();
+    let described = graphrefly::topology::snapshot(&g);
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "records" && edge.to == "kg/snapshot"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "drafts" && edge.to == "kg/snapshot"));
     assert!(described
@@ -1300,17 +1300,17 @@ fn agentic_memory_context_packing_is_deterministic_and_projection_only() {
         )
         .named("packing"),
     );
-    let described = g.topology();
+    let described = graphrefly::topology::snapshot(&g);
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "memory/context" && edge.to == "packing/snapshot"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "texts" && edge.to == "packing/snapshot"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "policy" && edge.to == "packing/snapshot"));
 
@@ -1458,13 +1458,13 @@ fn knowledge_graph_reducer_materializes_entities_and_errors() {
             .with_policy(policy.node().clone())
             .named("kg"),
     );
-    let described = g.topology();
+    let described = graphrefly::topology::snapshot(&g);
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "assertions" && edge.to == "kg/snapshot"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "kg/snapshot" && edge.to == "kg/entities"));
     let _entities = bundle.entities.subscribe(|_| {});

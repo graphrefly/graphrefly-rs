@@ -1791,8 +1791,8 @@ fn c33_closed_lifetime_revokes_ctx_and_cleanup_failures_stay_isolated() {
 
 /// The current dependencies of `name`, as the graph describes them.
 fn deps_of(g: &graphrefly::Graph, name: &str) -> Vec<String> {
-    g.topology()
-        .edges
+    graphrefly::topology::snapshot(g)
+        .edges()
         .iter()
         .filter(|e| e.to == name)
         .map(|e| e.from.clone())
@@ -2804,9 +2804,8 @@ fn c38_capture_and_restore() {
         "no function runs at restore"
     );
     let edges = |g: &graphrefly::Graph| {
-        let mut e: Vec<(String, String)> = g
-            .topology()
-            .edges
+        let mut e: Vec<(String, String)> = graphrefly::topology::snapshot(g)
+            .edges()
             .into_iter()
             .map(|e| (e.from, e.to))
             .collect();
@@ -3139,9 +3138,8 @@ fn c38_replace_and_rewire_are_restored_as_the_instance() {
     .expect("restores after each node's dependencies");
     let rr = json_node(&restored, "r");
     let _ur = rr.subscribe(|_| {});
-    let deps: Vec<String> = restored
-        .topology()
-        .edges
+    let deps: Vec<String> = graphrefly::topology::snapshot(&restored)
+        .edges()
         .into_iter()
         .filter(|e| e.to == "r")
         .map(|e| e.from)
@@ -3621,12 +3619,12 @@ fn definition_and_describe_give_the_r_node_content() {
         .expect("the new instance's function");
     assert!(!Rc::ptr_eq(&first, &second), "replace gives a new function");
 
-    let described: Vec<(String, graphrefly::DescribeKind, Vec<String>, bool)> = g
-        .topology()
-        .nodes
-        .into_iter()
-        .map(|n| (n.id, n.kind, n.deps, n.quiet))
-        .collect();
+    let described: Vec<(String, graphrefly::DescribeKind, Vec<String>, bool)> =
+        graphrefly::topology::snapshot(&g)
+            .nodes
+            .into_iter()
+            .map(|n| (n.id, n.kind, n.deps, n.quiet))
+            .collect();
     assert_eq!(
         described,
         vec![
@@ -4785,6 +4783,17 @@ fn nested_batch_result_errors_follow_the_outer_body() {
 }
 
 #[test]
+fn checkpoint_received_records_require_values_and_terminal() {
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({"values": []}),
+        serde_json::json!({"terminal": "NONE"}),
+    ] {
+        assert!(serde_json::from_value::<graphrefly::GraphCheckpointInput>(invalid).is_err());
+    }
+}
+
+#[test]
 fn kept_state_reads_retiring_lifetime_only_during_cleanup() {
     for replace in [false, true] {
         let g = graphrefly::graph();
@@ -4819,17 +4828,6 @@ fn kept_state_reads_retiring_lifetime_only_during_cleanup() {
         }
         assert_eq!(*writes.borrow(), vec![vec![42]]);
         assert!(kept.borrow().as_ref().unwrap().state_get::<i32>().is_none());
-    }
-}
-
-#[test]
-fn checkpoint_received_records_require_values_and_terminal() {
-    for invalid in [
-        serde_json::json!({}),
-        serde_json::json!({"values": []}),
-        serde_json::json!({"terminal": "NONE"}),
-    ] {
-        assert!(serde_json::from_value::<graphrefly::GraphCheckpointInput>(invalid).is_err());
     }
 }
 

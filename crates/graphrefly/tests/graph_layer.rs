@@ -137,14 +137,14 @@ fn graph_producer_node_find_describe_and_observe_first_cut() {
         .iter()
         .any(|(id, _, values)| id == "source" && values == &vec![7]));
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     assert_eq!(snap.name.as_deref(), Some("demo"));
     let source_node = snap.nodes.iter().find(|n| n.id == "source").unwrap();
     let raw_node = snap.nodes.iter().find(|n| n.id == "raw").unwrap();
     assert_eq!(source_node.factory, "producer");
     assert_eq!(raw_node.factory, "node");
     assert_eq!(raw_node.deps, vec!["source"]);
-    assert!(snap.edges.contains(&TopologyEdge {
+    assert!(snap.edges().contains(&TopologyEdge {
         from: "source".to_owned(),
         to: "raw".to_owned(),
     }));
@@ -157,8 +157,7 @@ fn observe_topology_emits_registered_nodes_from_existing_registry() {
     let g = graph();
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = g
-        .observe_topology()
+    let observer = graphrefly::topology::observe(&g)
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
@@ -195,8 +194,7 @@ fn observe_topology_deps_changed_matches_describe_edges() {
     );
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = g
-        .observe_topology_path("d")
+    let observer = graphrefly::topology::observe_path(&g, "d")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
     d.replace(
@@ -216,14 +214,14 @@ fn observe_topology_deps_changed_matches_describe_edges() {
     assert_eq!(events[0].deps, vec!["b".to_owned()]);
     assert_eq!(events[0].seq, 0);
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     let d_node = snap.nodes.iter().find(|node| node.id == "d").unwrap();
     assert_eq!(d_node.deps, vec!["b".to_owned()]);
-    assert!(snap.edges.contains(&TopologyEdge {
+    assert!(snap.edges().contains(&TopologyEdge {
         from: "b".to_owned(),
         to: "d".to_owned(),
     }));
-    assert!(!snap.edges.contains(&TopologyEdge {
+    assert!(!snap.edges().contains(&TopologyEdge {
         from: "a".to_owned(),
         to: "d".to_owned(),
     }));
@@ -235,11 +233,10 @@ fn observe_topology_emits_mount_changed_from_parent_graph() {
     let child = graph();
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = parent
-        .observe_topology_path("sub")
+    let observer = graphrefly::topology::observe_path(&parent, "sub")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
-    parent.mount(child, "sub");
+    graphrefly::topology::mount(&parent, child, "sub");
 
     observer.unsubscribe();
     let events = events.borrow();
@@ -249,18 +246,21 @@ fn observe_topology_emits_mount_changed_from_parent_graph() {
     assert_eq!(events[0].deps, Vec::<String>::new());
     assert_eq!(events[0].factory.as_deref(), Some("mount"));
     assert_eq!(events[0].seq, 0);
-    assert!(parent.topology().subgraphs.unwrap()[0].nodes.is_empty());
+    assert!(
+        graphrefly::topology::snapshot(&parent).subgraphs.unwrap()[0]
+            .nodes
+            .is_empty()
+    );
 }
 
 #[test]
 fn observe_topology_forwards_mounted_child_events_with_parent_paths() {
     let parent = graph();
     let child = graph();
-    parent.mount(child.clone(), "sub");
+    graphrefly::topology::mount(&parent, child.clone(), "sub");
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = parent
-        .observe_topology_path("sub")
+    let observer = graphrefly::topology::observe_path(&parent, "sub")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
     let a = child.state_opts(1i32, GraphNodeOpts::named("a"));
@@ -302,7 +302,7 @@ fn observe_topology_forwards_mounted_child_events_with_parent_paths() {
     assert_eq!(events[3].deps, vec!["sub::b".to_owned()]);
     assert_eq!(events[3].seq, 3);
 
-    let snap = parent.topology();
+    let snap = graphrefly::topology::snapshot(&parent);
     let subgraph = snap.subgraphs.unwrap().remove(0);
     let d_node = subgraph
         .nodes
@@ -316,11 +316,10 @@ fn observe_topology_forwards_mounted_child_events_with_parent_paths() {
 fn observe_topology_stops_forwarding_mounted_child_events_after_unsubscribe() {
     let parent = graph();
     let child = graph();
-    parent.mount(child.clone(), "sub");
+    graphrefly::topology::mount(&parent, child.clone(), "sub");
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = parent
-        .observe_topology()
+    let observer = graphrefly::topology::observe(&parent)
         .subscribe(move |event| event_sink.borrow_mut().push(event));
     observer.unsubscribe();
 
@@ -338,10 +337,9 @@ fn topology_group_creates_registered_child_nodes_and_release_removes_them() {
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = g
-        .observe_topology()
+    let observer = graphrefly::topology::observe(&g)
         .subscribe(move |event| event_sink.borrow_mut().push(event));
-    let group = g.topology_group_opts(TopologyGroupOptions::named("view"));
+    let group = graphrefly::topology::group_opts(&g, TopologyGroupOptions::named("view"));
 
     let delta = group.derived_opts(
         vec![source.erased()],
@@ -356,8 +354,7 @@ fn topology_group_creates_registered_child_nodes_and_release_removes_them() {
 
     assert!(g.find("view.delta").is_some());
     assert!(g.find("view.snapshot").is_some());
-    let describe_ids = g
-        .topology()
+    let describe_ids = graphrefly::topology::snapshot(&g)
         .nodes
         .into_iter()
         .map(|node| node.id)
@@ -365,7 +362,9 @@ fn topology_group_creates_registered_child_nodes_and_release_removes_them() {
     assert!(describe_ids.contains(&"source".to_owned()));
     assert!(describe_ids.contains(&"view.delta".to_owned()));
     assert!(describe_ids.contains(&"view.snapshot".to_owned()));
-    assert!(g.profile().nodes.contains_key("view.delta"));
+    assert!(graphrefly::topology::profile(&g)
+        .nodes
+        .contains_key("view.delta"));
     assert!(g
         .checkpoint()
         .unwrap()
@@ -402,12 +401,13 @@ fn topology_group_creates_registered_child_nodes_and_release_removes_them() {
     assert_eq!(events[3].seq, 3);
 
     assert!(g.find("view.delta").is_none());
-    assert!(!g
-        .topology()
+    assert!(!graphrefly::topology::snapshot(&g)
         .nodes
         .iter()
         .any(|node| node.id == "view.delta"));
-    assert!(!g.profile().nodes.contains_key("view.delta"));
+    assert!(!graphrefly::topology::profile(&g)
+        .nodes
+        .contains_key("view.delta"));
     assert!(!g
         .checkpoint()
         .unwrap()
@@ -427,7 +427,7 @@ fn topology_group_creates_registered_child_nodes_and_release_removes_them() {
 #[test]
 fn topology_group_add_accepts_only_registered_nodes_from_owning_graph() {
     let g = graph();
-    let group = g.topology_group_opts(TopologyGroupOptions::named("view"));
+    let group = graphrefly::topology::group_opts(&g, TopologyGroupOptions::named("view"));
     let registered = g.state_opts(1i32, GraphNodeOpts::named("registered"));
     let added = group.add(&registered);
     assert_eq!(added.cache(), Some(1));
@@ -437,10 +437,10 @@ fn topology_group_add_accepts_only_registered_nodes_from_owning_graph() {
     let other = graph().state_opts(1i32, GraphNodeOpts::named("other"));
     assert!(catch_unwind(AssertUnwindSafe(|| group.add(&other))).is_err());
 
-    let released_group = g.topology_group();
+    let released_group = graphrefly::topology::group(&g);
     let temp = released_group.state_opts(1i32, GraphNodeOpts::named("temp"));
     released_group.release();
-    let fresh_group = g.topology_group();
+    let fresh_group = graphrefly::topology::group(&g);
     assert!(catch_unwind(AssertUnwindSafe(|| fresh_group.add(&temp))).is_err());
 }
 
@@ -448,7 +448,7 @@ fn topology_group_add_accepts_only_registered_nodes_from_owning_graph() {
 fn topology_group_release_rejects_external_deps_and_subscribers() {
     let g = graph();
 
-    let dep_group = g.topology_group_opts(TopologyGroupOptions::named("dep"));
+    let dep_group = graphrefly::topology::group_opts(&g, TopologyGroupOptions::named("dep"));
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
     let child = dep_group.derived_opts(
         vec![source.erased()],
@@ -464,7 +464,7 @@ fn topology_group_release_rejects_external_deps_and_subscribers() {
     assert!(!dep_group.is_released());
     assert!(g.find("dep.child").is_some());
 
-    let sub_group = g.topology_group_opts(TopologyGroupOptions::named("sub"));
+    let sub_group = graphrefly::topology::group_opts(&g, TopologyGroupOptions::named("sub"));
     let subscribed = sub_group.state_opts(1i32, GraphNodeOpts::named("sub.child"));
     let unsub = subscribed.subscribe(|_| {});
     assert!(catch_unwind(AssertUnwindSafe(|| sub_group.release())).is_err());
@@ -491,8 +491,7 @@ fn observe_topology_is_read_only_and_separate_from_protocol_observe() {
     );
     let topology_events = Rc::new(RefCell::new(Vec::new()));
     let topology_sink = topology_events.clone();
-    let topology_observer = g
-        .observe_topology()
+    let topology_observer = graphrefly::topology::observe(&g)
         .subscribe(move |event| topology_sink.borrow_mut().push(event.kind));
 
     topology_observer.unsubscribe();
@@ -515,8 +514,7 @@ fn observe_topology_stops_after_unsubscribe() {
     let g = graph();
     let events = Rc::new(RefCell::new(Vec::new()));
     let event_sink = events.clone();
-    let observer = g
-        .observe_topology()
+    let observer = graphrefly::topology::observe(&g)
         .subscribe(move |event| event_sink.borrow_mut().push(event.path));
     observer.unsubscribe();
 
@@ -538,16 +536,15 @@ fn observe_topology_delivers_nested_events_fifo_and_isolates_panics() {
     let late_handles = late_observers.clone();
     let added_flag = added.clone();
     let graph_for_nested = g.clone();
-    let _first_observer = g.observe_topology().subscribe(move |event| {
+    let _first_observer = graphrefly::topology::observe(&g).subscribe(move |event| {
         first_sink
             .borrow_mut()
             .push(format!("{}:{}", event.path, event.seq));
         if !added_flag.get() {
             added_flag.set(true);
             let late_events = late_sink.clone();
-            let late_observer = graph_for_nested
-                .observe_topology()
-                .subscribe(move |late_event| {
+            let late_observer =
+                graphrefly::topology::observe(&graph_for_nested).subscribe(move |late_event| {
                     late_events
                         .borrow_mut()
                         .push(format!("{}:{}", late_event.path, late_event.seq));
@@ -557,7 +554,7 @@ fn observe_topology_delivers_nested_events_fifo_and_isolates_panics() {
         }
     });
     let second_sink = second.clone();
-    let _second_observer = g.observe_topology().subscribe(move |event| {
+    let _second_observer = graphrefly::topology::observe(&g).subscribe(move |event| {
         second_sink
             .borrow_mut()
             .push(format!("{}:{}", event.path, event.seq));
@@ -588,14 +585,14 @@ fn observe_topology_skips_observer_unsubscribed_before_its_turn() {
     let second = Rc::new(RefCell::new(Vec::new()));
     let second_observer = Rc::new(RefCell::new(None::<graphrefly::GraphTopologyObserver>));
     let second_handle = second_observer.clone();
-    let _first = g.observe_topology().subscribe(move |_| {
+    let _first = graphrefly::topology::observe(&g).subscribe(move |_| {
         if let Some(observer) = second_handle.borrow_mut().take() {
             observer.unsubscribe();
         }
     });
     let second_sink = second.clone();
     *second_observer.borrow_mut() = Some(
-        g.observe_topology()
+        graphrefly::topology::observe(&g)
             .subscribe(move |event| second_sink.borrow_mut().push(event.path)),
     );
 
@@ -621,7 +618,7 @@ fn graph_diagnostics_reachable_walks_deterministically() {
     let sink = g.effect_opts(vec![a.erased()], |_| None, GraphNodeOpts::named("sink"));
     let _keep_active = sink.subscribe(|_| {});
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     assert_eq!(
         reachable(
             &snap,
@@ -698,7 +695,7 @@ fn graph_diagnostics_explain_path_and_islands_are_pure_snapshot_helpers() {
         GraphNodeOpts::named("c"),
     );
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     let chain = explain_path(&snap, "a", "c", ExplainPathOptions::default());
     assert!(chain.found);
     assert_eq!(chain.reason, ExplainPathReason::Ok);
@@ -756,9 +753,9 @@ fn graph_diagnostics_explain_path_and_islands_are_pure_snapshot_helpers() {
         GraphNodeOpts::named("leafD"),
     );
     child.state_opts(9i32, GraphNodeOpts::named("orphan"));
-    parent.mount(child, "child");
+    graphrefly::topology::mount(&parent, child, "child");
 
-    let islands = validate_no_islands(&parent.topology());
+    let islands = validate_no_islands(&graphrefly::topology::snapshot(&parent));
     assert!(!islands.ok);
     assert_eq!(
         islands.orphans,
@@ -777,7 +774,7 @@ fn graph_diagnostics_explain_path_and_islands_are_pure_snapshot_helpers() {
 fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
     let g = graph();
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
-    let prev = g.topology();
+    let prev = graphrefly::topology::snapshot(&g);
 
     let mut opts = GraphNodeOpts::named("mapped");
     opts.meta.insert("role".to_owned(), "projection".to_owned());
@@ -786,7 +783,7 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
         |values| Some(*last_or_prev(values, 0).unwrap() + 1),
         opts,
     );
-    let next = g.topology();
+    let next = graphrefly::topology::snapshot(&g);
     let diff = topology_diff(&prev, &next);
 
     assert!(diff.events.iter().any(|event| matches!(
@@ -801,7 +798,9 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
 
     source.set(2);
     assert!(
-        topology_diff(&next, &g.topology()).events.is_empty(),
+        topology_diff(&next, &graphrefly::topology::snapshot(&g))
+            .events
+            .is_empty(),
         "value/status changes are observe/profile data, not topology"
     );
 
@@ -833,9 +832,9 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
 
     let child = graph_opts(GraphOptions::named("child"));
     child.state_opts(1i32, GraphNodeOpts::named("leaf"));
-    let before_mount = g.topology();
-    g.mount(child, "child");
-    let mounted = topology_diff(&before_mount, &g.topology());
+    let before_mount = graphrefly::topology::snapshot(&g);
+    graphrefly::topology::mount(&g, child, "child");
+    let mounted = topology_diff(&before_mount, &graphrefly::topology::snapshot(&g));
     assert!(mounted.events.iter().any(|event| matches!(
         event,
         DescribeEvent::SubgraphMounted { path } if path == "child"
@@ -846,9 +845,9 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
     )));
 
     let empty_child = graph_opts(GraphOptions::named("ignored-child-name"));
-    let before_empty_mount = g.topology();
-    g.mount(empty_child, "empty");
-    let empty_mounted = topology_diff(&before_empty_mount, &g.topology());
+    let before_empty_mount = graphrefly::topology::snapshot(&g);
+    graphrefly::topology::mount(&g, empty_child, "empty");
+    let empty_mounted = topology_diff(&before_empty_mount, &graphrefly::topology::snapshot(&g));
     assert!(empty_mounted.events.iter().any(|event| matches!(
         event,
         DescribeEvent::SubgraphMounted { path } if path == "empty"
@@ -856,7 +855,7 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
 
     let mut removed = next.clone();
     removed.nodes.retain(|node| node.id != "mapped");
-    removed.edges.clear();
+    removed.edges().clear();
     let removed_diff = topology_diff(&next, &removed);
     assert!(removed_diff.events.iter().any(|event| matches!(
         event,
@@ -889,15 +888,11 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 name: None,
                 factory: "derived".to_owned(),
                 kind: graphrefly::DescribeKind::Node,
-                deps: vec![],
+                deps: vec!["x".to_owned()],
                 quiet: false,
                 meta: None,
             },
         ],
-        edges: vec![TopologyEdge {
-            from: "x".to_owned(),
-            to: "y".to_owned(),
-        }],
         subgraphs: None,
     };
     assert_eq!(
@@ -937,19 +932,9 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 name: None,
                 factory: "derived".to_owned(),
                 kind: graphrefly::DescribeKind::Node,
-                deps: vec![],
+                deps: vec!["missing".to_owned()],
                 quiet: false,
                 meta: None,
-            },
-        ],
-        edges: vec![
-            TopologyEdge {
-                from: "x".to_owned(),
-                to: "missing".to_owned(),
-            },
-            TopologyEdge {
-                from: "missing".to_owned(),
-                to: "y".to_owned(),
             },
         ],
         subgraphs: None,
@@ -987,16 +972,6 @@ fn graph_diagnostics_accept_synthetic_snapshots_and_cycles() {
                 deps: vec!["a".to_owned()],
                 quiet: false,
                 meta: None,
-            },
-        ],
-        edges: vec![
-            TopologyEdge {
-                from: "b".to_owned(),
-                to: "a".to_owned(),
-            },
-            TopologyEdge {
-                from: "a".to_owned(),
-                to: "b".to_owned(),
             },
         ],
         subgraphs: None,
@@ -1119,8 +1094,8 @@ fn restore_registry_definitions_rebuild_declared_json_map_nodes() {
         json_cache(restored.find("double").expect("double restored")),
         json!(6)
     );
-    let snap = restored.topology();
-    assert!(snap.edges.contains(&TopologyEdge {
+    let snap = graphrefly::topology::snapshot(&restored);
+    assert!(snap.edges().contains(&TopologyEdge {
         from: "source".to_owned(),
         to: "double".to_owned(),
     }));
@@ -1215,9 +1190,9 @@ fn describe_mount_prefixes_child_graph() {
     let child = graph_opts(GraphOptions::named("child"));
     child.state_opts(2i32, GraphNodeOpts::named("leaf"));
 
-    parent.mount(child, "sub");
+    graphrefly::topology::mount(&parent, child, "sub");
 
-    let snap = parent.topology();
+    let snap = graphrefly::topology::snapshot(&parent);
     let sub = snap.subgraphs.unwrap().into_iter().next().unwrap();
     assert!(sub.nodes.iter().any(|n| n.id == "sub::leaf"));
 }
@@ -1226,15 +1201,15 @@ fn describe_mount_prefixes_child_graph() {
 #[should_panic(expected = "duplicate mount path")]
 fn mount_rejects_duplicate_paths() {
     let parent = graph();
-    parent.mount(graph(), "sub");
-    parent.mount(graph(), "sub");
+    graphrefly::topology::mount(&parent, graph(), "sub");
+    graphrefly::topology::mount(&parent, graph(), "sub");
 }
 
 #[test]
 #[should_panic(expected = "graph cycle")]
 fn mount_rejects_cycles() {
     let parent = graph();
-    parent.mount(parent.clone(), "self");
+    graphrefly::topology::mount(&parent, parent.clone(), "self");
 }
 
 #[test]
@@ -1242,7 +1217,7 @@ fn observe_traverses_mounted_graphs_with_prefixed_paths() {
     let parent = graph();
     let child = graph();
     let leaf = child.state_opts(2i32, GraphNodeOpts::named("leaf"));
-    parent.mount(child, "sub");
+    graphrefly::topology::mount(&parent, child, "sub");
 
     let (observed, observer) = observe_log(&parent, &["sub::leaf"]);
 
@@ -1393,18 +1368,21 @@ fn describe_explain_and_renderers_are_pure_snapshot_functions() {
     g.state_opts(99i32, GraphNodeOpts::named("unrelated"));
     let _keep_alive = sink.subscribe(|_| {});
 
-    let explain = g.topology_opts(TopologyOpts {
-        explain: Some(Explain {
-            from: "source".to_owned(),
-            to: "sink".to_owned(),
-        }),
-    });
+    let explain = graphrefly::topology::snapshot_opts(
+        &g,
+        TopologyOpts {
+            explain: Some(Explain {
+                from: "source".to_owned(),
+                to: "sink".to_owned(),
+            }),
+        },
+    );
     assert!(explain.nodes.iter().any(|n| n.id == "source"));
     assert!(explain.nodes.iter().any(|n| n.id == "mapped"));
     assert!(explain.nodes.iter().any(|n| n.id == "sink"));
     assert!(!explain.nodes.iter().any(|n| n.id == "unrelated"));
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     assert!(topology_to_mermaid(&snap).contains("flowchart LR"));
     assert!(topology_to_d2(&snap).contains("direction: right"));
     assert!(topology_to_pretty(&snap).contains("source (state)"));
@@ -1423,7 +1401,7 @@ fn renderers_respect_direction() {
         GraphNodeOpts::named("sink"),
     );
     let _keep_alive = sink.subscribe(|_| {});
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
 
     assert!(
         topology_to_mermaid_with_direction(&snap, DiagramDirection::Td).starts_with("flowchart TD")
@@ -1459,7 +1437,7 @@ fn describe_includes_discovered_same_graph_deps_with_synthetic_ids() {
     );
     let _keep_alive = sink.subscribe(|_| {});
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     let timeout_nodes = snap
         .nodes
         .iter()
@@ -1484,15 +1462,15 @@ fn describe_includes_discovered_same_graph_deps_with_synthetic_ids() {
     let timer_id = timer_nodes[0].id.clone();
     assert!(timeout_nodes[0].deps.contains(&"source".to_owned()));
     assert!(timeout_nodes[0].deps.contains(&timer_id));
-    assert!(snap.edges.contains(&TopologyEdge {
+    assert!(snap.edges().contains(&TopologyEdge {
         from: "source".to_owned(),
         to: timeout_id.clone(),
     }));
-    assert!(snap.edges.contains(&TopologyEdge {
+    assert!(snap.edges().contains(&TopologyEdge {
         from: timer_id,
         to: timeout_id.clone(),
     }));
-    assert!(snap.edges.contains(&TopologyEdge {
+    assert!(snap.edges().contains(&TopologyEdge {
         from: timeout_id.clone(),
         to: "sink".to_owned(),
     }));
@@ -1522,14 +1500,17 @@ fn explain_filters_mounted_subgraphs_without_leaking_unrelated_nodes() {
     );
     child.state_opts(5i32, GraphNodeOpts::named("child_unrelated"));
     let _keep_alive = sink.subscribe(|_| {});
-    parent.mount(child, "sub");
+    graphrefly::topology::mount(&parent, child, "sub");
 
-    let explain = parent.topology_opts(TopologyOpts {
-        explain: Some(Explain {
-            from: "sub::source".to_owned(),
-            to: "sub::sink".to_owned(),
-        }),
-    });
+    let explain = graphrefly::topology::snapshot_opts(
+        &parent,
+        TopologyOpts {
+            explain: Some(Explain {
+                from: "sub::source".to_owned(),
+                to: "sub::sink".to_owned(),
+            }),
+        },
+    );
 
     assert_eq!(explain.subgraphs, None);
     let ids = explain
@@ -1539,7 +1520,7 @@ fn explain_filters_mounted_subgraphs_without_leaking_unrelated_nodes() {
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["sub::source", "sub::sink"]);
     assert_eq!(
-        explain.edges,
+        explain.edges(),
         vec![TopologyEdge {
             from: "sub::source".to_owned(),
             to: "sub::sink".to_owned()
@@ -1566,7 +1547,7 @@ fn profile_enabled_graph_defaults_to_default_dispatcher_and_injection_isolates()
     let _keep_alive = doubled.subscribe(|_| {});
     source.set(2);
     assert!(
-        g.profile().nodes["doubled"].invokes >= 2,
+        graphrefly::topology::profile(&g).nodes["doubled"].invokes >= 2,
         "profile:true records through the default dispatcher when no dispatcher is injected"
     );
 
@@ -1588,7 +1569,7 @@ fn profile_enabled_graph_defaults_to_default_dispatcher_and_injection_isolates()
     let _keep_alive = doubled.subscribe(|_| {});
     source.set(2);
 
-    let profile = g.profile();
+    let profile = graphrefly::topology::profile(&g);
     assert_eq!(profile.nodes["source"].invokes, 0);
     assert!(profile.nodes["doubled"].invokes >= 2);
 
@@ -1602,7 +1583,7 @@ fn profile_enabled_graph_defaults_to_default_dispatcher_and_injection_isolates()
     let _keep_alive = doubled.subscribe(|_| {});
     source.set(2);
     assert_eq!(
-        unprofiled_default.profile().nodes["doubled"].invokes,
+        graphrefly::topology::profile(&unprofiled_default).nodes["doubled"].invokes,
         0,
         "explicit injection records on the injected dispatcher, not the default"
     );
@@ -1624,7 +1605,7 @@ fn profile_counts_graph_registered_invokes_when_enabled() {
     let _keep_alive = doubled.subscribe(|_| {});
     source.set(2);
 
-    let profile = g.profile();
+    let profile = graphrefly::topology::profile(&g);
     assert!(profile.total_invokes >= 2);
     assert_eq!(profile.nodes["source"].invokes, 0);
     assert!(profile.nodes["doubled"].invokes >= 2);
@@ -1648,10 +1629,10 @@ fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
         |values| Some(*last_or_prev(values, 0).unwrap() * 2),
         GraphNodeOpts::named("doubled"),
     );
-    parent.mount(child, "sub");
+    graphrefly::topology::mount(&parent, child, "sub");
     let _keep_doubled = doubled.subscribe(|_| {});
 
-    let profile = parent.profile();
+    let profile = graphrefly::topology::profile(&parent);
     assert!(profile.nodes.contains_key("sub::leaf"));
     assert!(profile.nodes["sub::doubled"].invokes >= 1);
 
@@ -1668,7 +1649,7 @@ fn profile_uses_mount_aware_paths_and_counts_panicking_invokes() {
         result.is_ok(),
         "D30 catch boundary converts the user panic to ERROR"
     );
-    let profile = panics.profile();
+    let profile = graphrefly::topology::profile(&panics);
     assert_eq!(profile.nodes["bad"].invokes, 1);
     assert_eq!(
         profile.nodes["bad"].status.output,
@@ -1694,8 +1675,8 @@ fn profile_summary_rolls_up_existing_profile_and_describe_facts() {
     source.set(1);
     source.set(2);
 
-    let described = g.topology();
-    let profile = g.profile();
+    let described = graphrefly::topology::snapshot(&g);
+    let profile = graphrefly::topology::profile(&g);
     let summary = profile_summary_from_snapshots(
         &described,
         &profile,
@@ -1719,10 +1700,11 @@ fn profile_summary_rolls_up_existing_profile_and_describe_facts() {
         profile.nodes["doubled"].invokes
     );
 
-    let profile_again = g.profile();
-    let described_again = g.topology();
+    let profile_again = graphrefly::topology::profile(&g);
+    let described_again = graphrefly::topology::snapshot(&g);
     assert_eq!(
-        described_again.edges, described.edges,
+        described_again.edges(),
+        described.edges(),
         "profile summary is inspection-only and must not change describe-visible edges"
     );
     assert_eq!(
@@ -1749,8 +1731,7 @@ fn profile_summary_does_not_activate_cold_nodes_or_create_topology_events() {
     );
     let topology_events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let topology_sink = topology_events.clone();
-    let observer = g
-        .observe_topology()
+    let observer = graphrefly::topology::observe(&g)
         .subscribe(move |event| topology_sink.borrow_mut().push(event));
 
     let summary = profile_summary(&g, ProfileSummaryOptions::default());
@@ -1814,7 +1795,7 @@ fn first_operator_and_source_slice_is_graph_visible() {
     assert!(events.borrow().contains(&"DATA:4".to_owned()));
     assert!(events.borrow().contains(&"COMPLETE".to_owned()));
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     let factory = |id: &str| {
         snap.nodes
             .iter()

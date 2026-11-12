@@ -227,7 +227,7 @@ fn process_bundle_topology_is_describe_visible_with_declared_deps() {
         }),
     );
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     let process_command = snap
         .nodes
         .iter()
@@ -247,7 +247,7 @@ fn process_bundle_topology_is_describe_visible_with_declared_deps() {
     assert_eq!(process_runtime.deps, vec!["process/command"]);
     assert_eq!(process_effect.deps, vec!["process/runtime"]);
     assert!(snap
-        .edges
+        .edges()
         .iter()
         .any(|edge| { edge.from == "process/command" && edge.to == "process/runtime" }));
 }
@@ -511,17 +511,17 @@ fn process_effect_runner_projects_result_commands_through_declared_process_edge(
         })
     );
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     assert!(snap
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "order/effect_request" && edge.to == "notify/requests"));
     assert!(snap
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "notify/outcomeFacts" && edge.to == "notify/runtime"));
     assert!(snap
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "notify/commands" && edge.to == "order/command"));
 }
@@ -705,13 +705,13 @@ fn process_effect_runner_command_source_fan_in_accepts_multiple_runners() {
         process.state.cache(),
         Some(vec!["left-effect".to_owned(), "right-effect".to_owned()])
     );
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     assert!(snap
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "left/commands" && edge.to == "process/command"));
     assert!(snap
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "right/commands" && edge.to == "process/command"));
 }
@@ -754,9 +754,8 @@ fn process_effect_runner_release_is_idempotent_and_retryable_after_release_failu
         Some(1),
         "release rollback must not replay cached runner.commands"
     );
-    assert!(g
-        .topology()
-        .edges
+    assert!(graphrefly::topology::snapshot(&g)
+        .edges()
         .iter()
         .any(|edge| edge.from == "work/commands" && edge.to == "process/command"));
 
@@ -772,9 +771,8 @@ fn process_effect_runner_release_is_idempotent_and_retryable_after_release_failu
     runner.release();
     assert!(g.find("work/runtime").is_none());
     assert!(g.find("work/commands").is_none());
-    assert!(!g
-        .topology()
-        .edges
+    assert!(!graphrefly::topology::snapshot(&g)
+        .edges()
         .iter()
         .any(|edge| edge.from == "work/commands" && edge.to == "process/command"));
 

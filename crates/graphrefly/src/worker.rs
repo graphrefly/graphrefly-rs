@@ -194,9 +194,9 @@ mod tests {
                 graph_thread
             );
 
-            let snap = g.topology();
+            let snap = crate::topology::snapshot(&g);
             assert!(snap
-                .edges
+                .edges()
                 .iter()
                 .any(|edge| edge.from == "source" && edge.to == "worker"));
             assert!(snap

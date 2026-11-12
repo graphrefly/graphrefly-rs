@@ -435,3 +435,5 @@ pub use work_queue::{
 };
 #[cfg(feature = "tokio-worker")]
 pub use worker::worker_derived;
+
+pub use graph::topology;

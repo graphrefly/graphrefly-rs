@@ -2258,7 +2258,7 @@ mod clean_slate_tests {
                 .with_topics(["orders"])
                 .with_now(|| 10),
         );
-        let snap = g.topology();
+        let snap = crate::topology::snapshot(&g);
         for id in [
             "bus/commands",
             "bus/runtime",

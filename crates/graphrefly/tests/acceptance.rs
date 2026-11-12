@@ -510,17 +510,17 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
         .text
         .contains("[near] Durable project memory"));
 
-    let described = g.topology();
+    let described = graphrefly::topology::snapshot(&g);
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "records" && edge.to == "memory/projection"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "kg/assertions" && edge.to == "knowledgeGraph/snapshot"));
     assert!(described
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "memory/context" && edge.to == "packing/snapshot"));
 
@@ -633,12 +633,13 @@ fn public_crate_root_b72_sources_io_and_resilience_acceptance() {
         }]
     );
     assert!(completed.get());
-    assert!(g
-        .topology()
+    assert!(graphrefly::topology::snapshot(&g)
         .nodes
         .iter()
         .any(|node| { node.id == "acceptance/b72/sse" && node.factory == "fromSSE" }));
-    assert!(g.profile().nodes.contains_key("acceptance/b72/sse"));
+    assert!(graphrefly::topology::profile(&g)
+        .nodes
+        .contains_key("acceptance/b72/sse"));
 
     unsubscribe_sse();
 }
@@ -651,7 +652,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
         ..GraphOptions::default()
     });
     let source = g.state_opts(1_i32, GraphNodeOpts::named("acceptance/source"));
-    let before_pipe = g.topology();
+    let before_pipe = graphrefly::topology::snapshot(&g);
 
     let doubled = pipe(&g, source.node().clone())
         .through(map::<i32, i32>(|value| value * 2))
@@ -674,7 +675,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     source.set(2);
 
     assert_eq!(doubled_values.borrow().as_slice(), &[2, 4]);
-    let after_pipe = g.topology();
+    let after_pipe = graphrefly::topology::snapshot(&g);
     let pipe_diff = topology_diff(&before_pipe, &after_pipe);
     assert!(pipe_diff.events.iter().any(|event| matches!(
         event,
@@ -724,15 +725,14 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
             .into_iter()
             .collect()
     );
-    let with_view = g.topology();
+    let with_view = graphrefly::topology::snapshot(&g);
     assert!(with_view.nodes.iter().any(|node| {
         node.id == "acceptance/items.select#0.delta" && node.factory == "reactiveMap.select.delta"
     }));
-    assert!(with_view.edges.iter().any(|edge| {
+    assert!(with_view.edges().iter().any(|edge| {
         edge.from == "acceptance/items.delta" && edge.to == "acceptance/items.select#0.delta"
     }));
-    assert!(g
-        .profile()
+    assert!(graphrefly::topology::profile(&g)
         .nodes
         .contains_key("acceptance/items.select#0.delta"));
     assert!(g
@@ -744,7 +744,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
 
     unsubscribe_selected_snapshot();
     selected.dispose();
-    let after_dispose = g.topology();
+    let after_dispose = graphrefly::topology::snapshot(&g);
     let dispose_diff = topology_diff(&with_view, &after_dispose);
     assert!(dispose_diff.events.iter().any(|event| matches!(
         event,
@@ -1002,9 +1002,8 @@ fn public_crate_root_d566_environment_resilience_acceptance() {
         vec![("x-graphrefly".to_owned(), "d566".to_owned())]
     );
     assert_eq!(WebSocketSend::binary([1_u8, 2, 3]).data, vec![1, 2, 3]);
-    assert!(g
-        .topology()
-        .edges
+    assert!(graphrefly::topology::snapshot(&g)
+        .edges()
         .iter()
         .any(|edge| { edge.from == "acceptance/env/source" && edge.to == "acceptance/env/http" }));
 }

@@ -2993,7 +2993,7 @@ fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() 
     assert_eq!(*statuses.borrow(), vec![CascadingCacheStatus::Idle]);
     request.set("user:1".to_owned());
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     let mut ids = snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>();
     ids.sort_unstable();
     assert_eq!(
@@ -3007,19 +3007,19 @@ fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() 
         ]
     );
     // The request sequence is a ledger the bundle owns (review Q13).
-    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
+    assert!(snap.edges().contains(&graphrefly::TopologyEdge {
         from: "cache.ledger".to_owned(),
         to: "cache.events".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
+    assert!(snap.edges().contains(&graphrefly::TopologyEdge {
         from: "request".to_owned(),
         to: "cache.events".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
+    assert!(snap.edges().contains(&graphrefly::TopologyEdge {
         from: "cache.events".to_owned(),
         to: "cache.status".to_owned(),
     }));
-    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
+    assert!(snap.edges().contains(&graphrefly::TopologyEdge {
         from: "cache.events".to_owned(),
         to: "cache.value".to_owned(),
     }));

@@ -184,7 +184,7 @@ fn flatten_for_diff(snapshot: &TopologySnapshot) -> FlatSnapshot {
         for node in &snapshot.nodes {
             flat.nodes.insert(node.id.clone(), node.clone());
         }
-        for edge in &snapshot.edges {
+        for edge in &snapshot.edges() {
             flat.edges
                 .insert((edge.from.clone(), edge.to.clone()), edge.clone());
         }
@@ -293,8 +293,8 @@ pub fn topology_diff(prev: &TopologySnapshot, next: &TopologySnapshot) -> Descri
 /// existing `describe()` and `profile()` snapshots; the actual rollup is pure over those facts.
 #[must_use]
 pub fn profile_summary(graph: &Graph, options: ProfileSummaryOptions) -> ProfileSummary {
-    let snapshot = graph.topology();
-    let profile = graph.profile();
+    let snapshot = crate::topology::snapshot(graph);
+    let profile = crate::topology::profile(graph);
     profile_summary_from_snapshots(&snapshot, &profile, options)
 }
 
@@ -393,7 +393,7 @@ fn index_snapshot(snapshot: &TopologySnapshot) -> SnapshotIndex {
 }
 
 fn index_snapshot_edges(snapshot: &TopologySnapshot, idx: &mut SnapshotIndex) {
-    for edge in &snapshot.edges {
+    for edge in &snapshot.edges() {
         if idx.nodes.contains_key(&edge.from) && idx.nodes.contains_key(&edge.to) {
             add_edge(&mut idx.outgoing, &edge.from, &edge.to);
             add_edge(&mut idx.incoming, &edge.to, &edge.from);

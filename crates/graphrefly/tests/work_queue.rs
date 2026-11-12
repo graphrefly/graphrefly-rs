@@ -107,7 +107,7 @@ fn admits_submitted_work_through_message_bus_and_acks_after_record() {
         cursor.borrow().last().map(|cursor| cursor.next_seq),
         Some(2)
     );
-    let describe = g.topology();
+    let describe = graphrefly::topology::snapshot(&g);
     assert!(
         describe
             .nodes

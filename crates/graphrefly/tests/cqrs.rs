@@ -318,12 +318,12 @@ fn cqrs_projection_is_declared_and_reducer_panics_are_error_facts() {
         cqrs_event_id("cmd-1", 2)
     );
 
-    let snap = g.topology();
+    let snap = graphrefly::topology::snapshot(&g);
     assert!(snap
         .nodes
         .iter()
         .any(|node| node.id == "orders/count" && node.factory == "cqrsProjection"));
-    assert!(snap.edges.contains(&graphrefly::TopologyEdge {
+    assert!(snap.edges().contains(&graphrefly::TopologyEdge {
         from: "orders/events".to_owned(),
         to: "orders/count".to_owned(),
     }));

@@ -593,7 +593,7 @@ impl<TCommand: Clone + 'static, TEffect: Clone + 'static, TResult: Clone + 'stat
         ];
         let release_ids = self.release_node_ids();
         let release_id_set = release_ids.iter().cloned().collect::<HashSet<_>>();
-        for edge in self.graph.topology().edges {
+        for edge in crate::topology::snapshot(&self.graph).edges() {
             if !release_id_set.contains(&edge.from) || release_id_set.contains(&edge.to) {
                 continue;
             }

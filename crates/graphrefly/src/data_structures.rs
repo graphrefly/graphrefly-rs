@@ -2089,9 +2089,10 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
     materialize_snapshot: F,
     on_dispose: Option<ViewDisposeHook>,
 ) -> ReactiveView<C, S> {
-    let group = graph.topology_group_opts(TopologyGroupOptions::named(
-        name.clone().unwrap_or_else(|| factories.group.to_owned()),
-    ));
+    let group = crate::topology::group_opts(
+        graph,
+        TopologyGroupOptions::named(name.clone().unwrap_or_else(|| factories.group.to_owned())),
+    );
     let delta_op = Operator::with_opts(
         factories.delta,
         NodeOpts {

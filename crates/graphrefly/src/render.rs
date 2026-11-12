@@ -183,7 +183,7 @@ pub fn topology_to_json(snapshot: &TopologySnapshot) -> String {
 
 fn flatten(snapshot: &TopologySnapshot) -> (Vec<TopologyNode>, Vec<TopologyEdge>) {
     let mut nodes = snapshot.nodes.clone();
-    let mut edges = snapshot.edges.clone();
+    let mut edges = snapshot.edges();
     for child in snapshot.subgraphs.iter().flatten() {
         let (mut child_nodes, mut child_edges) = flatten(child);
         nodes.append(&mut child_nodes);

@@ -409,20 +409,6 @@ impl Graph {
         }
     }
 
-    pub fn name(&self) -> Option<&str> {
-        self.inner.name.as_deref()
-    }
-
-    /// D152 graph-owned topology/release group. Members are ordinary registered
-    /// graph nodes and release is quiescent-only; no protocol messages are synthesized.
-    pub fn topology_group(&self) -> TopologyGroup {
-        self.topology_group_opts(TopologyGroupOptions::default())
-    }
-
-    pub fn topology_group_opts(&self, opts: TopologyGroupOptions) -> TopologyGroup {
-        TopologyGroup::new(self.clone(), opts)
-    }
-
     /// Look up a registered graph node by stable id.
     pub fn find(&self, id: &str) -> Option<GraphNode> {
         self.core_at(id).map(GraphNode::new)
@@ -629,32 +615,6 @@ impl Graph {
         self.add(node, op.factory, opts)
     }
 
-    /// Mount a child graph under a stable `::` path prefix.
-    pub fn mount(&self, child: Graph, at: impl Into<String>) {
-        let at = at.into();
-        assert!(!at.is_empty(), "mount path must not be empty");
-        assert!(
-            !child.contains_graph(self),
-            "mount would create a graph cycle"
-        );
-        assert!(
-            !self.inner.mounts.borrow().iter().any(|m| m.at == at),
-            "duplicate mount path '{at}'"
-        );
-        if self.inner.profile_enabled.get() {
-            child.enable_profile_recorder_recursive();
-        }
-        self.inner.mounts.borrow_mut().push(Mount {
-            at: at.clone(),
-            graph: child,
-            topology_observer: RefCell::new(None),
-        });
-        if self.has_topology_observers() {
-            self.ensure_mounted_topology_forwarders();
-        }
-        self.emit_topology_mount_changed(at);
-    }
-
     /// The graph's topology as data (R-graph-surface@1, R-node@2): every node in
     /// creation order as `{ id, kind, deps, quiet }` and nothing else; `deps` are the
     /// current dependencies, a ctx.rewire's included. A value or a status is read from
@@ -670,23 +630,6 @@ impl Graph {
                 quiet: node.quiet,
             })
             .collect()
-    }
-
-    /// This package's own topology view for rendering and diagnostics: describe's
-    /// nodes with their factory, name and annotations, the edges and the mounted
-    /// graphs (D39). Not part of R-graph-surface; values and status are read from the
-    /// node.
-    pub fn topology(&self) -> TopologySnapshot {
-        self.topology_opts(TopologyOpts::default())
-    }
-
-    pub fn topology_opts(&self, opts: TopologyOpts) -> TopologySnapshot {
-        let snap = self.topology_with_prefix("");
-        if let Some(explain) = opts.explain {
-            explain_subset(snap, &explain)
-        } else {
-            snap
-        }
     }
 
     /// Subscribes `sink` to each node in `ids` as an ordinary subscriber
@@ -743,35 +686,6 @@ impl Graph {
         let core = self.core_at(id);
         let core = core.unwrap_or_else(|| panic!("retain: no node '{id}'"));
         Node::<AnyValue>::from_core(core).subscribe(|_| {})
-    }
-
-    /// D145 read-only topology lifecycle egress over the existing graph registry.
-    ///
-    /// This is not a graph node, does not subscribe to nodes, and does not publish DATA.
-    pub fn observe_topology(&self) -> TopologyStream {
-        TopologyStream {
-            graph: self.clone(),
-            path: None,
-        }
-    }
-
-    /// Read-only topology lifecycle egress for one registered id or `::` subtree prefix.
-    pub fn observe_topology_path(&self, path: &str) -> TopologyStream {
-        TopologyStream {
-            graph: self.clone(),
-            path: Some(path.to_owned()),
-        }
-    }
-
-    /// Opt-in accumulated-counter snapshot (D39/R-profile).
-    pub fn profile(&self) -> Profile {
-        let mut total_invokes = 0;
-        let mut nodes = BTreeMap::new();
-        self.collect_profile("", &mut nodes, &mut total_invokes);
-        Profile {
-            total_invokes,
-            nodes,
-        }
     }
 
     fn collect_profile(
@@ -884,7 +798,7 @@ impl Graph {
     }
 
     pub(crate) fn mount_restored(&self, child: Graph, at: String) {
-        self.mount(child, at);
+        crate::topology::mount(self, child, at);
     }
 
     fn add<T: 'static>(&self, node: Node<T>, factory: &str, opts: GraphNodeOpts) -> Node<T> {
@@ -1274,7 +1188,7 @@ impl Graph {
             }
             let parent = parent.clone();
             let mount_path = mount.at.clone();
-            let observer = mount.graph.observe_topology().subscribe(move |event| {
+            let observer = crate::topology::observe(&mount.graph).subscribe(move |event| {
                 if let Some(inner) = parent.upgrade() {
                     Graph { inner }.emit_mounted_topology_event(&mount_path, event);
                 }
@@ -1357,7 +1271,6 @@ impl Graph {
     fn topology_with_prefix(&self, prefix: &str) -> TopologySnapshot {
         let entries = self.inner.entries.borrow().clone();
         let mut nodes = Vec::with_capacity(entries.len());
-        let mut edges = Vec::new();
         let mut discovered: Vec<Core> = Vec::new();
         for entry in &entries {
             let id = format!("{prefix}{}", entry.id);
@@ -1374,12 +1287,6 @@ impl Graph {
                     self.id_for_core(dep, prefix)
                 })
                 .collect();
-            for dep_id in &deps {
-                edges.push(TopologyEdge {
-                    from: dep_id.clone(),
-                    to: id.clone(),
-                });
-            }
             nodes.push(TopologyNode {
                 id,
                 name: entry.name.clone(),
@@ -1416,12 +1323,6 @@ impl Graph {
                     self.id_for_core(dep, prefix)
                 })
                 .collect();
-            for dep_id in &deps {
-                edges.push(TopologyEdge {
-                    from: dep_id.clone(),
-                    to: id.clone(),
-                });
-            }
             nodes.push(TopologyNode {
                 id,
                 name: None,
@@ -1447,7 +1348,6 @@ impl Graph {
         TopologySnapshot {
             name: self.inner.name.clone(),
             nodes,
-            edges,
             subgraphs: if subgraphs.is_empty() {
                 None
             } else {
@@ -1632,8 +1532,22 @@ impl GraphNode {
 pub struct TopologySnapshot {
     pub name: Option<String>,
     pub nodes: Vec<TopologyNode>,
-    pub edges: Vec<TopologyEdge>,
     pub subgraphs: Option<Vec<TopologySnapshot>>,
+}
+
+impl TopologySnapshot {
+    /// Derive edges from the ordered dependencies; nodes are the only stored source.
+    pub fn edges(&self) -> Vec<TopologyEdge> {
+        self.nodes
+            .iter()
+            .flat_map(|node| {
+                node.deps.iter().map(|dep| TopologyEdge {
+                    from: dep.clone(),
+                    to: node.id.clone(),
+                })
+            })
+            .collect()
+    }
 }
 
 /// One node of [`Graph::describe`] (R-graph-surface@1): exactly its id, kind,
@@ -1825,7 +1739,7 @@ fn explain_subset(snapshot: TopologySnapshot, explain: &Explain) -> TopologySnap
     let snapshot = flatten_describe_snapshot(snapshot);
     let mut fwd: HashMap<String, Vec<String>> = HashMap::new();
     let mut rev: HashMap<String, Vec<String>> = HashMap::new();
-    for edge in &snapshot.edges {
+    for edge in snapshot.edges() {
         fwd.entry(edge.from.clone())
             .or_default()
             .push(edge.to.clone());
@@ -1842,11 +1756,10 @@ fn explain_subset(snapshot: TopologySnapshot, explain: &Explain) -> TopologySnap
             .nodes
             .into_iter()
             .filter(|node| on_path.contains(&node.id))
-            .collect(),
-        edges: snapshot
-            .edges
-            .into_iter()
-            .filter(|edge| on_path.contains(&edge.from) && on_path.contains(&edge.to))
+            .map(|mut node| {
+                node.deps.retain(|dep| on_path.contains(dep));
+                node
+            })
             .collect(),
         subgraphs: None,
     }
@@ -1857,7 +1770,6 @@ fn flatten_describe_snapshot(mut snapshot: TopologySnapshot) -> TopologySnapshot
         for child in subgraphs {
             let mut child = flatten_describe_snapshot(child);
             snapshot.nodes.append(&mut child.nodes);
-            snapshot.edges.append(&mut child.edges);
         }
     }
     snapshot
@@ -1943,8 +1855,7 @@ mod tests {
         u();
         let events = Rc::new(RefCell::new(Vec::new()));
         let event_sink = events.clone();
-        let observer = g
-            .observe_topology()
+        let observer = crate::topology::observe(&g)
             .subscribe(move |event| event_sink.borrow_mut().push(event));
 
         g.release_nodes(&[panic_node.erased()], "test");
@@ -1963,7 +1874,7 @@ mod tests {
     #[test]
     fn release_nodes_still_rejects_public_subscribers() {
         let g = graph();
-        let group = g.topology_group_opts(TopologyGroupOptions::named("child"));
+        let group = crate::topology::group_opts(&g, TopologyGroupOptions::named("child"));
         let child = group.state_opts(1, GraphNodeOpts::named("child/value"));
         let public_subscriber = child.subscribe(|_| {});
         let observer = g.observe(&["child/value"], |_| {});
@@ -1978,5 +1889,96 @@ mod tests {
             g.find("child/value").is_none(),
             "after public subscriber detaches, release can proceed"
         );
+    }
+}
+
+/// Optional topology and profiling utilities. They do not activate nodes.
+pub mod topology {
+    use super::*;
+
+    pub fn name(graph: &Graph) -> Option<&str> {
+        graph.inner.name.as_deref()
+    }
+
+    /// D152 graph-owned topology/release group. Members are ordinary registered
+    /// graph nodes and release is quiescent-only; no protocol messages are synthesized.
+    pub fn group(graph: &Graph) -> TopologyGroup {
+        crate::topology::group_opts(graph, TopologyGroupOptions::default())
+    }
+
+    pub fn group_opts(graph: &Graph, opts: TopologyGroupOptions) -> TopologyGroup {
+        TopologyGroup::new(graph.clone(), opts)
+    }
+
+    /// Mount a child graph under a stable `::` path prefix.
+    pub fn mount(graph: &Graph, child: Graph, at: impl Into<String>) {
+        let at = at.into();
+        assert!(!at.is_empty(), "mount path must not be empty");
+        assert!(
+            !child.contains_graph(graph),
+            "mount would create a graph cycle"
+        );
+        assert!(
+            !graph.inner.mounts.borrow().iter().any(|m| m.at == at),
+            "duplicate mount path '{at}'"
+        );
+        if graph.inner.profile_enabled.get() {
+            child.enable_profile_recorder_recursive();
+        }
+        graph.inner.mounts.borrow_mut().push(Mount {
+            at: at.clone(),
+            graph: child,
+            topology_observer: RefCell::new(None),
+        });
+        if graph.has_topology_observers() {
+            graph.ensure_mounted_topology_forwarders();
+        }
+        graph.emit_topology_mount_changed(at);
+    }
+
+    /// This package's own topology view for rendering and diagnostics: describe's
+    /// nodes with their factory, name and annotations, the edges and the mounted
+    /// graphs (D39). Not part of R-graph-surface; values and status are read from the
+    /// node.
+    pub fn snapshot(graph: &Graph) -> TopologySnapshot {
+        crate::topology::snapshot_opts(graph, TopologyOpts::default())
+    }
+
+    pub fn snapshot_opts(graph: &Graph, opts: TopologyOpts) -> TopologySnapshot {
+        let snap = graph.topology_with_prefix("");
+        if let Some(explain) = opts.explain {
+            explain_subset(snap, &explain)
+        } else {
+            snap
+        }
+    }
+
+    /// D145 read-only topology lifecycle egress over the existing graph registry.
+    ///
+    /// This is not a graph node, does not subscribe to nodes, and does not publish DATA.
+    pub fn observe(graph: &Graph) -> TopologyStream {
+        TopologyStream {
+            graph: graph.clone(),
+            path: None,
+        }
+    }
+
+    /// Read-only topology lifecycle egress for one registered id or `::` subtree prefix.
+    pub fn observe_path(graph: &Graph, path: &str) -> TopologyStream {
+        TopologyStream {
+            graph: graph.clone(),
+            path: Some(path.to_owned()),
+        }
+    }
+
+    /// Opt-in accumulated-counter snapshot (D39/R-profile).
+    pub fn profile(graph: &Graph) -> Profile {
+        let mut total_invokes = 0;
+        let mut nodes = BTreeMap::new();
+        graph.collect_profile("", &mut nodes, &mut total_invokes);
+        Profile {
+            total_invokes,
+            nodes,
+        }
     }
 }

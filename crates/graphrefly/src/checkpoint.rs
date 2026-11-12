@@ -1160,7 +1160,7 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
         .collect::<RestoreResult<Vec<_>>>()?;
     Ok(GraphCheckpoint {
         version: GRAPH_CHECKPOINT_VERSION.to_owned(),
-        name: graph.name().map(str::to_owned),
+        name: crate::topology::name(graph).map(str::to_owned),
         nodes,
         edges,
         mounts: if mounts.is_empty() {
@@ -2012,7 +2012,7 @@ mod tests {
         let parent = crate::graph::graph();
         let child = crate::graph::graph();
         child.state_opts(json!(1), GraphNodeOpts::named("leaf"));
-        parent.mount(child, "child");
+        crate::topology::mount(&parent, child, "child");
         let mut checkpoint = parent.checkpoint().expect("checkpoint succeeds");
         checkpoint.mounts.as_mut().expect("mount exists")[0]
             .at

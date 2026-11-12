@@ -3483,7 +3483,7 @@ mod tests {
             bridge.status.cache().unwrap().state,
             WireBridgeStatusState::Closed
         );
-        let snap = g.topology();
+        let snap = crate::topology::snapshot(&g);
         let mut ids = snap
             .nodes
             .iter()
@@ -3510,15 +3510,15 @@ mod tests {
         // The status counters are a ledger the bundle owns (Q13); the event fold is
         // held for the graph's life and keeps its sequence in its private state.
         assert!(snap
-            .edges
+            .edges()
             .iter()
             .any(|edge| edge.from == "bridge/statusLedger" && edge.to == "bridge/status"));
         assert!(snap
-            .edges
+            .edges()
             .iter()
             .any(|edge| edge.from == "bridge/command" && edge.to == "bridge/events"));
         assert!(snap
-            .edges
+            .edges()
             .iter()
             .any(|edge| edge.from == "bridge/inbound" && edge.to == "bridge/events"));
     }

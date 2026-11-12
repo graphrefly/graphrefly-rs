@@ -250,15 +250,15 @@ fn remote_call_sends_request_facts_and_projects_later_response() {
         "D147: late/unknown responses are bridge facts but not remote_call results"
     );
 
-    let snapshot = g.topology();
+    let snapshot = graphrefly::topology::snapshot(&g);
     assert!(snapshot.nodes.iter().any(|node| node.id == "rpc/responses"));
     assert!(snapshot.nodes.iter().any(|node| node.id == "rpc/results"));
     assert!(snapshot
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "bridge/events" && edge.to == "rpc/responses"));
     assert!(snapshot
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "rpc/responses" && edge.to == "rpc/results"));
 }
@@ -694,13 +694,13 @@ fn remote_responder_invokes_sync_handler_and_sends_response_through_bridge_comma
         "remote responder command helper must publish DATA facts, not protocol ERROR"
     );
 
-    let snapshot = g.topology();
+    let snapshot = graphrefly::topology::snapshot(&g);
     assert!(snapshot
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "bridge/inbound" && edge.to == "responder/events"));
     assert!(snapshot
-        .edges
+        .edges()
         .iter()
         .any(|edge| edge.from == "responder/events" && edge.to == "responder/responseCommands"));
 }
@@ -969,9 +969,8 @@ fn remote_responder_release_detaches_response_commands_from_long_lived_bridge() 
     responder.release();
 
     assert!(g.find("responder/responseCommands").is_none());
-    assert!(!g
-        .topology()
-        .edges
+    assert!(!graphrefly::topology::snapshot(&g)
+        .edges()
         .iter()
         .any(|edge| { edge.from == "responder/responseCommands" && edge.to == "bridge/command" }));
     bridge.inbound.set(envelope_with_request(
