@@ -219,6 +219,58 @@ fn main() {
             json!(restored.err().unwrap().to_string()),
         );
     }
+    let mut quiet_errors = Vec::new();
+    for invalidate in [Policy::Auto, Policy::Manual] {
+        for retained in [true, false] {
+            let g = graph();
+            let a = g.state(1i32);
+            let b = g.state(1i32);
+            let q = g.node_opts::<i32, _>(
+                vec![a.erased()],
+                move |ctx| {
+                    if retained {
+                        if let Some(value) = ctx.dep(0).value::<i32>() {
+                            ctx.emit(*value);
+                        }
+                    }
+                },
+                GraphNodeOpts::named("q").with_node(NodeOpts {
+                    quiet: true,
+                    invalidate,
+                    ..NodeOpts::default()
+                }),
+            );
+            let d = g.node::<i32, _>(vec![q.erased(), b.erased()], |ctx| {
+                if let (Some(a), Some(b)) = (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>()) {
+                    ctx.emit(*a + *b);
+                }
+            });
+            let data: Values = Rc::default();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let _stop = d.subscribe({
+                let (data, events) = (data.clone(), events.clone());
+                move |msgs| {
+                    data.borrow_mut().extend(values(msgs));
+                    events.borrow_mut().extend(
+                        msgs.iter()
+                            .filter(|m| !matches!(m, Message::Pending | Message::Data(_)))
+                            .map(|m| format!("{m:?}")),
+                    );
+                }
+            });
+            data.borrow_mut().clear();
+            events.borrow_mut().clear();
+            g.batch(|| -> Result<(), ()> {
+                a.invalidate();
+                a.error("boom");
+                b.set(2);
+                Ok(())
+            })
+            .unwrap();
+            quiet_errors.push(json!({"invalidate": if invalidate == Policy::Auto {"auto"} else {"manual"}, "retained":retained, "values":*data.borrow(), "events":*events.borrow()}));
+        }
+    }
+    result.insert("quietError".into(), json!(quiet_errors));
     let root = std::env::var_os("GRAPHREFLY_SPEC_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

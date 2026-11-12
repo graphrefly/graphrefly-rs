@@ -2966,22 +2966,16 @@ impl Core {
                 invalidated_first,
                 error,
             } => {
-                let mut end = Vec::new();
-                if invalidated_first {
-                    end.push(vec![Message::Invalidate]);
-                }
-                end.push(vec![Message::Error(error.to_string().into())]);
-                if self.with_config(|cfg| cfg.quiet) {
-                    // A quiet node's output is a later wave: the INVALIDATE goes with
-                    // the ERROR (R-wave).
-                    self.with_inner_edges_mut(|_, e| e.wave.pending = false);
-                    let lifetime = self.open_lifetime();
-                    if lifetime.is_some() {
-                        self.publish_later(lifetime, end);
-                    }
-                    return;
-                }
-                self.publish(end);
+                let lead = if invalidated_first {
+                    self.apply_out(vec![vec![Message::Invalidate]])
+                } else {
+                    Vec::new()
+                };
+                self.finish_settle(
+                    lead,
+                    vec![vec![Message::Error(error.to_string().into())]],
+                    self.with_config(|cfg| cfg.quiet),
+                );
             }
             SettlePlan::Run {
                 invalidated,
@@ -3008,30 +3002,35 @@ impl Core {
                 } else {
                     Vec::new()
                 };
-                if quiet {
-                    // What a quiet node outputs is a later wave of its own, a request
-                    // made through its lifetime; only an auto INVALIDATE goes on now
-                    // (R-wave). Its pending mark is cleared first, so that INVALIDATE
-                    // marks its cone pending and a diamond below settles once.
-                    self.with_inner_edges_mut(|_, e| e.wave.pending = false);
-                    if !lead.is_empty() {
-                        self.deliver_out(lead);
-                    }
-                    let lifetime = self.open_lifetime();
-                    if lifetime.is_some() {
-                        let mut output = out;
-                        output.extend(postlude);
-                        self.publish_later(lifetime, output);
-                    }
-                    return;
-                }
                 let mut tail = out;
                 tail.extend(postlude);
-                let mut all = lead;
-                all.extend(self.apply_out(tail));
-                self.deliver_out(all);
+                self.finish_settle(lead, tail, quiet);
             }
         }
+    }
+
+    fn finish_settle(
+        &self,
+        lead: Vec<Vec<Message<AnyValue>>>,
+        tail: Vec<Vec<Message<AnyValue>>>,
+        quiet: bool,
+    ) {
+        if quiet {
+            // Both ordinary settlement and auto ERROR forward effective INVALIDATE
+            // now. Only the function/terminal output belongs to a later lifetime wave.
+            self.with_inner_edges_mut(|_, e| e.wave.pending = false);
+            if !lead.is_empty() {
+                self.deliver_out(lead);
+            }
+            let lifetime = self.open_lifetime();
+            if lifetime.is_some() {
+                self.publish_later(lifetime, tail);
+            }
+            return;
+        }
+        let mut all = lead;
+        all.extend(self.apply_out(tail));
+        self.deliver_out(all);
     }
 
     /// A lifetime's first run, on the dependencies' snapshots (R-lifetime@2). The kernel

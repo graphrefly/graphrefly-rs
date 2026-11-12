@@ -4981,3 +4981,115 @@ fn restore_factory_errors_and_missing_dependencies_identify_the_node() {
         "not restorable: n: missing received records"
     );
 }
+
+#[test]
+fn quiet_auto_error_invalidates_before_sibling_data_for_both_policies() {
+    use graphrefly::{graph, GraphNodeOpts, NodeOpts, Policy};
+    use serde_json::json;
+    type Values = Rc<RefCell<Vec<i32>>>;
+    fn values(msgs: &[Message<AnyValue>]) -> Vec<i32> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Message::Data(v) => v.downcast_ref::<i32>().copied(),
+                _ => None,
+            })
+            .collect()
+    }
+    let mut result = serde_json::Map::new();
+    let mut quiet_errors = Vec::new();
+    for invalidate in [Policy::Auto, Policy::Manual] {
+        for retained in [true, false] {
+            let g = graph();
+            let a = g.state(1i32);
+            let b = g.state(1i32);
+            let q = g.node_opts::<i32, _>(
+                vec![a.erased()],
+                move |ctx| {
+                    if retained {
+                        if let Some(value) = ctx.dep(0).value::<i32>() {
+                            ctx.emit(*value);
+                        }
+                    }
+                },
+                GraphNodeOpts::named("q").with_node(NodeOpts {
+                    quiet: true,
+                    invalidate,
+                    ..NodeOpts::default()
+                }),
+            );
+            let d = g.node::<i32, _>(vec![q.erased(), b.erased()], |ctx| {
+                if let (Some(a), Some(b)) = (ctx.dep(0).value::<i32>(), ctx.dep(1).value::<i32>()) {
+                    ctx.emit(*a + *b);
+                }
+            });
+            let data: Values = Rc::default();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let _stop = d.subscribe({
+                let (data, events) = (data.clone(), events.clone());
+                move |msgs| {
+                    data.borrow_mut().extend(values(msgs));
+                    events.borrow_mut().extend(
+                        msgs.iter()
+                            .filter(|m| !matches!(m, Message::Pending | Message::Data(_)))
+                            .map(|m| format!("{m:?}")),
+                    );
+                }
+            });
+            data.borrow_mut().clear();
+            events.borrow_mut().clear();
+            g.batch(|| -> Result<(), ()> {
+                a.invalidate();
+                a.error("boom");
+                b.set(2);
+                Ok(())
+            })
+            .unwrap();
+            quiet_errors.push(json!({"invalidate": if invalidate == Policy::Auto {"auto"} else {"manual"}, "retained":retained, "values":*data.borrow(), "events":*events.borrow()}));
+        }
+    }
+    result.insert("quietError".into(), json!(quiet_errors));
+
+    let expected: Vec<_> = ["auto", "manual"].into_iter().flat_map(|invalidate| [true, false].into_iter().map(move |retained| json!({"invalidate":invalidate,"retained":retained,"values":[],"events":[if retained {"INVALIDATE"} else {"RESOLVED"},"ERROR"]}))).collect();
+    assert_eq!(result["quietError"], json!(expected));
+}
+
+#[test]
+fn quiet_auto_error_later_output_is_revoked_when_invalidation_stops_lifetime() {
+    let g = graphrefly::graph();
+    let a = g.state(1i32);
+    let q = g.node_opts::<i32, _>(
+        vec![a.erased()],
+        |ctx| {
+            if let Some(v) = ctx.dep(0).value::<i32>() {
+                ctx.emit(*v);
+            }
+        },
+        named("q").with_node(quiet_opts()),
+    );
+    let stop: Rc<RefCell<Option<Unsub>>> = Rc::default();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    *stop.borrow_mut() = Some(q.subscribe({
+        let stop = stop.clone();
+        let events = events.clone();
+        move |msgs| {
+            for msg in msgs {
+                events.borrow_mut().push(format!("{msg:?}"));
+                if matches!(msg, Message::Invalidate) {
+                    if let Some(stop) = stop.borrow_mut().take() {
+                        stop();
+                    }
+                }
+            }
+        }
+    }));
+    events.borrow_mut().clear();
+    g.batch(|| -> Result<(), ()> {
+        a.invalidate();
+        a.error("boom");
+        Ok(())
+    })
+    .unwrap();
+    assert!(events.borrow().iter().any(|tag| tag == "INVALIDATE"));
+    assert!(!events.borrow().iter().any(|tag| tag == "ERROR"));
+    assert_eq!(q.status().output, graphrefly::OutputStatus::Open);
+}
