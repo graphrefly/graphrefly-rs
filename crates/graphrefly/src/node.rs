@@ -412,6 +412,7 @@ impl GraphArena {
 }
 
 struct GraphCore {
+    node_ids: std::collections::HashSet<String>,
     entries: Vec<ArenaEntry>,
     free: Vec<usize>,
     /// The domain's host reporter (R-failure@3, R-graph-domain@3).
@@ -504,6 +505,7 @@ fn with_wave<R>(d: &Domain, f: impl FnOnce(&RefCell<Option<WaveScope>>) -> R) ->
 impl GraphCore {
     fn new() -> Self {
         Self {
+            node_ids: std::collections::HashSet::new(),
             entries: Vec::new(),
             free: Vec::new(),
             reporter: None,
@@ -613,7 +615,13 @@ impl GraphCore {
     }
 
     fn take_live(&mut self, key: NodeKey) -> Option<NodeSlot> {
-        self.entry_mut(key)?.node.take()
+        let slot = self.entry_mut(key)?.node.take()?;
+        if !slot.topology.id_reserved {
+            if let Some(id) = &slot.topology.registered_id {
+                self.node_ids.remove(id);
+            }
+        }
+        Some(slot)
     }
 }
 
@@ -934,6 +942,7 @@ type TopologyDepsChangedObserver = Rc<dyn Fn(&[Core], &[Core])>;
 
 struct NodeTopologySlot {
     registered_id: Option<String>,
+    id_reserved: bool,
     /// The current dependencies: the declared ones, or a ctx.rewire's for the open
     /// lifetime (R-request-order@2).
     deps: Vec<Core>,
@@ -1989,18 +1998,46 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
 
 impl Core {
     pub(crate) fn graph_id(&self) -> String {
-        self.borrow().registered_id.clone().unwrap_or_else(|| {
-            format!(
-                "~{}#{}-{}",
-                self.factory().unwrap_or_else(|| "node".to_owned()),
-                self.id.0,
-                self.generation
-            )
-        })
+        let mut graph = self.graph.borrow_mut();
+        if let Some(id) = &graph.node(self.key()).topology.registered_id {
+            return id.clone();
+        }
+        let factory = graph
+            .node(self.key())
+            .call
+            .factory
+            .as_deref()
+            .unwrap_or("node");
+        let base = format!("~{factory}#{}-{}", self.id.0, self.generation);
+        let mut id = base.clone();
+        let mut suffix = 1;
+        while !graph.node_ids.insert(id.clone()) {
+            id = format!("{base}~{suffix}");
+            suffix += 1;
+        }
+        graph.node_mut(self.key()).topology.registered_id = Some(id.clone());
+        id
     }
 
     pub(crate) fn set_graph_id(&self, id: String) {
-        self.with_inner_edges_mut(|node, _| node.registered_id = Some(id));
+        let mut graph = self.graph.borrow_mut();
+        if graph.node(self.key()).topology.registered_id.as_ref() != Some(&id) {
+            assert!(
+                graph.node_ids.insert(id.clone()),
+                "duplicate graph node id '{id}'"
+            );
+            let old = graph
+                .node_mut(self.key())
+                .topology
+                .registered_id
+                .replace(id);
+            if let Some(old) = old {
+                graph.node_ids.remove(&old);
+            }
+        }
+        // Explicit graph registrations retain their D122 reservation after release;
+        // generated inner-node IDs are released with their arena slot.
+        graph.node_mut(self.key()).topology.id_reserved = true;
     }
 
     /// True when both handles name the same node (same graph arena, id and slot
@@ -2239,6 +2276,7 @@ impl Core {
         }
         let topology = NodeTopologySlot {
             registered_id: None,
+            id_reserved: false,
             declared: deps.clone(),
             deps,
             topology_deps_changed: None,
@@ -4195,6 +4233,23 @@ mod tests {
         fn batch<R, E>(&self, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
             crate::batch::batch_in(&self.0.domain(), f)
         }
+    }
+
+    #[test]
+    fn generated_id_claims_are_bounded_by_live_arena_nodes() {
+        let arena = TestArena::new();
+        for _ in 0..1000 {
+            let inner = arena.producer::<i32, _>(|_| {});
+            let id = inner.erased().graph_id();
+            assert!(arena.0 .0.borrow().node_ids.contains(&id));
+            assert_eq!(arena.0 .0.borrow().node_ids.len(), 1);
+            drop(inner);
+            assert!(arena.0 .0.borrow().node_ids.is_empty());
+        }
+        let named = arena.producer::<i32, _>(|_| {});
+        named.erased().set_graph_id("reserved".into());
+        drop(named);
+        assert!(arena.0 .0.borrow().node_ids.contains("reserved"));
     }
 
     /// Collect a subscriber's message-kind tags into a shared Vec for shape asserts.

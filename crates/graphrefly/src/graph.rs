@@ -425,28 +425,7 @@ impl Graph {
 
     /// Look up a registered graph node by stable id.
     pub fn find(&self, id: &str) -> Option<GraphNode> {
-        if let Some(core) = self.inner.by_id.borrow().get(id).cloned() {
-            return Some(GraphNode::new(core));
-        }
-        // Dynamic inner nodes share describe's identity without a second registry.
-        let mut pending: Vec<Core> = self
-            .inner
-            .entries
-            .borrow()
-            .iter()
-            .map(|entry| entry.core.clone())
-            .collect();
-        let mut seen = HashSet::new();
-        while let Some(core) = pending.pop() {
-            if !seen.insert(core.identity_key()) {
-                continue;
-            }
-            if core.graph_id() == id {
-                return Some(GraphNode::new(core));
-            }
-            pending.extend(core.deps());
-        }
-        None
+        self.core_at(id).map(GraphNode::new)
     }
 
     /// ctx-level power surface: the raw `(ctx)=>void` node factory.
@@ -1118,6 +1097,24 @@ impl Graph {
     fn core_at(&self, id: &str) -> Option<Core> {
         if let Some(core) = self.inner.by_id.borrow().get(id).cloned() {
             return Some(core);
+        }
+        // Dynamic inner nodes share describe's identity without a second registry.
+        let mut pending: Vec<Core> = self
+            .inner
+            .entries
+            .borrow()
+            .iter()
+            .map(|entry| entry.core.clone())
+            .collect();
+        let mut seen = HashSet::new();
+        while let Some(core) = pending.pop() {
+            if !seen.insert(core.identity_key()) {
+                continue;
+            }
+            if core.graph_id() == id {
+                return Some(core);
+            }
+            pending.extend(core.deps());
         }
         let (at, rest) = id.split_once("::")?;
         let child = self

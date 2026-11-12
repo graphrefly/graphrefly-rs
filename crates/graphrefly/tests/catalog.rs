@@ -4805,3 +4805,96 @@ fn higher_order_switch_projector_panic_detaches_previous_inner() {
         "terminal switch_map output should be sealed after projector panic"
     );
 }
+
+#[test]
+fn dynamic_dependency_ids_support_find_observe_and_retain() {
+    let driver = Rc::new(ManualDriver::default());
+    let g = graphrefly::graph_opts(GraphOptions {
+        environment: EnvironmentDrivers::new().with_local_async(driver),
+        ..GraphOptions::default()
+    });
+    let source = g.state(1i32);
+    let output = g.init_node(
+        debounce::<i32>(10),
+        vec![source.erased()],
+        GraphNodeOpts::named("debounced"),
+    );
+    let stop = output.subscribe(|_| {});
+    let dynamic: Vec<_> = g
+        .describe()
+        .into_iter()
+        .filter(|node| node.id.starts_with('~'))
+        .collect();
+    assert_eq!(
+        dynamic.len(),
+        2,
+        "the delayed value and timer are described"
+    );
+    for node in dynamic {
+        assert!(g.find(&node.id).is_some());
+        let received = Rc::new(Cell::new(0));
+        let observed = g.observe(&[&node.id], {
+            let received = received.clone();
+            move |event| {
+                assert!(event.msgs.iter().any(|m| matches!(m, Message::Start)));
+                received.set(received.get() + 1);
+            }
+        });
+        let held = g.retain(&node.id);
+        assert_eq!(received.get(), 1);
+        observed();
+        held();
+    }
+    stop();
+}
+
+#[test]
+fn dynamic_and_named_ids_cannot_collide_in_either_allocation_order() {
+    for named_first in [false, true] {
+        let driver = Rc::new(ManualDriver::default());
+        let g = graphrefly::graph_opts(GraphOptions {
+            environment: EnvironmentDrivers::new().with_local_async(driver),
+            ..GraphOptions::default()
+        });
+        // With a named state first, source and debounce occupy slots 1 and 2,
+        // so the timer's default candidate will be slot 3, generation 0.
+        let reserved = "~timer#3-0";
+        if named_first {
+            g.state_opts(99i32, GraphNodeOpts::named(reserved));
+        }
+        let source = g.state(1i32);
+        let output = g.init_node(
+            debounce::<i32>(10),
+            vec![source.erased()],
+            GraphNodeOpts::named("debounced"),
+        );
+        let stop = output.subscribe(|_| {});
+        let snapshot = g.topology();
+        let timer = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.factory == "timer")
+            .unwrap()
+            .id
+            .clone();
+        if named_first {
+            assert_ne!(timer, reserved, "generated IDs choose an unused candidate");
+            assert_eq!(
+                g.find(reserved).unwrap().as_state::<i32>().unwrap().cache(),
+                Some(99)
+            );
+        } else {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                g.state_opts(99i32, GraphNodeOpts::named(&timer))
+            }));
+            assert!(
+                refused.is_err(),
+                "named IDs cannot steal a described dynamic ID"
+            );
+            assert!(g.find(&timer).unwrap().as_state::<i32>().is_none());
+        }
+        let ids: std::collections::HashSet<_> = g.describe().into_iter().map(|n| n.id).collect();
+        assert_eq!(ids.len(), g.describe().len());
+        stop();
+    }
+}
