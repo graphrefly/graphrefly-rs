@@ -20,6 +20,7 @@ pub struct Operator<T> {
     /// The recipe a node built from this operator carries when its caller gives none,
     /// so a checkpoint can rebuild it from the built-in registry (R-checkpoint@1).
     pub(crate) recipe: Option<crate::graph::RestoreFactoryMeta>,
+    arity: Option<usize>,
     _t: PhantomData<fn() -> T>,
 }
 
@@ -30,6 +31,7 @@ impl<T> Clone for Operator<T> {
             body: self.body.clone(),
             opts: self.opts.clone(),
             recipe: self.recipe.clone(),
+            arity: self.arity,
             _t: PhantomData,
         }
     }
@@ -53,8 +55,21 @@ impl<T> Operator<T> {
             body: Rc::new(body),
             opts,
             recipe: None,
+            arity: None,
             _t: PhantomData,
         }
+    }
+
+    /// A built-in with a fixed number of initial dependencies.
+    pub(crate) fn fixed(
+        factory: &'static str,
+        arity: usize,
+        opts: NodeOpts,
+        body: impl Fn(&Ctx) + 'static,
+    ) -> Self {
+        let mut op = Self::with_opts(factory, opts, body);
+        op.arity = Some(arity);
+        op
     }
 
     /// This operator with the recipe `ref_` (and `config`), which the built-in
@@ -86,6 +101,14 @@ pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
     deps: Vec<Core>,
     caller_opts: NodeOpts,
 ) -> Node<T> {
+    if let Some(arity) = op.arity {
+        assert_eq!(
+            deps.len(),
+            arity,
+            "{}: expected {arity} dependencies",
+            op.factory
+        );
+    }
     let mut opts = merge_node_opts(&op.opts, caller_opts);
     if opts.factory.is_none() {
         opts.factory = Some(op.factory.to_owned());
@@ -97,7 +120,7 @@ pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
 
 /// map: emit `fn(value)` for every upstream DATA occurrence.
 pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T> {
-    Operator::new("map", move |ctx| {
+    Operator::fixed("map", 1, NodeOpts::default(), move |ctx| {
         for wave in ctx.dep(0).waves::<S>() {
             ctx.down(crate::protocol::data_wave(
                 wave.iter().map(|value| f(value.as_ref())),
@@ -108,7 +131,7 @@ pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T>
 
 /// filter: forward values matching `pred`; skipped waves settle as undirty RESOLVED.
 pub fn filter<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
-    Operator::new("filter", move |ctx| {
+    Operator::fixed("filter", 1, NodeOpts::default(), move |ctx| {
         for wave in ctx.dep(0).waves::<S>() {
             ctx.down(crate::protocol::data_wave(
                 wave.iter()
@@ -124,7 +147,7 @@ pub fn scan<S: 'static, T: Clone + 'static>(
     reducer: impl Fn(T, &S) -> T + 'static,
     seed: T,
 ) -> Operator<T> {
-    Operator::new("scan", move |ctx| {
+    Operator::fixed("scan", 1, NodeOpts::default(), move |ctx| {
         let mut acc = ctx
             .state_get::<T>()
             .map(|v| (*v).clone())
@@ -147,7 +170,7 @@ pub fn take<S: Clone + 'static>(n: usize) -> Operator<S> {
 }
 
 fn take_op<S: Clone + 'static>(n: usize) -> Operator<S> {
-    Operator::new("take", move |ctx| {
+    Operator::fixed("take", 1, NodeOpts::default(), move |ctx| {
         if n == 0 {
             ctx.down(vec![Message::Complete]);
             return;
@@ -182,7 +205,7 @@ fn take_op<S: Clone + 'static>(n: usize) -> Operator<S> {
 pub fn distinct_until_changed<S: Clone + 'static>(
     eq: impl Fn(&S, &S) -> bool + 'static,
 ) -> Operator<S> {
-    Operator::new("distinctUntilChanged", move |ctx| {
+    Operator::fixed("distinctUntilChanged", 1, NodeOpts::default(), move |ctx| {
         let mut last = ctx.state_get::<S>().map(|v| (*v).clone());
         for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::new();
@@ -229,8 +252,9 @@ pub fn reduce<S: 'static, T: Clone + 'static>(
     reducer: impl Fn(T, &S) -> T + 'static,
     seed: T,
 ) -> Operator<T> {
-    Operator::with_opts(
+    Operator::fixed(
         "reduce",
+        1,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -253,7 +277,7 @@ pub fn reduce<S: 'static, T: Clone + 'static>(
 
 /// pairwise: emit `(previous, current)` for each consecutive DATA occurrence.
 pub fn pairwise<S: Clone + 'static>() -> Operator<(S, S)> {
-    Operator::new("pairwise", move |ctx| {
+    Operator::fixed("pairwise", 1, NodeOpts::default(), move |ctx| {
         let mut prev = ctx.state_get::<S>().map(|v| (*v).clone());
         for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::new();
@@ -277,7 +301,7 @@ pub fn skip<S: Clone + 'static>(n: usize) -> Operator<S> {
 }
 
 fn skip_op<S: Clone + 'static>(n: usize) -> Operator<S> {
-    Operator::new("skip", move |ctx| {
+    Operator::fixed("skip", 1, NodeOpts::default(), move |ctx| {
         let mut count = saved_count(ctx);
         for wave in ctx.dep(0).waves::<S>() {
             let mut out = Vec::new();
@@ -296,7 +320,7 @@ fn skip_op<S: Clone + 'static>(n: usize) -> Operator<S> {
 
 /// take_while: emit while `pred` holds; first failed value completes without emission.
 pub fn take_while<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
-    Operator::new("takeWhile", move |ctx| {
+    Operator::fixed("takeWhile", 1, NodeOpts::default(), move |ctx| {
         for wave in ctx.dep(0).waves::<S>() {
             let mut out: Wave<AnyValue> = Vec::new();
             for value in wave {
@@ -317,7 +341,7 @@ pub fn take_while<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Op
 
 /// first: emit the first value matching `pred` (or the first value), then COMPLETE.
 pub fn first<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
-    Operator::new("first", move |ctx| {
+    Operator::fixed("first", 1, NodeOpts::default(), move |ctx| {
         for value in ctx.dep(0).values::<S>() {
             if pred(value.as_ref()) {
                 ctx.down(vec![
@@ -341,8 +365,9 @@ fn first_any_op<S: Clone + 'static>() -> Operator<S> {
 
 /// last: emit the last matching value on source COMPLETE; no match -> bare COMPLETE.
 pub fn last<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
-    Operator::with_opts(
+    Operator::fixed(
         "last",
+        1,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -378,8 +403,9 @@ fn last_any_op<S: Clone + 'static>() -> Operator<S> {
 
 /// find: emit the first matching value, then COMPLETE; no match -> bare COMPLETE.
 pub fn find<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
-    Operator::with_opts(
+    Operator::fixed(
         "find",
+        1,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -407,8 +433,9 @@ pub fn element_at<S: Clone + 'static>(index: usize) -> Operator<S> {
 }
 
 fn element_at_op<S: Clone + 'static>(index: usize) -> Operator<S> {
-    Operator::with_opts(
+    Operator::fixed(
         "elementAt",
+        1,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -435,7 +462,7 @@ fn element_at_op<S: Clone + 'static>(index: usize) -> Operator<S> {
 
 /// tap: run a side-effect for each DATA occurrence and pass values through unchanged.
 pub fn tap<S: Clone + 'static>(f: impl Fn(&S) + 'static) -> Operator<S> {
-    Operator::new("tap", move |ctx| {
+    Operator::fixed("tap", 1, NodeOpts::default(), move |ctx| {
         let mut emitted = Vec::new();
         for value in ctx.dep(0).values::<S>() {
             f(value.as_ref());
@@ -455,7 +482,7 @@ pub fn on_first_data_where<S: Clone + 'static>(
     f: impl Fn(&S) + 'static,
     where_pred: impl Fn(&S) -> bool + 'static,
 ) -> Operator<S> {
-    Operator::new("onFirstData", move |ctx| {
+    Operator::fixed("onFirstData", 1, NodeOpts::default(), move |ctx| {
         let mut fired = ctx.state_get::<bool>().is_some_and(|v| *v);
         let mut emitted = Vec::new();
         for value in ctx.dep(0).values::<S>() {
@@ -495,7 +522,7 @@ pub fn settle_by<S: Clone + 'static>(
     if let Some(max) = max_waves {
         assert!(max > 0, "settle: max_waves must be positive when set");
     }
-    Operator::new("settle", move |ctx| {
+    Operator::fixed("settle", 1, NodeOpts::default(), move |ctx| {
         let mut st = ctx
             .state_get::<SettleState<S>>()
             .map(|v| (*v).clone())
@@ -543,8 +570,9 @@ pub fn settle<S: Clone + PartialEq + 'static>(
 
 /// rescue: absorb upstream ERROR and replace it with `recover(error_message)`.
 pub fn rescue<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) -> Operator<S> {
-    Operator::with_opts(
+    Operator::fixed(
         "rescue",
+        1,
         NodeOpts {
             error: Policy::Manual,
             complete: Policy::Manual,
@@ -576,8 +604,9 @@ pub fn valve<S: Clone + 'static>() -> Operator<S> {
 }
 
 fn valve_op<S: Clone + 'static>() -> Operator<S> {
-    Operator::with_opts(
+    Operator::fixed(
         "valve",
+        2,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()

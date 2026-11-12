@@ -4435,3 +4435,66 @@ fn queued_batch_refuses_an_ended_target_before_any_updater_or_commit() {
             .contains("host input to an ended node"));
     }
 }
+
+#[test]
+fn fixed_arity_operators_refuse_before_registering_or_running() {
+    use graphrefly::{buffer, concat, sample, take_until, valve, with_latest_from};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let g = graphrefly::graph();
+    let a = g.state(1i32);
+    let b = g.state(2i32);
+    for count in [0, 1, 3] {
+        for factory in [
+            "withLatestFrom",
+            "concat",
+            "buffer",
+            "sample",
+            "takeUntil",
+            "valve",
+        ] {
+            let deps = (0..count)
+                .map(|i| if i % 2 == 0 { a.erased() } else { b.erased() })
+                .collect();
+            let before = g.describe().len();
+            let rejected = catch_unwind(AssertUnwindSafe(|| match factory {
+                "withLatestFrom" => {
+                    g.init_node(with_latest_from::<i32, i32>(), deps, named("bad"));
+                }
+                "concat" => {
+                    g.init_node(concat::<i32>(), deps, named("bad"));
+                }
+                "buffer" => {
+                    g.init_node(buffer::<i32>(), deps, named("bad"));
+                }
+                "sample" => {
+                    g.init_node(sample::<i32>(), deps, named("bad"));
+                }
+                "takeUntil" => {
+                    g.init_node(take_until::<i32>(), deps, named("bad"));
+                }
+                _ => {
+                    g.init_node(valve::<i32>(), deps, named("bad"));
+                }
+            }));
+            assert!(rejected.is_err(), "{factory} accepted {count} dependencies");
+            assert_eq!(g.describe().len(), before);
+        }
+    }
+    let _valid = g.init_node(
+        with_latest_from::<i32, i32>(),
+        vec![a.erased(), b.erased()],
+        named("valid"),
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| g.init_node(
+        graphrefly::map(|v: &i32| *v),
+        vec![],
+        named("map")
+    )))
+    .is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| g.init_node(
+        graphrefly::of(1i32),
+        vec![a.erased()],
+        named("source")
+    )))
+    .is_err());
+}

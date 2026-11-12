@@ -39,8 +39,9 @@ pub fn combine_latest<T: Clone + 'static>() -> Operator<Vec<T>> {
 
 /// with_latest_from: dep 0 drives `(primary, latest_secondary)` emissions.
 pub fn with_latest_from<A: Clone + 'static, B: Clone + 'static>() -> Operator<(A, B)> {
-    Operator::with_opts(
+    Operator::fixed(
         "withLatestFrom",
+        2,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -137,8 +138,9 @@ struct ConcatState<T> {
 
 /// concat: forward dep 0, then dep 1; dep-1 early values are buffered.
 pub fn concat<T: Clone + 'static>() -> Operator<T> {
-    Operator::with_opts(
+    Operator::fixed(
         "concat",
+        2,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -271,8 +273,9 @@ pub fn race<T: Clone + 'static>() -> Operator<T> {
 
 /// buffer: collect dep 0 values, flush a Vec on each dep 1 notifier DATA.
 pub fn buffer<T: Clone + 'static>() -> Operator<Vec<T>> {
-    Operator::with_opts(
+    Operator::fixed(
         "buffer",
+        2,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -306,8 +309,9 @@ pub fn buffer<T: Clone + 'static>() -> Operator<Vec<T>> {
 /// buffer_count: emit chunks of `count`, flushing the remainder on source COMPLETE.
 pub fn buffer_count<T: Clone + 'static>(count: usize) -> Operator<Vec<T>> {
     assert!(count > 0, "buffer_count: count must be positive");
-    Operator::with_opts(
+    Operator::fixed(
         "bufferCount",
+        1,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()
@@ -347,8 +351,9 @@ struct SampleState<T> {
 
 /// sample: emit dep 0's latest value whenever dep 1 notifier delivers DATA.
 pub fn sample<T: Clone + 'static>() -> Operator<T> {
-    Operator::with_opts(
+    Operator::fixed(
         "sample",
+        2,
         NodeOpts {
             error: Policy::Manual,
             complete: Policy::Manual,
@@ -398,8 +403,9 @@ pub fn take_until<T: Clone + 'static>() -> Operator<T> {
 }
 
 fn take_until_op<T: Clone + 'static>() -> Operator<T> {
-    Operator::with_opts(
+    Operator::fixed(
         "takeUntil",
+        2,
         NodeOpts {
             complete: Policy::Manual,
             ..NodeOpts::default()

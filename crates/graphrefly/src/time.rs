@@ -20,8 +20,9 @@ type AuditProject<S> = Rc<dyn Fn(&Ctx, &S) -> Core>;
 fn delayed_value<S: Clone + 'static>(ctx: &Ctx, value: S, ms: u64) -> Node<S> {
     let tick = ctx.init_node_in_scope(timer(ms), vec![]);
     ctx.init_node_in_scope(
-        Operator::with_opts(
+        Operator::fixed(
             "delayedValue",
+            0,
             crate::node::NodeOpts {
                 error: Policy::Manual,
                 complete: Policy::Manual,
@@ -105,8 +106,9 @@ fn throttle_with_factory<S: Clone + 'static>(factory: &'static str, ms: u64) -> 
         run_throttle_body::<S>(ctx, ms);
     });
 
-    Operator::with_opts(
+    Operator::fixed(
         factory,
+        1,
         crate::node::NodeOpts {
             error: Policy::Manual,
             complete: Policy::Manual,
@@ -220,8 +222,9 @@ fn audit_with_ctx<S: Clone + 'static>(
         run_audit_body(ctx, &duration_selector);
     });
 
-    Operator::with_opts(
+    Operator::fixed(
         factory,
+        1,
         crate::node::NodeOpts {
             error: Policy::Manual,
             complete: Policy::Manual,
@@ -338,7 +341,7 @@ pub fn timeout<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<S> {
     });
 
     let node = crate::operators::init_node_in_arena_with_dispatcher(
-        Operator::with_opts("timeout", time_helper_opts(), move |ctx| {
+        Operator::fixed("timeout", 1, time_helper_opts(), move |ctx| {
             body(ctx);
         }),
         &source_core.arena(),
@@ -423,7 +426,7 @@ pub fn buffer_time<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<Vec<S>
     });
 
     let node = crate::operators::init_node_in_arena_with_dispatcher(
-        Operator::with_opts("bufferTime", time_helper_opts(), move |ctx| {
+        Operator::fixed("bufferTime", 1, time_helper_opts(), move |ctx| {
             body(ctx);
         }),
         &source_core.arena(),

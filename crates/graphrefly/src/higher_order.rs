@@ -153,8 +153,9 @@ pub fn repeat<T: 'static>(factory: impl Fn() -> Node<T> + 'static, count: usize)
         run_repeat_body(ctx, &factory, count);
     });
 
-    Operator::with_opts(
+    Operator::fixed(
         "repeat",
+        0,
         NodeOpts {
             error: Policy::Manual,
             complete: Policy::Manual,
@@ -174,8 +175,9 @@ fn map_operator<TIn: Clone + 'static, TOut: 'static>(
     let body: Body = Rc::new(move |ctx| {
         run_map_body(ctx, &project, mode, concurrent);
     });
-    Operator::with_opts(
+    Operator::fixed(
         factory,
+        1,
         NodeOpts {
             error: Policy::Manual,
             complete: Policy::Manual,

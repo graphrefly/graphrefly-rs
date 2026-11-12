@@ -40,8 +40,9 @@ fn source_op<T: 'static>(
     opts: NodeOpts,
     body: impl Fn(&crate::ctx::Ctx, &CloseSlot) + 'static,
 ) -> Operator<T> {
-    Operator::with_opts(
+    Operator::fixed(
         factory,
+        0,
         opts.with_setup(move |ctx| {
             let on_close = CloseSlot::default();
             body(ctx, &on_close);
@@ -65,7 +66,7 @@ impl CloseSlot {
 pub fn of<T: Clone + 'static>(value: T) -> Operator<T> {
     let config =
         crate::checkpoint::json_of(&value).map(|value| serde_json::json!({ "value": value }));
-    let op = Operator::new("of", move |ctx| {
+    let op = Operator::fixed("of", 0, NodeOpts::default(), move |ctx| {
         let out: AnyValue = Rc::new(value.clone());
         ctx.down(vec![Message::Data(out), Message::Complete]);
     });
@@ -84,7 +85,7 @@ pub fn from_iter<T: Clone + 'static>(items: impl IntoIterator<Item = T>) -> Oper
         .map(crate::checkpoint::json_of)
         .collect::<Option<Vec<_>>>()
         .map(|items| serde_json::json!({ "items": items }));
-    let op = Operator::new("fromIter", move |ctx| {
+    let op = Operator::fixed("fromIter", 0, NodeOpts::default(), move |ctx| {
         let mut out: Vec<Message<AnyValue>> = values
             .iter()
             .map(|value| Message::Data(Rc::new(value.clone()) as AnyValue))
@@ -104,7 +105,7 @@ pub fn empty<T: 'static>() -> Operator<T> {
 }
 
 fn empty_op<T: 'static>() -> Operator<T> {
-    Operator::new("empty", |ctx| {
+    Operator::fixed("empty", 0, NodeOpts::default(), |ctx| {
         ctx.down(vec![Message::Complete]);
     })
 }
@@ -115,14 +116,14 @@ pub fn never<T: 'static>() -> Operator<T> {
 }
 
 fn never_op<T: 'static>() -> Operator<T> {
-    Operator::new("never", |_| {})
+    Operator::fixed("never", 0, NodeOpts::default(), |_| {})
 }
 
 /// throw_error: terminate with ERROR on activation.
 pub fn throw_error<T: 'static>(err: impl Into<String>) -> Operator<T> {
     let err = err.into();
     let config = serde_json::json!({ "error": err });
-    Operator::new("throwError", move |ctx| {
+    Operator::fixed("throwError", 0, NodeOpts::default(), move |ctx| {
         ctx.down(vec![Message::Error(err.clone().into())]);
     })
     .with_recipe("throwError", Some(config))
