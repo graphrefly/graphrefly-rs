@@ -187,7 +187,7 @@ inside an outer body that returns `Ok` keeps the accumulated writes.
 
 The minimal graph view is `graph.describe()`; use `graph.find(id)` for status and
 values. Optional diagnostics are free functions: `graphrefly::topology::snapshot(&graph)`,
-`snapshot_opts`, `observe`, `observe_path`, `profile`, `group`, `group_opts`, `mount`
+`snapshot_opts`, `observe`, `observe_at`, `profile`, `group`, `group_opts`, `mount`
 and `name`. Snapshot edges are derived with `snapshot.edges()` from node dependencies.
 The operator names are `combine`, `on_first_data`, `rescue`, `debounce` and `throttle`;
 the wire cause type is `WireEdgeCause`.

@@ -1964,7 +1964,7 @@ pub mod topology {
     }
 
     /// Read-only topology lifecycle egress for one registered id or `::` subtree prefix.
-    pub fn observe_path(graph: &Graph, path: &str) -> TopologyStream {
+    pub fn observe_at(graph: &Graph, path: &str) -> TopologyStream {
         TopologyStream {
             graph: graph.clone(),
             path: Some(path.to_owned()),

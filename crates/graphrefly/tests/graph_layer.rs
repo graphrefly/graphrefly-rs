@@ -194,7 +194,7 @@ fn observe_topology_deps_changed_matches_describe_edges() {
     );
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = graphrefly::topology::observe_path(&g, "d")
+    let observer = graphrefly::topology::observe_at(&g, "d")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
     d.replace(
@@ -233,7 +233,7 @@ fn observe_topology_emits_mount_changed_from_parent_graph() {
     let child = graph();
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = graphrefly::topology::observe_path(&parent, "sub")
+    let observer = graphrefly::topology::observe_at(&parent, "sub")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
     graphrefly::topology::mount(&parent, child, "sub");
@@ -260,7 +260,7 @@ fn observe_topology_forwards_mounted_child_events_with_parent_paths() {
     graphrefly::topology::mount(&parent, child.clone(), "sub");
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = graphrefly::topology::observe_path(&parent, "sub")
+    let observer = graphrefly::topology::observe_at(&parent, "sub")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
     let a = child.state_opts(1i32, GraphNodeOpts::named("a"));

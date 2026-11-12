@@ -943,7 +943,7 @@ fn failed_reactive_log_page_dispose_emits_no_node_released_and_keeps_topology() 
     );
     let events = Rc::new(RefCell::new(Vec::<TopologyEvent>::new()));
     let event_sink = events.clone();
-    let observer = graphrefly::topology::observe_path(&g, "log.page#0")
+    let observer = graphrefly::topology::observe_at(&g, "log.page#0")
         .subscribe(move |event| event_sink.borrow_mut().push(event));
 
     let result = catch_unwind(AssertUnwindSafe(|| page.dispose()));
