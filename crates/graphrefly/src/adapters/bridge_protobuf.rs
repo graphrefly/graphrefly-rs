@@ -78,12 +78,12 @@ pub struct CanonicalWireBridgeMetadata {
 pub enum CanonicalWireBridgeDataBody {
     Value(Vec<u8>),
     /// A wire edge group's cause (field 3; field 2 is reserved).
-    EdgeCause(CanonicalWireEdgeCause),
+    EdgeCause(WireEdgeCause),
 }
 
 /// One frame of a wire edge group: one sender wave (R-bridge@2).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalWireEdgeCause {
+pub struct WireEdgeCause {
     /// The group's name.
     pub group: String,
     /// The session: one lifetime of the group's outbound node.
@@ -163,7 +163,7 @@ pub const WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE: WireBridgeProtobufHelperShape =
 pub enum WireBridgeProtobufDataBody {
     Value(Vec<u8>),
     /// A wire edge group's cause.
-    EdgeCause(CanonicalWireEdgeCause),
+    EdgeCause(WireEdgeCause),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,7 +270,7 @@ pub fn decode_canonical_wire_bridge_envelope(
 
 /// Encodes a wire edge group's cause as canonical protobuf bytes.
 pub fn encode_canonical_wire_edge_cause(
-    cause: &CanonicalWireEdgeCause,
+    cause: &WireEdgeCause,
 ) -> Result<Vec<u8>, CanonicalProtobufError> {
     validate_wire_edge_cause(cause)?;
     Ok(encode_wire_edge_cause(cause))
@@ -280,7 +280,7 @@ pub fn encode_canonical_wire_edge_cause(
 /// `invalid_wire_edge` error.
 pub fn decode_canonical_wire_edge_cause(
     bytes: &[u8],
-) -> Result<CanonicalWireEdgeCause, CanonicalProtobufError> {
+) -> Result<WireEdgeCause, CanonicalProtobufError> {
     let cause = parse_wire_edge_cause(bytes)?;
     validate_wire_edge_cause(&cause)?;
     if encode_wire_edge_cause(&cause) != bytes {
@@ -575,7 +575,7 @@ fn invalid_edge(message: impl Into<String>) -> CanonicalProtobufError {
     CanonicalProtobufError::new(CanonicalProtobufErrorCategory::InvalidWireEdge, message)
 }
 
-fn parse_wire_edge_cause(bytes: &[u8]) -> Result<CanonicalWireEdgeCause, CanonicalProtobufError> {
+fn parse_wire_edge_cause(bytes: &[u8]) -> Result<WireEdgeCause, CanonicalProtobufError> {
     let fields = read_fields_with_repeated(
         bytes,
         &[(1, 2), (2, 2), (3, 0), (4, 2)],
@@ -590,7 +590,7 @@ fn parse_wire_edge_cause(bytes: &[u8]) -> Result<CanonicalWireEdgeCause, Canonic
         .filter(|f| f.no == 4)
         .map(|f| parse_wire_edge_arrays(f.as_bytes()?))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(CanonicalWireEdgeCause {
+    Ok(WireEdgeCause {
         group: utf8_string(group, "group")?,
         session: utf8_string(session, "session")?,
         cause,
@@ -647,7 +647,7 @@ fn missing(what: &str) -> CanonicalProtobufError {
 }
 
 /// A frame a receiver's gate refuses whole is `invalid_wire_edge` (R-bridge@2).
-fn validate_wire_edge_cause(cause: &CanonicalWireEdgeCause) -> Result<(), CanonicalProtobufError> {
+fn validate_wire_edge_cause(cause: &WireEdgeCause) -> Result<(), CanonicalProtobufError> {
     if cause.group.is_empty() || cause.session.is_empty() {
         return Err(missing("WireEdgeCause group or session"));
     }
@@ -799,7 +799,7 @@ fn encode_data_payload(
     Ok(out.finish())
 }
 
-fn encode_wire_edge_cause(cause: &CanonicalWireEdgeCause) -> Vec<u8> {
+fn encode_wire_edge_cause(cause: &WireEdgeCause) -> Vec<u8> {
     let mut out = Writer::default();
     out.string_field(1, &cause.group);
     out.string_field(2, &cause.session);

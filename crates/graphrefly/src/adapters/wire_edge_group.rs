@@ -18,20 +18,16 @@
 //! encodes; an ERROR's payload is its message's UTF-8 bytes. Bridge nodes carry no
 //! recipe: they are local-only for a checkpoint (R-bridge@2 does not cover it).
 
+pub use super::bridge_protobuf::WireEdgeCause;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use super::bridge_protobuf::{
-    CanonicalWireEdgeArrays, CanonicalWireEdgeCause, CanonicalWireMessage,
-};
+use super::bridge_protobuf::{CanonicalWireEdgeArrays, CanonicalWireMessage};
 use crate::ctx::{Ctx, DepTerminal};
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::node::{Core, Node, NodeOpts, Policy};
 use crate::protocol::{AnyValue, Message};
-
-/// A wire edge group's frame: one cause, one sender wave.
-pub type WireEdgeCause = CanonicalWireEdgeCause;
 
 /// What an edge last brought, as the gate keeps it: the values of its last array that
 /// carried DATA, then its terminal.

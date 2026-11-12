@@ -158,7 +158,7 @@ pub use adapters::bridge_protobuf::{
     encode_canonical_wire_edge_cause, encode_wire_bridge_protobuf_bytes, CanonicalProtobufError,
     CanonicalProtobufErrorCategory, CanonicalWireBridgeDataBody, CanonicalWireBridgeEnvelope,
     CanonicalWireBridgeMetadata, CanonicalWireBridgePayload, CanonicalWireEdgeArrays,
-    CanonicalWireEdgeCause, CanonicalWireMessage, WireBridgeProtobufDataBody,
+    WireEdgeCause, CanonicalWireMessage, WireBridgeProtobufDataBody,
     WireBridgeProtobufDecode, WireBridgeProtobufEncode, WireBridgeProtobufEnvelope,
     WireBridgeProtobufHelperShape, WireBridgeProtobufIssue, WireBridgeProtobufPayload,
     WireBridgeProtobufStatus, WireBridgeProtobufStatusKind, WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE,
@@ -183,7 +183,7 @@ pub use adapters::reactive_collection_storage::{
     ReactiveCollectionPersistenceStatusFact,
 };
 pub use adapters::wire_edge_group::{
-    frame_sink, frame_source, wire_edge_group_in, wire_edge_group_out, FrameDeliver, WireEdgeCause,
+    frame_sink, frame_source, wire_edge_group_in, wire_edge_group_out, FrameDeliver, 
     WireEdgeGateValue, WireEdgeGroupIn, WireEdgeIssue, WireEdgeView,
 };
 #[cfg(feature = "tokio")]
