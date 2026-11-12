@@ -55,7 +55,7 @@ pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly-rs/checkpoint@1";
 
 pub type GraphCheckpointJson = Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind")]
 pub enum GraphCheckpointTerminal {
     #[serde(rename = "none")]
@@ -64,6 +64,28 @@ pub enum GraphCheckpointTerminal {
     Complete,
     #[serde(rename = "ERROR")]
     Error { error: GraphCheckpointJson },
+}
+
+impl<'de> Deserialize<'de> for GraphCheckpointTerminal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Empty struct variants reject payload fields; serde's unit variants ignore
+        // them even with deny_unknown_fields on an internally tagged enum.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", deny_unknown_fields)]
+        enum Terminal {
+            #[serde(rename = "none")]
+            None {},
+            #[serde(rename = "COMPLETE")]
+            Complete {},
+            #[serde(rename = "ERROR")]
+            Error { error: GraphCheckpointJson },
+        }
+        Ok(match Terminal::deserialize(deserializer)? {
+            Terminal::None {} => Self::None,
+            Terminal::Complete {} => Self::Complete,
+            Terminal::Error { error } => Self::Error { error },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +100,14 @@ pub enum GraphCheckpointFactory {
     },
     #[serde(rename = "local-only")]
     LocalOnly { name: String, reason: String },
+}
+
+/// The kernel identity needed to admit lifetime data before invoking a recipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphCheckpointNodeKind {
+    State,
+    Computed,
 }
 
 /// The node-owned policies captured independently of its recipe.
@@ -95,6 +125,8 @@ pub struct GraphCheckpointPolicies {
 pub struct GraphCheckpointNode {
     /// The node's id.
     pub id: String,
+    /// Captured from the kernel, never inferred from recipe or diagnostic metadata.
+    pub kind: GraphCheckpointNodeKind,
     /// The node's display name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -114,7 +146,7 @@ pub struct GraphCheckpointNode {
     /// A computed node's private state; for a collection's delta node, the
     /// collection's backend (a collection is a node whose backend is its private
     /// state, graphrefly:D802).
-    #[serde(rename = "privateState", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "privateState", deserialize_with = "required_private_state")]
     pub private_state: Option<GraphCheckpointJson>,
     /// What a computed node with a lifetime received from each current dependency.
     // Explicit null is cold; an absent field is a truncated/older checkpoint.
@@ -123,6 +155,12 @@ pub struct GraphCheckpointNode {
     /// The node's graph metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<BTreeMap<String, GraphCheckpointJson>>,
+}
+
+fn required_private_state<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<GraphCheckpointJson>, D::Error> {
+    Option::<GraphCheckpointJson>::deserialize(deserializer)
 }
 
 fn required_received<'de, D: serde::Deserializer<'de>>(
@@ -142,6 +180,8 @@ pub struct GraphCheckpointInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A declared dependency membership edge. Ordered occurrences live in `deps` and
+/// `received`; repeated initial dependency positions share one membership edge.
 pub struct GraphCheckpointEdge {
     pub from: String,
     pub to: String,
@@ -1086,10 +1126,18 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                     .collect::<RestoreResult<Vec<_>>>()
             })
             .transpose()?;
-        edges.extend(dep_ids.iter().map(|dep| GraphCheckpointEdge {
-            from: dep.clone(),
-            to: entry.id.clone(),
-        }));
+        // Edges record membership; deps/received preserve positional occurrences.
+        // Initial construction can declare the same dependency more than once.
+        let mut seen_deps = BTreeSet::new();
+        edges.extend(
+            dep_ids
+                .iter()
+                .filter(|dep| seen_deps.insert(*dep))
+                .map(|dep| GraphCheckpointEdge {
+                    from: dep.clone(),
+                    to: entry.id.clone(),
+                }),
+        );
         let backend = checkpoint_backend_state(&entry.core, &format!("{}.privateState", entry.id))
             .map_err(|_| not_restorable(&entry.id, "its private state is not JSON"))?;
         let helper = is_non_authoritative_helper(&entry.core);
@@ -1138,6 +1186,11 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
         let (quiet, complete, error, invalidate) = entry.core.checkpoint_policies();
         let saved_node = GraphCheckpointNode {
             id: entry.id.clone(),
+            kind: if runtime.is_state {
+                GraphCheckpointNodeKind::State
+            } else {
+                GraphCheckpointNodeKind::Computed
+            },
             name: entry.name.clone(),
             factory: checkpoint_factory(entry, runtime.is_state),
             policies: GraphCheckpointPolicies {
@@ -1515,6 +1568,14 @@ fn prepare_checkpoint(
                 return Err(not_restorable(&node.id, "missing received records"));
             }
         }
+        if node.kind == GraphCheckpointNodeKind::State
+            && (!node.deps.is_empty() || node.lifetime_deps.is_some() || node.received.is_some())
+        {
+            return Err(not_restorable(
+                &node.id,
+                "a state cannot have dependency records",
+            ));
+        }
         nodes.insert(
             node.id.clone(),
             PreparedNode {
@@ -1533,6 +1594,41 @@ fn prepare_checkpoint(
                 ));
             }
         }
+    }
+    for node in nodes.values() {
+        let mut lifetime_ids = BTreeSet::new();
+        for dep in node.checkpoint.lifetime_deps.iter().flatten() {
+            if !lifetime_ids.insert(dep) {
+                return Err(not_restorable(
+                    &node.checkpoint.id,
+                    "duplicate lifetime dependency",
+                ));
+            }
+            if !nodes.contains_key(dep) {
+                return Err(not_restorable(
+                    &node.checkpoint.id,
+                    &format!("lifetime dependency '{dep}' is missing"),
+                ));
+            }
+        }
+    }
+    for item in nodes.values() {
+        let node = &item.checkpoint;
+        // Admission must finish for the complete tree before any descriptor runs.
+        let saved_lifetime = node.private_state.is_some()
+            || node.lifetime_deps.is_some()
+            || (matches!(node.terminal, GraphCheckpointTerminal::None) && !node.values.is_empty());
+        if node.kind == GraphCheckpointNodeKind::Computed
+            && saved_lifetime
+            && node.received.is_none()
+        {
+            return Err(not_restorable(&node.id, "missing received records"));
+        }
+    }
+    let mut visiting = BTreeSet::new();
+    let mut done = BTreeSet::new();
+    for id in nodes.keys() {
+        validate_dependency_order(id, &nodes, &mut visiting, &mut done)?;
     }
     let mut edge_keys = BTreeSet::new();
     for edge in &checkpoint.edges {
@@ -1596,6 +1692,31 @@ fn prepare_checkpoint(
     })
 }
 
+fn validate_dependency_order(
+    id: &str,
+    nodes: &BTreeMap<String, PreparedNode>,
+    visiting: &mut BTreeSet<String>,
+    done: &mut BTreeSet<String>,
+) -> RestoreResult<()> {
+    if done.contains(id) {
+        return Ok(());
+    }
+    if !visiting.insert(id.to_owned()) {
+        return Err(not_restorable(id, "dependency cycle"));
+    }
+    // R-request-order: acyclicity covers declared and current lifetime edges together.
+    for dep in nodes[id]
+        .deps
+        .iter()
+        .chain(nodes[id].checkpoint.lifetime_deps.iter().flatten())
+    {
+        validate_dependency_order(dep, nodes, visiting, done)?;
+    }
+    visiting.remove(id);
+    done.insert(id.to_owned());
+    Ok(())
+}
+
 fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()> {
     if let GraphCheckpointFactory::RegistryRef {
         config: Some(config),
@@ -1618,18 +1739,35 @@ fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()
             validate_checkpoint_json(value, &format!("{}.received[{i}]", node.id))
                 .map_err(|_| not_restorable(&node.id, "its received values are not JSON"))?;
         }
-        if let GraphCheckpointTerminal::Error { error } = &input.terminal {
-            validate_checkpoint_json(error, &format!("{}.received[{i}].terminal.error", node.id))
-                .map_err(|_| not_restorable(&node.id, "its ERROR payload is not JSON"))?;
-        }
+        validate_checkpoint_terminal(
+            &input.terminal,
+            &node.id,
+            &format!("{}.received[{i}].terminal.error", node.id),
+        )?;
     }
-    if let GraphCheckpointTerminal::Error { error } = &node.terminal {
-        validate_checkpoint_json(error, &format!("{}.terminal.error", node.id))
-            .map_err(|_| not_restorable(&node.id, "its ERROR payload is not JSON"))?;
-    }
+    validate_checkpoint_terminal(
+        &node.terminal,
+        &node.id,
+        &format!("{}.terminal.error", node.id),
+    )?;
     if let Some(meta) = &node.meta {
         for (key, value) in meta {
             validate_checkpoint_json(value, &format!("{}.meta.{key}", node.id))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_terminal(
+    terminal: &GraphCheckpointTerminal,
+    id: &str,
+    path: &str,
+) -> RestoreResult<()> {
+    if let GraphCheckpointTerminal::Error { error } = terminal {
+        validate_checkpoint_json(error, path)
+            .map_err(|_| not_restorable(id, "its ERROR payload is not JSON"))?;
+        if error.is_boolean() {
+            return Err(not_restorable(id, "ERROR payload must not be boolean"));
         }
     }
     Ok(())
@@ -1643,17 +1781,9 @@ fn construct_prepared(
     opts.name = prepared.checkpoint.name.clone();
     let graph = crate::graph::graph_opts(opts);
     let mut built = BTreeMap::<String, Core>::new();
-    let mut visiting = BTreeSet::<String>::new();
     // Each node after its declared dependencies, and otherwise in checkpoint order.
     for node in &prepared.checkpoint.nodes {
-        build_node(
-            &node.id,
-            prepared,
-            &options.registry,
-            &graph,
-            &mut built,
-            &mut visiting,
-        )?;
+        build_node(&node.id, prepared, &options.registry, &graph, &mut built)?;
     }
     for (at, child) in &prepared.mounts {
         graph.mount_restored(construct_prepared(child, options)?, at.clone());
@@ -1665,29 +1795,11 @@ fn construct_prepared(
             .get(id)
             .expect("built map only contains prepared nodes")
             .checkpoint;
+        // Admission validated these ids before any recipe ran, and every node is built.
         let lifetime_deps = node
             .lifetime_deps
             .as_ref()
-            .map(|ids| {
-                ids.iter()
-                    .map(|dep| {
-                        built.get(dep).cloned().ok_or_else(|| {
-                            not_restorable(id, &format!("lifetime dependency '{dep}' is missing"))
-                        })
-                    })
-                    .collect::<RestoreResult<Vec<_>>>()
-            })
-            .transpose()?;
-        // A computed node saved with a lifetime (private state, a lifetime's own
-        // dependencies, or values while it has not ended) must carry what it received;
-        // without it the checkpoint is refused, never completed from its dependencies'
-        // values (R-checkpoint@1).
-        let saved_lifetime = node.private_state.is_some()
-            || node.lifetime_deps.is_some()
-            || (matches!(node.terminal, GraphCheckpointTerminal::None) && !node.values.is_empty());
-        if !core.is_state() && saved_lifetime && node.received.is_none() {
-            return Err(not_restorable(id, "missing received records"));
-        }
+            .map(|ids| ids.iter().map(|dep| built[dep].clone()).collect());
         let seeded = !core.is_state()
             && matches!(node.terminal, GraphCheckpointTerminal::None)
             && node.received.is_some();
@@ -1704,8 +1816,10 @@ fn construct_prepared(
             lifetime_deps,
             // The note holds what the node had received (R-checkpoint@1).
             note: node.received.as_ref().map(|inputs| {
-                Rc::new(serde_json::to_value(inputs).unwrap_or(GraphCheckpointJson::Null))
-                    as AnyValue
+                Rc::new(
+                    serde_json::to_value(inputs)
+                        .expect("admitted JSON received records serialize infallibly"),
+                ) as AnyValue
             }),
         });
     }
@@ -1718,21 +1832,16 @@ fn build_node(
     registry: &GraphRestoreRegistry,
     graph: &Graph,
     built: &mut BTreeMap<String, Core>,
-    visiting: &mut BTreeSet<String>,
 ) -> RestoreResult<Core> {
     if let Some(core) = built.get(id) {
         return Ok(core.clone());
     }
-    if !visiting.insert(id.to_owned()) {
-        return Err(not_restorable(id, "dependency cycle"));
-    }
-    let item = prepared.nodes.get(id).ok_or_else(|| {
-        GraphRestoreError::new(format!("restore_graph: missing prepared node '{id}'"))
-    })?;
+    // Only admitted node ids reach construction; the declared graph is acyclic.
+    let item = &prepared.nodes[id];
     let deps = item
         .deps
         .iter()
-        .map(|dep| build_node(dep, prepared, registry, graph, built, visiting))
+        .map(|dep| build_node(dep, prepared, registry, graph, built))
         .collect::<RestoreResult<Vec<_>>>()?;
     let config = match &item.checkpoint.factory {
         GraphCheckpointFactory::RegistryRef { config, .. } => config.as_ref(),
@@ -1783,6 +1892,9 @@ fn build_node(
                 .erased()
         }
     };
+    if core.is_state() != (item.checkpoint.kind == GraphCheckpointNodeKind::State) {
+        return Err(not_restorable(id, "recipe constructed the wrong node kind"));
+    }
     // Policies belong to the saved node, never to the reconstruction recipe.
     let policies = item.checkpoint.policies;
     core.restore_policies(
@@ -1807,7 +1919,6 @@ fn build_node(
         ));
     }
     built.insert(id.to_owned(), core.clone());
-    visiting.remove(id);
     Ok(core)
 }
 

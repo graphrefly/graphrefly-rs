@@ -199,6 +199,11 @@ GRAPHREFLY_SPEC_ROOT=../graphrefly/spec cargo run -p graphrefly-rs --example d79
 ```
 
 It compares the actual trace against the root `d797-rereview.v1.json` fixture.
+Checkpoint records now require the actual kernel `kind`, the complete `policies`
+tuple, and explicit nullable `privateState` / `received` fields. Older incomplete
+records are refused; no defaults reconstruct omitted data. Saved policies override
+recipe defaults, including custom constructors.
+
 Restore creates a cold graph; explicitly retain the required runtime nodes before
 sending commands. Dependency views are borrowed only for setup/function invocation;
 `Ctx::defer()` keeps output, state, rewire and signal capabilities for later work.

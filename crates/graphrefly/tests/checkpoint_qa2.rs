@@ -179,3 +179,175 @@ fn policy_tuple_and_each_field_are_required_and_closed() {
     }
 }
 
+#[test]
+fn damaged_checkpoint_is_refused_before_any_recipe_side_effect() {
+    let saved = serde_json::to_value(capture(manual())).unwrap();
+    let mut cases: Vec<(String, serde_json::Value)> = Vec::new();
+    for field in [
+        "id",
+        "kind",
+        "factory",
+        "deps",
+        "values",
+        "terminal",
+        "privateState",
+        "received",
+        "policies",
+    ] {
+        for index in [0, 1] {
+            let mut damaged = saved.clone();
+            damaged["nodes"][index]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            cases.push((format!("missing {field} on node {index}"), damaged));
+        }
+    }
+    for terminal in [
+        json!({"kind":"DATA", "error":23}),
+        json!({"kind":"ERROR"}),
+        json!({"kind":"ERROR","error":true}),
+        json!({"kind":"ERROR","error":false}),
+        json!({"kind":"ERROR","error":"boom","extra":1}),
+        json!({"kind":"COMPLETE","error":"boom"}),
+        json!({"kind":"none","error":"boom"}),
+        json!(["COMPLETE", 1]),
+    ] {
+        for received in [false, true] {
+            let mut damaged = saved.clone();
+            if received {
+                damaged["nodes"][1]["received"][0]["terminal"] = terminal.clone();
+            } else {
+                damaged["nodes"][1]["terminal"] = terminal.clone();
+            }
+            cases.push((format!("terminal {terminal} received={received}"), damaged));
+        }
+    }
+    for received in [
+        json!([{}]),
+        json!([{"values":[]}]),
+        json!([{"terminal":{"kind":"none"}}]),
+        json!([]),
+    ] {
+        let mut damaged = saved.clone();
+        damaged["nodes"][1]["received"] = received;
+        cases.push(("received".into(), damaged));
+    }
+    let mut duplicate = saved.clone();
+    duplicate["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(saved["nodes"][1].clone());
+    cases.push(("duplicate id".into(), duplicate));
+    let mut missing = saved.clone();
+    missing["nodes"][1]["lifetimeDeps"] = json!(["missing"]);
+    cases.push(("missing lifetime dependency".into(), missing));
+    let mut truncated = saved.clone();
+    truncated["nodes"][1]["received"] = json!(null);
+    truncated["nodes"][1]["values"] = json!([42]);
+    cases.push(("lived computed with null received".into(), truncated));
+    let mut cycle = saved.clone();
+    cycle["nodes"][1]["deps"] = json!(["n"]);
+    cycle["edges"] = json!([{"from":"n","to":"n"}]);
+    cases.push(("cycle".into(), cycle));
+    let mut duplicate_lifetime = saved.clone();
+    duplicate_lifetime["nodes"][1]["lifetimeDeps"] = json!(["a", "a"]);
+    let input = saved["nodes"][1]["received"][0].clone();
+    duplicate_lifetime["nodes"][1]["received"] = json!([input.clone(), input]);
+    cases.push(("duplicate lifetime dependencies".into(), duplicate_lifetime));
+    let mut lifetime_self = saved.clone();
+    lifetime_self["nodes"][1]["lifetimeDeps"] = json!(["n"]);
+    cases.push(("lifetime self-cycle".into(), lifetime_self));
+    // Both declared and current graphs can be DAGs while their union is cyclic.
+    let chain = graph();
+    let a = chain.state_opts(json!(1), GraphNodeOpts::named("a"));
+    let options = |id| {
+        let mut opts = GraphNodeOpts::named(id);
+        opts.restore = Some(RestoreFactoryMeta::registry_ref("qa2"));
+        opts
+    };
+    let n = chain.node_opts::<serde_json::Value, _>(vec![a.erased()], |_| {}, options("n"));
+    let m = chain.node_opts::<serde_json::Value, _>(vec![n.erased()], |_| {}, options("m"));
+    let _keep = m.subscribe(|_| {});
+    let mut union = serde_json::to_value(chain.checkpoint().unwrap()).unwrap();
+    union["nodes"][1]["lifetimeDeps"] = json!(["m"]);
+    // m's lifetime detaches from n, so each edge set alone remains acyclic.
+    union["nodes"][2]["lifetimeDeps"] = json!(["a"]);
+    cases.push(("declared/lifetime union cycle".into(), union));
+    let mut invalid_kind = saved.clone();
+    invalid_kind["nodes"][1]["kind"] = json!("other");
+    cases.push(("invalid kind".into(), invalid_kind));
+    let mut mounted = saved.clone();
+    let mut child = saved.clone();
+    child["nodes"][1]["received"] = json!([]);
+    mounted["mounts"] = json!([{"at":"child", "checkpoint":child}]);
+    cases.push((
+        "invalid child admission before parent factory".into(),
+        mounted,
+    ));
+    for (label, damaged) in cases {
+        let calls = Rc::new(Cell::new(0));
+        let rejected = match serde_json::from_value::<GraphCheckpoint>(damaged) {
+            Err(_) => true,
+            Ok(checkpoint) => restore_graph(
+                checkpoint,
+                RestoreGraphOptions::new(registry(calls.clone(), false)),
+            )
+            .is_err(),
+        };
+        assert!(rejected, "accepted {label}");
+        assert_eq!(calls.get(), 0, "factory ran for {label}");
+    }
+}
+
+#[test]
+fn cold_and_state_records_are_explicit_and_actual_kind_ignores_metadata() {
+    let g = graph();
+    g.state_opts(json!(17), GraphNodeOpts::named("s"));
+    let mut opts = GraphNodeOpts::named("cold");
+    opts.restore = Some(RestoreFactoryMeta::registry_ref("qa2"));
+    opts.meta.insert("kind".into(), "state".into());
+    g.node_opts::<serde_json::Value, _>(vec![], |_| {}, opts);
+    let cp = g.checkpoint().unwrap();
+    let json = serde_json::to_value(&cp).unwrap();
+    assert_eq!(json["nodes"][0]["kind"], "state");
+    assert_eq!(json["nodes"][1]["kind"], "computed");
+    assert!(json["nodes"][1]
+        .as_object()
+        .unwrap()
+        .contains_key("received"));
+    assert!(json["nodes"][1]["received"].is_null());
+    assert!(json["nodes"][1]
+        .as_object()
+        .unwrap()
+        .contains_key("privateState"));
+    assert!(restore_graph(cp, RestoreGraphOptions::new(registry(Rc::default(), false))).is_ok());
+}
+
+#[test]
+fn initial_duplicate_dependencies_round_trip_without_a_rewire_record() {
+    let g = graph();
+    let a = g.state_opts(json!(1), GraphNodeOpts::named("a"));
+    let mut opts = GraphNodeOpts::named("n");
+    opts.restore = Some(RestoreFactoryMeta::registry_ref("qa2"));
+    let n = g.node_opts::<serde_json::Value, _>(vec![a.erased(), a.erased()], |_| {}, opts);
+    let _keep = n.subscribe(|_| {});
+    let cp = g.checkpoint().unwrap();
+    assert_eq!(cp.nodes[1].deps, vec!["a", "a"]);
+    assert_eq!(cp.edges.len(), 1);
+    assert_eq!(cp.nodes[1].received.as_ref().unwrap().len(), 2);
+    assert!(cp.nodes[1].lifetime_deps.is_none());
+    let calls = Rc::new(Cell::new(0));
+    let restored =
+        restore_graph(cp, RestoreGraphOptions::new(registry(calls.clone(), false))).unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        restored
+            .describe()
+            .iter()
+            .find(|n| n.id == "n")
+            .unwrap()
+            .deps,
+        vec!["a", "a"]
+    );
+}
