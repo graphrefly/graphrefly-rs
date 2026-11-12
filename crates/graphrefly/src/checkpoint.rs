@@ -225,10 +225,6 @@ pub(crate) fn register_backend_state_contributor(
     });
 }
 
-pub(crate) fn unregister_backend_state_contributor(core: &Core) {
-    unregister_backend_state_contributor_key(core.identity_key());
-}
-
 pub(crate) fn unregister_backend_state_contributor_key(key: (usize, usize, u64)) {
     BACKEND_STATE_CONTRIBUTORS.with(|contributors| {
         contributors.borrow_mut().remove(&key);

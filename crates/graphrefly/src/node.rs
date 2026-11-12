@@ -40,9 +40,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 
 use crate::batch::{batch_frame_open, collecting_batch, defer_to_batch};
-use crate::checkpoint::{
-    unregister_backend_state_contributor, unregister_backend_state_contributor_key,
-};
+use crate::checkpoint::unregister_backend_state_contributor_key;
 use crate::ctx::{Ctx, DepRecord, DepTerminal};
 #[cfg(test)]
 use crate::dispatcher::default_dispatcher;
@@ -392,10 +390,8 @@ impl NodeIdentity {
     }
 }
 
-/// B49 / D71 transition slice: graph-local arena for node bookkeeping. The
-/// public [`Core`] is now a node id plus a shared graph arena, rather than a direct
-/// `Rc<RefCell<NodeInner>>`. Topology is already graph-owned in `NodeTopologySlot`;
-/// this keeps the public API stable while moving ownership toward arena-index execution.
+/// A graph's node arena (B49 / D71): a [`Core`] is a node id and generation into it,
+/// and each entry holds one node's parts together ([`NodeSlot`]).
 pub(crate) struct GraphArena(Rc<RefCell<GraphCore>>);
 
 impl GraphArena {
@@ -417,20 +413,31 @@ impl GraphArena {
 }
 
 struct GraphCore {
-    slots: Vec<Option<NodeInner>>,
-    topology_slots: Vec<Option<NodeTopologySlot>>,
-    call_slots: Vec<Option<NodeCallSlot>>,
-    config_slots: Vec<Option<NodeConfigSlot>>,
-    edge_slots: Vec<Option<DepEdges>>,
-    aux_slots: Vec<Option<NodeAux>>,
-    generations: Vec<u64>,
-    touched_waves: Vec<u64>,
-    pins: Vec<usize>,
+    entries: Vec<ArenaEntry>,
     free: Vec<usize>,
     /// The domain's host reporter (R-failure@3, R-graph-domain@3).
     reporter: Option<crate::report::HostReporter>,
     /// The graph's wave, request queue and batch (R-graph-domain@3).
     domain: DomainRef,
+}
+
+/// One node's parts, kept together in its arena entry (review §5.6).
+struct NodeSlot {
+    topology: NodeTopologySlot,
+    call: NodeCallSlot,
+    config: NodeConfigSlot,
+    edges: DepEdges,
+    aux: NodeAux,
+}
+
+/// An arena entry: the node while it lives, and the counters that outlive it.
+struct ArenaEntry {
+    node: Option<NodeSlot>,
+    /// Bumped on reuse, so a stale key never names the new node.
+    generation: u64,
+    /// The wave that last pinned this entry.
+    touched_wave: u64,
+    pins: usize,
 }
 
 /// A graph's concurrency domain (R-graph-domain@3): its own wave scope, delivery
@@ -495,27 +502,10 @@ fn with_wave<R>(d: &Domain, f: impl FnOnce(&RefCell<Option<WaveScope>>) -> R) ->
     f(&d.wave)
 }
 
-type TakenNodeSlot = (
-    NodeInner,
-    NodeTopologySlot,
-    NodeCallSlot,
-    NodeConfigSlot,
-    DepEdges,
-    NodeAux,
-);
-
 impl GraphCore {
     fn new() -> Self {
         Self {
-            slots: Vec::new(),
-            topology_slots: Vec::new(),
-            call_slots: Vec::new(),
-            config_slots: Vec::new(),
-            edge_slots: Vec::new(),
-            aux_slots: Vec::new(),
-            generations: Vec::new(),
-            touched_waves: Vec::new(),
-            pins: Vec::new(),
+            entries: Vec::new(),
             free: Vec::new(),
             reporter: None,
             domain: Domain::new(),
@@ -524,283 +514,107 @@ impl GraphCore {
 
     fn alloc(
         &mut self,
-        inner: NodeInner,
         topology: NodeTopologySlot,
         call: NodeCallSlot,
         config: NodeConfigSlot,
-    ) -> NodeId {
+    ) -> NodeKey {
         let edges = DepEdges::new(topology.deps.len());
-        let aux = NodeAux::new();
+        let node = Some(NodeSlot {
+            topology,
+            call,
+            config,
+            edges,
+            aux: NodeAux::new(),
+        });
         if let Some(id) = self.free.last().copied() {
-            let next_generation = self.generations[id]
+            let entry = &mut self.entries[id];
+            entry.generation = entry
+                .generation
                 .checked_add(1)
                 .expect("GraphCore generation overflow on slot reuse");
             self.free.pop();
-            self.slots[id] = Some(inner);
-            self.topology_slots[id] = Some(topology);
-            self.call_slots[id] = Some(call);
-            self.config_slots[id] = Some(config);
-            self.edge_slots[id] = Some(edges);
-            self.aux_slots[id] = Some(aux);
-            self.generations[id] = next_generation;
-            self.touched_waves[id] = 0;
-            self.pins[id] = 0;
-            NodeId(id)
+            entry.node = node;
+            entry.touched_wave = 0;
+            entry.pins = 0;
+            NodeKey {
+                id: NodeId(id),
+                generation: entry.generation,
+            }
         } else {
-            let id = self.slots.len();
-            self.slots.push(Some(inner));
-            self.topology_slots.push(Some(topology));
-            self.call_slots.push(Some(call));
-            self.config_slots.push(Some(config));
-            self.edge_slots.push(Some(edges));
-            self.aux_slots.push(Some(aux));
-            self.generations.push(0);
-            self.touched_waves.push(0);
-            self.pins.push(0);
-            NodeId(id)
+            self.entries.push(ArenaEntry {
+                node,
+                generation: 0,
+                touched_wave: 0,
+                pins: 0,
+            });
+            NodeKey {
+                id: NodeId(self.entries.len() - 1),
+                generation: 0,
+            }
         }
     }
 
-    fn key_for(&self, id: NodeId) -> NodeKey {
-        NodeKey {
-            id,
-            generation: self.generations[id.0],
-        }
+    /// The entry `key` names, if its generation still matches.
+    fn entry(&self, key: NodeKey) -> Option<&ArenaEntry> {
+        self.entries
+            .get(key.id.0)
+            .filter(|entry| entry.generation == key.generation)
+    }
+
+    fn entry_mut(&mut self, key: NodeKey) -> Option<&mut ArenaEntry> {
+        self.entries
+            .get_mut(key.id.0)
+            .filter(|entry| entry.generation == key.generation)
+    }
+
+    fn node(&self, key: NodeKey) -> &NodeSlot {
+        self.entry(key)
+            .and_then(|entry| entry.node.as_ref())
+            .expect("Core points at a stale or freed GraphCore slot")
+    }
+
+    fn node_mut(&mut self, key: NodeKey) -> &mut NodeSlot {
+        self.entry_mut(key)
+            .and_then(|entry| entry.node.as_mut())
+            .expect("Core points at a stale or freed GraphCore slot")
     }
 
     fn get(&self, key: NodeKey) -> &NodeTopologySlot {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.topology_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore topology slot")
+        &self.node(key).topology
     }
 
     fn get_node_and_edges_mut(&mut self, key: NodeKey) -> (&mut NodeTopologySlot, &mut DepEdges) {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        let n = self
-            .topology_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore topology slot");
-        let e = self
-            .edge_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore edge slot");
-        (n, e)
-    }
-
-    fn get_call(&self, key: NodeKey) -> &NodeCallSlot {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.call_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore call slot")
-    }
-
-    fn get_call_mut(&mut self, key: NodeKey) -> &mut NodeCallSlot {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.call_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore call slot")
-    }
-
-    fn get_config(&self, key: NodeKey) -> &NodeConfigSlot {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.config_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore config slot")
-    }
-
-    fn get_node_edges_aux_mut(
-        &mut self,
-        key: NodeKey,
-    ) -> (&mut NodeTopologySlot, &mut DepEdges, &mut NodeAux) {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        let topology_slots = &mut self.topology_slots;
-        let edge_slots = &mut self.edge_slots;
-        let aux_slots = &mut self.aux_slots;
-        let n = topology_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore topology slot");
-        let e = edge_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore edge slot");
-        let a = aux_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore aux slot");
-        (n, e, a)
-    }
-
-    fn get_node_call_config_edges_mut(
-        &mut self,
-        key: NodeKey,
-    ) -> (
-        &mut NodeTopologySlot,
-        &mut NodeCallSlot,
-        &mut NodeConfigSlot,
-        &mut DepEdges,
-    ) {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        let topology_slots = &mut self.topology_slots;
-        let call_slots = &mut self.call_slots;
-        let config_slots = &mut self.config_slots;
-        let edge_slots = &mut self.edge_slots;
-        let n = topology_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore topology slot");
-        let c = call_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore call slot");
-        let cfg = config_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore config slot");
-        let e = edge_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore edge slot");
-        (n, c, cfg, e)
-    }
-
-    fn get_node_call_config_edges_aux_mut(
-        &mut self,
-        key: NodeKey,
-    ) -> (
-        &mut NodeTopologySlot,
-        &mut NodeCallSlot,
-        &mut NodeConfigSlot,
-        &mut DepEdges,
-        &mut NodeAux,
-    ) {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        let topology_slots = &mut self.topology_slots;
-        let call_slots = &mut self.call_slots;
-        let config_slots = &mut self.config_slots;
-        let edge_slots = &mut self.edge_slots;
-        let aux_slots = &mut self.aux_slots;
-        let n = topology_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore topology slot");
-        let c = call_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore call slot");
-        let cfg = config_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore config slot");
-        let e = edge_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore edge slot");
-        let a = aux_slots
-            .get_mut(key.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore aux slot");
-        (n, c, cfg, e, a)
-    }
-
-    fn get_aux(&self, key: NodeKey) -> &NodeAux {
-        assert!(
-            self.is_live_key(key),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        self.aux_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore aux slot")
-    }
-
-    fn is_live(&self, id: NodeId) -> bool {
-        let live = self.slots.get(id.0).is_some_and(Option::is_some);
-        if live {
-            debug_assert!(self.topology_slots.get(id.0).is_some_and(Option::is_some));
-            debug_assert!(self.call_slots.get(id.0).is_some_and(Option::is_some));
-            debug_assert!(self.config_slots.get(id.0).is_some_and(Option::is_some));
-            debug_assert!(self.edge_slots.get(id.0).is_some_and(Option::is_some));
-            debug_assert!(self.aux_slots.get(id.0).is_some_and(Option::is_some));
-        }
-        live
+        let slot = self.node_mut(key);
+        (&mut slot.topology, &mut slot.edges)
     }
 
     fn is_live_key(&self, key: NodeKey) -> bool {
-        self.generations.get(key.id.0) == Some(&key.generation) && self.is_live(key.id)
+        self.entry(key).is_some_and(|entry| entry.node.is_some())
     }
 
     fn pin_live_key(&mut self, key: NodeKey) -> bool {
-        if !self.is_live_key(key) {
+        let Some(entry) = self.entry_mut(key).filter(|entry| entry.node.is_some()) else {
             return false;
-        }
-        self.pins[key.id.0] = self.pins[key.id.0]
+        };
+        entry.pins = entry
+            .pins
             .checked_add(1)
             .expect("GraphCore pin count overflow");
         true
     }
 
     fn release_pin(&mut self, key: NodeKey) {
-        if self.generations.get(key.id.0) != Some(&key.generation) {
-            return;
-        }
-        let Some(pin) = self.pins.get_mut(key.id.0) else {
-            return;
-        };
-        if *pin > 0 {
-            *pin -= 1;
+        if let Some(entry) = self.entry_mut(key) {
+            entry.pins = entry.pins.saturating_sub(1);
         }
     }
 
     fn pin_count(&self, key: NodeKey) -> usize {
-        if self.generations.get(key.id.0) != Some(&key.generation) {
-            return 0;
-        }
-        self.pins.get(key.id.0).copied().unwrap_or(0)
+        self.entry(key).map_or(0, |entry| entry.pins)
     }
 
-    fn take_live(&mut self, key: NodeKey) -> Option<TakenNodeSlot> {
-        if !self.is_live_key(key) {
-            return None;
-        }
-        let inner = self.slots.get_mut(key.id.0)?.take()?;
-        let topology = self.topology_slots.get_mut(key.id.0)?.take()?;
-        let call = self.call_slots.get_mut(key.id.0)?.take()?;
-        let config = self.config_slots.get_mut(key.id.0)?.take()?;
-        let edges = self.edge_slots.get_mut(key.id.0)?.take()?;
-        let aux = self.aux_slots.get_mut(key.id.0)?.take()?;
-        Some((inner, topology, call, config, edges, aux))
+    fn take_live(&mut self, key: NodeKey) -> Option<NodeSlot> {
+        self.entry_mut(key)?.node.take()
     }
 }
 
@@ -1133,10 +947,8 @@ struct NodeTopologySlot {
     topology_deps_changed: Option<TopologyDepsChangedObserver>,
 }
 
-struct NodeInner;
-
-/// Release a node's upstream subscriptions + external resources when its inner is
-/// finally dropped (D1).
+/// Release a node's upstream subscriptions + external resources when its slot is
+/// freed (D1).
 ///
 /// Rust has no GC, so a `Node<T>` dropped without an explicit unsubscribe (and
 /// with no subscriber-driven deactivation) would otherwise leave its sink in each
@@ -1147,14 +959,11 @@ struct NodeInner;
 /// live borrow on `self`); each unsub touches a *dep* node (a different `RefCell`),
 /// recursively deactivating up the DAG (terminates); idempotent with `deactivate`
 /// (which already drained both vecs, so this is then a no-op).
-impl NodeInner {
-    fn cleanup_before_free(
-        &mut self,
-        call: &mut NodeCallSlot,
-        edges: &mut DepEdges,
-        aux: &mut NodeAux,
-        reporter: Option<crate::report::HostReporter>,
-    ) {
+impl NodeSlot {
+    fn cleanup_before_free(&mut self, reporter: Option<crate::report::HostReporter>) {
+        let NodeSlot {
+            call, edges, aux, ..
+        } = self;
         // B32: free this node's fn slot so the dispatcher pool no longer holds the fn —
         // and thus the upstream `Core`s the fn captured (e.g. a `Node: Clone` handle, the
         // idiomatic feedback pattern) — alive for the whole process. Safe: invoke clones
@@ -1280,8 +1089,8 @@ impl Core {
         f: impl FnOnce(&mut NodeTopologySlot, &mut DepEdges) -> R,
     ) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, e) = g.get_node_and_edges_mut(self.key());
-        f(n, e)
+        let slot = g.node_mut(self.key());
+        f(&mut slot.topology, &mut slot.edges)
     }
 
     fn with_inner_edges_aux_mut<R>(
@@ -1289,19 +1098,14 @@ impl Core {
         f: impl FnOnce(&mut NodeTopologySlot, &mut DepEdges, &mut NodeAux) -> R,
     ) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, e, a) = g.get_node_edges_aux_mut(self.key());
-        f(n, e, a)
+        let slot = g.node_mut(self.key());
+        f(&mut slot.topology, &mut slot.edges, &mut slot.aux)
     }
 
     fn with_inner_edges<R>(&self, f: impl FnOnce(&NodeTopologySlot, &DepEdges) -> R) -> R {
         let g = self.graph.borrow();
-        let n = g.get(self.key());
-        let e = g
-            .edge_slots
-            .get(self.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore edge slot");
-        f(n, e)
+        let slot = g.node(self.key());
+        f(&slot.topology, &slot.edges)
     }
 
     fn with_node_state_mut<R>(
@@ -1314,8 +1118,13 @@ impl Core {
         ) -> R,
     ) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, c, cfg, e) = g.get_node_call_config_edges_mut(self.key());
-        f(n, c, cfg, e)
+        let slot = g.node_mut(self.key());
+        f(
+            &mut slot.topology,
+            &mut slot.call,
+            &mut slot.config,
+            &mut slot.edges,
+        )
     }
 
     fn with_node_state_aux_mut<R>(
@@ -1329,42 +1138,34 @@ impl Core {
         ) -> R,
     ) -> R {
         let mut g = self.graph.borrow_mut();
-        let (n, c, cfg, e, a) = g.get_node_call_config_edges_aux_mut(self.key());
-        f(n, c, cfg, e, a)
+        let slot = g.node_mut(self.key());
+        f(
+            &mut slot.topology,
+            &mut slot.call,
+            &mut slot.config,
+            &mut slot.edges,
+            &mut slot.aux,
+        )
     }
 
     fn with_call<R>(&self, f: impl FnOnce(&NodeCallSlot) -> R) -> R {
-        let g = self.graph.borrow();
-        f(g.get_call(self.key()))
+        f(&self.graph.borrow().node(self.key()).call)
     }
 
     fn with_call_mut<R>(&self, f: impl FnOnce(&mut NodeCallSlot) -> R) -> R {
-        let mut g = self.graph.borrow_mut();
-        f(g.get_call_mut(self.key()))
+        f(&mut self.graph.borrow_mut().node_mut(self.key()).call)
     }
 
     fn with_config<R>(&self, f: impl FnOnce(&NodeConfigSlot) -> R) -> R {
-        let g = self.graph.borrow();
-        f(g.get_config(self.key()))
+        f(&self.graph.borrow().node(self.key()).config)
     }
 
     fn with_aux<R>(&self, f: impl FnOnce(&NodeAux) -> R) -> R {
-        let g = self.graph.borrow();
-        f(g.get_aux(self.key()))
+        f(&self.graph.borrow().node(self.key()).aux)
     }
 
     fn with_aux_mut<R>(&self, f: impl FnOnce(&mut NodeAux) -> R) -> R {
-        let mut g = self.graph.borrow_mut();
-        assert!(
-            g.is_live_key(self.key()),
-            "Core points at a stale or freed GraphCore slot"
-        );
-        let a = g
-            .aux_slots
-            .get_mut(self.id.0)
-            .and_then(Option::as_mut)
-            .expect("Core points at a live GraphCore aux slot");
-        f(a)
+        f(&mut self.graph.borrow_mut().node_mut(self.key()).aux)
     }
 
     fn downgrade(&self) -> CoreWeak {
@@ -1409,45 +1210,40 @@ fn free_slot_if_unreferenced(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, r
     if refs.get() != 0 {
         return;
     }
-    let (mut inner, topology, mut call, config, mut edges, mut aux) = {
+    let slot = {
         let mut graph = graph_ref.borrow_mut();
         if graph.pin_count(key) != 0 {
             return;
         }
-        let Some(pair) = graph.take_live(key) else {
+        let Some(slot) = graph.take_live(key) else {
             return;
         };
-        pair
+        slot
     };
-    struct FreeSlotOnDrop {
-        graph: Rc<RefCell<GraphCore>>,
-        id: usize,
-        armed: bool,
-    }
-    impl Drop for FreeSlotOnDrop {
+    free_taken_slot(graph_ref, key, slot);
+}
+
+/// Closes a node taken out of the arena (R-lifetime@2) and returns its entry to the
+/// free list, also when the close panics.
+fn free_taken_slot(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, mut slot: NodeSlot) {
+    struct FreeSlotOnDrop<'a>(&'a Rc<RefCell<GraphCore>>, usize);
+    impl Drop for FreeSlotOnDrop<'_> {
         fn drop(&mut self) {
-            if self.armed {
-                self.graph.borrow_mut().free.push(self.id);
-            }
+            self.0.borrow_mut().free.push(self.1);
         }
     }
-    let mut free_slot = FreeSlotOnDrop {
-        graph: graph_ref.clone(),
-        id: key.id.0,
-        armed: true,
-    };
+    let free_slot = FreeSlotOnDrop(graph_ref, key.id.0);
     unregister_backend_state_contributor_key((
         Rc::as_ptr(graph_ref) as usize,
         key.id.0,
         key.generation,
     ));
-    inner.cleanup_before_free(&mut call, &mut edges, &mut aux, graph_reporter(graph_ref));
-    free_slot.armed = false;
-    graph_ref.borrow_mut().free.push(key.id.0);
+    slot.cleanup_before_free(graph_reporter(graph_ref));
+    drop(free_slot);
     // The freed node's parts hold handles to its dependencies, whose own frees would
     // nest one level per node: they are dropped by one loop instead, so a long chain
     // frees with a constant stack depth (review Q15).
-    drop_later(Box::new((inner, topology, call, config, edges, aux)));
+    drop_later(Box::new(slot));
 }
 
 thread_local! {
@@ -1834,18 +1630,17 @@ impl WaveScope {
             if !g.is_live_key(arena_key.node) {
                 return false;
             }
-            let id = arena_key.node.id.0;
-            if g.touched_waves.get(id) == Some(&self.wave_id) {
+            let entry = g
+                .entry_mut(arena_key.node)
+                .expect("Core points at a live GraphCore entry");
+            if entry.touched_wave == self.wave_id {
                 return true;
             }
-            g.pins[id] = g.pins[id]
+            entry.pins = entry
+                .pins
                 .checked_add(1)
                 .expect("GraphCore pin count overflow");
-            let touched = g
-                .touched_waves
-                .get_mut(id)
-                .expect("Core points at a live GraphCore touch slot");
-            *touched = self.wave_id;
+            entry.touched_wave = self.wave_id;
         }
         self.touched.push(ArenaNodePin {
             arena_key,
@@ -2300,11 +2095,7 @@ impl Core {
         if g.pin_count(key) != 0 {
             return false;
         }
-        let e = g
-            .edge_slots
-            .get(key.id.0)
-            .and_then(Option::as_ref)
-            .expect("Core points at a live GraphCore edge slot");
+        let e = &g.node(key).edges;
         e.state.pending == 0
             && !e.wave.inside_run_wave
             && !e.wave.in_dep_mutation
@@ -2332,28 +2123,7 @@ impl Core {
             slot
         };
         self.refs.set(0);
-        struct FreeSlotOnDrop {
-            graph: Rc<RefCell<GraphCore>>,
-            id: usize,
-            armed: bool,
-        }
-        impl Drop for FreeSlotOnDrop {
-            fn drop(&mut self) {
-                if self.armed {
-                    self.graph.borrow_mut().free.push(self.id);
-                }
-            }
-        }
-        let mut free_slot = FreeSlotOnDrop {
-            graph: self.graph.clone(),
-            id: key.id.0,
-            armed: true,
-        };
-        unregister_backend_state_contributor(self);
-        let (mut inner, _topology, mut call, _config, mut edges, mut aux) = slot;
-        inner.cleanup_before_free(&mut call, &mut edges, &mut aux, graph_reporter(&self.graph));
-        free_slot.armed = false;
-        self.graph.borrow_mut().free.push(key.id.0);
+        free_taken_slot(&self.graph, key, slot);
         true
     }
 
@@ -2532,7 +2302,6 @@ impl Core {
             deps,
             topology_deps_changed: None,
         };
-        let inner = NodeInner;
         let mut environment = EnvironmentDrivers::default();
         environment.set_local_async_driver(dispatcher.local_async_driver());
         let call = NodeCallSlot {
@@ -2544,11 +2313,11 @@ impl Core {
         let config = NodeConfigSlot::from_opts(&opts);
         {
             let mut g = arena.0.borrow_mut();
-            let id = g.alloc(inner, topology, call, config);
-            let generation = g.key_for(id).generation;
+            let key = g.alloc(topology, call, config);
+            let NodeKey { id, generation } = key;
             // R-initial: a provided initial pre-populates the cache.
             if let Some(v) = initial {
-                let (_n, e) = g.get_node_and_edges_mut(NodeKey { id, generation });
+                let e = &mut g.node_mut(key).edges;
                 e.value.values = vec![v.clone()];
                 e.value.cache = Some(v);
                 e.value.has_data = true;
@@ -4795,7 +4564,7 @@ mod tests {
                 !fn_dropped.get(),
                 "the fn (and its capture) is live while the node is"
             );
-            // `p` + `_u` drop here → p's Core refcount → 0 → NodeInner::Drop → dispatcher
+            // `p` + `_u` drop here → p's Core refcount → 0 → the slot is freed → dispatcher
             // .unregister → the pool drops the fn → the captured guard drops.
         }
         assert!(
@@ -4855,7 +4624,7 @@ mod tests {
     #[test]
     fn drop_returns_arena_slot_when_cleanup_hook_panics() {
         let g = TestArena::new();
-        // B49/D71 regression: Core::drop removes the NodeInner from the arena before
+        // B49/D71 regression: Core::drop takes the node's slot out of the arena before
         // running cleanup. Even if a user cleanup hook panics, the slot id must be
         // returned to the free list.
         let probe = g.state::<i32>(0);
@@ -6004,7 +5773,7 @@ mod tests {
         let first = Node::<i32>::state_in_arena(&arena, 1);
         let slot = first.core.id.0;
         drop(first);
-        arena.0.borrow_mut().generations[slot] = u64::MAX;
+        arena.0.borrow_mut().entries[slot].generation = u64::MAX;
 
         let _second = Node::<i32>::state_in_arena(&arena, 2);
     }
