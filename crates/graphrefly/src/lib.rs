@@ -158,10 +158,10 @@ pub use adapters::bridge_protobuf::{
     encode_canonical_wire_edge_cause, encode_wire_bridge_protobuf_bytes, CanonicalProtobufError,
     CanonicalProtobufErrorCategory, CanonicalWireBridgeDataBody, CanonicalWireBridgeEnvelope,
     CanonicalWireBridgeMetadata, CanonicalWireBridgePayload, CanonicalWireEdgeArrays,
-    WireEdgeCause, CanonicalWireMessage, WireBridgeProtobufDataBody,
-    WireBridgeProtobufDecode, WireBridgeProtobufEncode, WireBridgeProtobufEnvelope,
-    WireBridgeProtobufHelperShape, WireBridgeProtobufIssue, WireBridgeProtobufPayload,
-    WireBridgeProtobufStatus, WireBridgeProtobufStatusKind, WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE,
+    CanonicalWireMessage, WireBridgeProtobufDataBody, WireBridgeProtobufDecode,
+    WireBridgeProtobufEncode, WireBridgeProtobufEnvelope, WireBridgeProtobufHelperShape,
+    WireBridgeProtobufIssue, WireBridgeProtobufPayload, WireBridgeProtobufStatus,
+    WireBridgeProtobufStatusKind, WireEdgeCause, WIRE_BRIDGE_PROTOBUF_HELPER_SHAPE,
 };
 pub use adapters::environment::{
     to_http, to_http_with_options, to_process, to_process_with_options, to_websocket,
@@ -183,7 +183,7 @@ pub use adapters::reactive_collection_storage::{
     ReactiveCollectionPersistenceStatusFact,
 };
 pub use adapters::wire_edge_group::{
-    frame_sink, frame_source, wire_edge_group_in, wire_edge_group_out, FrameDeliver, 
+    frame_sink, frame_source, wire_edge_group_in, wire_edge_group_out, FrameDeliver,
     WireEdgeGateValue, WireEdgeGroupIn, WireEdgeIssue, WireEdgeView,
 };
 #[cfg(feature = "tokio")]
@@ -208,8 +208,7 @@ pub mod __binding_private {
     pub use crate::checkpoint::register_checkpoint_json_encoder;
 }
 pub use combinators::{
-    buffer, buffer_count, combine, combine_latest, concat, race, sample, take_until,
-    with_latest_from, zip,
+    buffer, buffer_count, combine, concat, race, sample, take_until, with_latest_from, zip,
 };
 pub use composition::{
     pipe, stratify, stratify_branch, Pipe, Stratified, StratifyOptions, StratifyRule,
@@ -292,9 +291,9 @@ pub use node::{
     ReplaceOpts, State, StateWrite, Status,
 };
 pub use operators::{
-    catch_error, distinct_until_changed, element_at, filter, find, first, first_any, last,
-    last_any, map, merge, on_first_data, on_first_data_where, pairwise, reduce, rescue, scan,
-    settle, settle_by, skip, take, take_while, tap, tap_first, valve, Operator,
+    distinct_until_changed, element_at, filter, find, first, first_any, last, last_any, map, merge,
+    on_first_data, on_first_data_where, pairwise, reduce, rescue, scan, settle, settle_by, skip,
+    take, take_while, tap, valve, Operator,
 };
 pub use patterns::{
     admission_filter_3d, admission_scored, cosine_similarity, filter_memory_fragments,
@@ -416,10 +415,7 @@ pub use storage::{
     REACTIVE_COLLECTION_FRAME_VERSION, REACTIVE_COLLECTION_SNAPSHOT_FORMAT, WAL_FORMAT_VERSION,
     WAL_FRAME_SEQ_PAD, WAL_KEY_SEGMENT,
 };
-pub use time::{
-    audit, audit_time, buffer_time, debounce, debounce_time, delay, throttle, throttle_time,
-    timeout,
-};
+pub use time::{audit, audit_time, buffer_time, debounce, delay, throttle, timeout};
 pub use work_queue::readiness::{
     work_queue_lease_expiration_command, work_queue_lease_expiration_command_projector,
     work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,

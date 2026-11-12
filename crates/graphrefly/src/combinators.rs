@@ -32,11 +32,6 @@ pub fn combine<T: Clone + 'static>() -> Operator<Vec<T>> {
     )
 }
 
-/// combine_latest: alias-shaped Rust helper for [`combine`].
-pub fn combine_latest<T: Clone + 'static>() -> Operator<Vec<T>> {
-    combine()
-}
-
 /// with_latest_from: dep 0 drives `(primary, latest_secondary)` emissions.
 pub fn with_latest_from<A: Clone + 'static, B: Clone + 'static>() -> Operator<(A, B)> {
     Operator::fixed(

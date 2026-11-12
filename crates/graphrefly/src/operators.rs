@@ -497,11 +497,6 @@ pub fn on_first_data_where<S: Clone + 'static>(
     })
 }
 
-/// tap_first: alias-shaped Rust helper for [`on_first_data`].
-pub fn tap_first<S: Clone + 'static>(f: impl Fn(&S) + 'static) -> Operator<S> {
-    on_first_data(f)
-}
-
 #[derive(Clone)]
 struct SettleState<S> {
     last: Option<S>,
@@ -591,11 +586,6 @@ pub fn rescue<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) -> Oper
             }
         },
     )
-}
-
-/// catch_error: alias-shaped Rust helper for [`rescue`].
-pub fn catch_error<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) -> Operator<S> {
-    rescue(recover)
 }
 
 /// valve: forward source DATA while boolean control dep is true.

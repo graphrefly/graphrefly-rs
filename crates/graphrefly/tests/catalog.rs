@@ -13,17 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_core::Stream;
 use graphrefly::{
-    audit, audit_time, buffer, buffer_count, buffer_time, catch_error, combine, combine_latest,
-    concat, concat_map, debounce, debounce_time, delay, distinct_until_changed, element_at, empty,
-    exhaust_map, filter, find, first, first_any, first_sync_value_from, flat_map, from_cron,
-    from_cron_with_options, from_fs_watch, from_fs_watch_with_options, from_git_hook,
-    from_git_hook_with_options, from_http, from_iter, from_process, from_sse,
-    from_sse_with_options, from_timer, from_webhook, from_webhook_with_options, from_websocket,
-    future_local, graph, interval, last, last_any, map, matches_cron, merge_map,
-    merge_map_with_options, never, of, on_first_data, on_first_data_where, pairwise, parse_cron,
-    race, reduce, repeat, rescue, run_process, sample, scan, settle, settle_by,
-    single_sync_value_from, skip, stream_local, switch_map, take, take_until, take_while, tap,
-    tap_first, throttle, throttle_time, throw_error, timeout, timer, valve, with_latest_from, zip,
+    audit, audit_time, buffer, buffer_count, buffer_time, combine, concat, concat_map, debounce,
+    delay, distinct_until_changed, element_at, empty, exhaust_map, filter, find, first, first_any,
+    first_sync_value_from, flat_map, from_cron, from_cron_with_options, from_fs_watch,
+    from_fs_watch_with_options, from_git_hook, from_git_hook_with_options, from_http, from_iter,
+    from_process, from_sse, from_sse_with_options, from_timer, from_webhook,
+    from_webhook_with_options, from_websocket, future_local, graph, interval, last, last_any, map,
+    matches_cron, merge_map, merge_map_with_options, never, of, on_first_data, on_first_data_where,
+    pairwise, parse_cron, race, reduce, repeat, rescue, run_process, sample, scan, settle,
+    settle_by, single_sync_value_from, skip, stream_local, switch_map, take, take_until,
+    take_while, tap, throttle, throw_error, timeout, timer, valve, with_latest_from, zip,
     CronInstant, CronTick, Dispatcher, EnvironmentDrivers, FromCronOptions, FromFsWatchOptions,
     FromGitHookOptions, FsEvent, FsEventKind, GitEvent, GraphNodeOpts, GraphOptions, HttpRequest,
     HttpResponse, HttpStreamDriverEvent, HttpStreamHead, LocalAsyncDriver, LocalHttpDriver,
@@ -2498,7 +2497,10 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
     assert!(delayed_seen.borrow().is_empty());
     assert_eq!(driver.sleepers.borrow().len(), 2);
     assert!(
-        g.topology().nodes.iter().any(|n| n.factory == "timer"),
+        g.topology()
+            .nodes
+            .iter()
+            .any(|n| n.factory == "timer"),
         "time operators should expose pending helper timer nodes through describe discovery"
     );
     driver.fire_sleepers();
@@ -2511,9 +2513,9 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
 
     let debounced_src = g.state_empty::<i32>();
     let debounced = g.init_node(
-        debounce_time::<i32>(10),
+        debounce::<i32>(10),
         vec![debounced_src.erased()],
-        GraphNodeOpts::named("debounce_time"),
+        GraphNodeOpts::named("debounce"),
     );
     let debounced_seen = collect_data(&debounced);
     debounced_src.set(1);
@@ -2522,14 +2524,14 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
     assert_eq!(
         *debounced_seen.borrow(),
         vec![2],
-        "debounce_time should cancel the superseded timer via unsubscribe_dep"
+        "debounce should cancel the superseded timer via unsubscribe_dep"
     );
 
     let throttled_src = g.state_empty::<i32>();
     let throttled = g.init_node(
-        throttle_time::<i32>(10),
+        throttle::<i32>(10),
         vec![throttled_src.erased()],
-        GraphNodeOpts::named("throttle_time"),
+        GraphNodeOpts::named("throttle"),
     );
     let throttled_seen = collect_data(&throttled);
     throttled_src.set(1);
@@ -2537,7 +2539,7 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
     assert_eq!(
         *throttled_seen.borrow(),
         vec![1],
-        "throttle_time is leading-edge and ignores values while the timer window is live"
+        "throttle is leading-edge and ignores values while the timer window is live"
     );
     driver.fire_sleepers();
     throttled_src.set(3);
@@ -2560,46 +2562,32 @@ fn time_operators_compose_over_graph_scoped_timer_helpers() {
         "audit_time should emit the latest value when the visible timer dep closes"
     );
 
-    let factories = g
-        .topology()
+    let factories = g.topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
         .collect::<Vec<_>>();
     assert!(factories.contains(&"delay".to_owned()));
-    assert!(factories.contains(&"debounceTime".to_owned()));
-    assert!(factories.contains(&"throttleTime".to_owned()));
+    assert!(factories.contains(&"debounce".to_owned()));
+    assert!(factories.contains(&"throttle".to_owned()));
     assert!(factories.contains(&"auditTime".to_owned()));
 
-    let alias_src = g.state_empty::<i32>();
-    let _debounce = g.init_node(
-        debounce::<i32>(10),
-        vec![alias_src.erased()],
-        GraphNodeOpts::named("debounce"),
-    );
-    let _throttle = g.init_node(
-        throttle::<i32>(10),
-        vec![alias_src.erased()],
-        GraphNodeOpts::named("throttle"),
-    );
+    let audit_src = g.state_empty::<i32>();
     let notifier = g.state_empty::<()>();
     let _audit = g.init_node(
         audit::<i32, ()>({
             let notifier = notifier.clone();
             move |_| notifier.node().clone()
         }),
-        vec![alias_src.erased()],
+        vec![audit_src.erased()],
         GraphNodeOpts::named("audit"),
     );
-    let alias_factories = g
-        .topology()
+    let audit_factories = g.topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
         .collect::<Vec<_>>();
-    assert!(alias_factories.contains(&"debounce".to_owned()));
-    assert!(alias_factories.contains(&"throttle".to_owned()));
-    assert!(alias_factories.contains(&"audit".to_owned()));
+    assert!(audit_factories.contains(&"audit".to_owned()));
 }
 
 #[test]
@@ -2611,7 +2599,7 @@ fn throttle_waits_for_open_window_before_source_complete() {
     });
     let src = g.state_empty::<i32>();
     let throttled = g.init_node(
-        throttle_time::<i32>(10),
+        throttle::<i32>(10),
         vec![src.erased()],
         GraphNodeOpts::named("throttle_complete_window"),
     );
@@ -2652,7 +2640,7 @@ fn throttle_reactivation_starts_a_new_lifetime_on_the_completed_snapshot() {
     });
     let src = g.state_empty::<i32>();
     let throttled = g.init_node(
-        throttle_time::<i32>(10),
+        throttle::<i32>(10),
         vec![src.erased()],
         GraphNodeOpts::named("throttle_deactivate_window"),
     );
@@ -3146,8 +3134,7 @@ fn buffer_time_propagates_source_error_missing_driver_and_is_described() {
         vec![buffered.erased()],
         GraphNodeOpts::named("buffer_time_sink"),
     );
-    let factories = g
-        .topology()
+    let factories = g.topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
@@ -3257,7 +3244,7 @@ fn time_operator_missing_driver_routes_timer_error() {
 
     let src = g.state_empty::<i32>();
     let debounced = g.init_node(
-        debounce_time::<i32>(10),
+        debounce::<i32>(10),
         vec![src.erased()],
         GraphNodeOpts::named("debounce_time_missing_driver"),
     );
@@ -3268,7 +3255,7 @@ fn time_operator_missing_driver_routes_timer_error() {
 
     let src = g.state_empty::<i32>();
     let throttled = g.init_node(
-        throttle_time::<i32>(10),
+        throttle::<i32>(10),
         vec![src.erased()],
         GraphNodeOpts::named("throttle_time_missing_driver"),
     );
@@ -3525,9 +3512,9 @@ fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
 
     let source = g.state(1i32);
     let recovered = g.init_node(
-        catch_error::<i32>(|_| 42),
+        rescue::<i32>(|_| 42),
         vec![source.erased()],
-        GraphNodeOpts::named("catch_error"),
+        GraphNodeOpts::named("rescue"),
     );
     let recovered_seen = collect_data(&recovered);
     source.error("boom");
@@ -3561,9 +3548,9 @@ fn catalog_aliases_predicates_and_empty_terminals_are_pinned() {
         GraphNodeOpts::named("tap_first_src"),
     );
     let tapped = g.init_node(
-        tap_first::<i32>(move |v| tapped_sink.borrow_mut().push(*v)),
+        on_first_data::<i32>(move |v| tapped_sink.borrow_mut().push(*v)),
         vec![src.erased()],
-        GraphNodeOpts::named("tap_first"),
+        GraphNodeOpts::named("on_first_data"),
     );
     assert_eq!(*collect_data(&tapped).borrow(), vec![8, 9]);
     assert_eq!(*tapped_values.borrow(), vec![8]);
@@ -3629,8 +3616,7 @@ fn scan_and_merge_catalog_symbols_are_directly_pinned() {
     right.set(11);
     assert_eq!(*merged_seen.borrow(), vec![1, 10, 11]);
 
-    let factories = g
-        .topology()
+    let factories = g.topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)
@@ -3673,7 +3659,7 @@ fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
 
     let source = g.state_empty::<i32>();
     let recovered = g.init_node(
-        catch_error::<i32>(|_| panic!("recover callback boom")),
+        rescue::<i32>(|_| panic!("recover callback boom")),
         vec![source.erased()],
         GraphNodeOpts::named("catch_error_recover_panic"),
     );
@@ -3782,9 +3768,9 @@ fn static_combinators_use_declared_deps_and_state() {
     let left = g.state_empty::<i32>();
     let right = g.state_empty::<i32>();
     let combined_latest = g.init_node(
-        combine_latest::<i32>(),
+        combine::<i32>(),
         vec![left.erased(), right.erased()],
-        GraphNodeOpts::named("combine_latest"),
+        GraphNodeOpts::named("combine_second"),
     );
     let combined_latest_seen = collect_data(&combined_latest);
     left.set(4);
@@ -4198,8 +4184,7 @@ fn higher_order_repeat_replays_fresh_factory_rounds_and_completes() {
         graphrefly::OutputStatus::Completed
     );
 
-    let factories = g
-        .topology()
+    let factories = g.topology()
         .nodes
         .into_iter()
         .map(|n| n.factory)

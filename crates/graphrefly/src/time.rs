@@ -22,7 +22,7 @@ fn delayed_value<S: Clone + 'static>(ctx: &Ctx, value: S, ms: u64) -> Node<S> {
     ctx.init_node_in_scope(
         Operator::fixed(
             "delayedValue",
-            0,
+            1,
             crate::node::NodeOpts {
                 error: Policy::Manual,
                 complete: Policy::Manual,
@@ -59,21 +59,9 @@ pub fn debounce<S: Clone + 'static>(ms: u64) -> Operator<S> {
     })
 }
 
-/// debounce_time: RxJS-shaped alias of [`debounce`] with its own factory name.
-pub fn debounce_time<S: Clone + 'static>(ms: u64) -> Operator<S> {
-    switch_map_with_ctx("debounceTime", move |ctx, value: &S| {
-        delayed_value(ctx, value.clone(), ms)
-    })
-}
-
 /// throttle: leading-edge throttle. Emit immediately, then ignore source DATA for `ms`.
 pub fn throttle<S: Clone + 'static>(ms: u64) -> Operator<S> {
     throttle_with_factory("throttle", ms)
-}
-
-/// throttle_time: RxJS-shaped alias of [`throttle`] with its own factory name.
-pub fn throttle_time<S: Clone + 'static>(ms: u64) -> Operator<S> {
-    throttle_with_factory("throttleTime", ms)
 }
 
 #[derive(Clone)]
@@ -341,7 +329,7 @@ pub fn timeout<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<S> {
     });
 
     let node = crate::operators::init_node_in_arena_with_dispatcher(
-        Operator::fixed("timeout", 1, time_helper_opts(), move |ctx| {
+        Operator::fixed("timeout", 2, time_helper_opts(), move |ctx| {
             body(ctx);
         }),
         &source_core.arena(),
@@ -426,7 +414,7 @@ pub fn buffer_time<S: Clone + 'static>(source: &Node<S>, ms: u64) -> Node<Vec<S>
     });
 
     let node = crate::operators::init_node_in_arena_with_dispatcher(
-        Operator::fixed("bufferTime", 1, time_helper_opts(), move |ctx| {
+        Operator::fixed("bufferTime", 2, time_helper_opts(), move |ctx| {
             body(ctx);
         }),
         &source_core.arena(),
