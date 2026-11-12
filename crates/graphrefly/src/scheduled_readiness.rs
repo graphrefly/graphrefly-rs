@@ -939,7 +939,7 @@ fn project_fact<T: Clone + 'static>(
                     emitted.push(value);
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         node_opts(name, factory),
     )

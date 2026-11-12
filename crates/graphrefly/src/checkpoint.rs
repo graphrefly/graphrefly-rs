@@ -537,7 +537,7 @@ impl GraphRestoreDescriptor for MapJsonRestoreDescriptor {
                     Err(err) => panic!("{err}"),
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         });
         Ok(RestoreNodeDefinition {
             factory: "map".to_owned(),
@@ -1777,7 +1777,7 @@ mod tests {
                         acc += 1;
                         emitted.push(json!(acc));
                     }
-                    ctx.emit_all(emitted);
+                    ctx.down(crate::protocol::data_wave(emitted));
                     ctx.state_set(json!(acc));
                 })),
                 opts: restored_opts(ctx.checkpoint)?,
@@ -1803,7 +1803,7 @@ mod tests {
                     acc += 1;
                     emitted.push(json!(acc));
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
                 ctx.state_set(json!(acc));
             },
             opts,
@@ -1897,7 +1897,7 @@ mod tests {
                 for value in ctx.dep(0).values::<GraphCheckpointJson>() {
                     emitted.push(json!(value.as_i64().expect("number input") * 2));
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             },
             opts,
         );
@@ -1959,7 +1959,7 @@ mod tests {
                 for value in ctx.dep(0).values::<GraphCheckpointJson>() {
                     emitted.push(value.as_ref().clone());
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             },
             opts,
         );

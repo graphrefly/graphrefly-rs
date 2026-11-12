@@ -216,7 +216,11 @@ fn forward_i32(ctx: &graphrefly::Ctx) {
 /// A kernel node's function that forwards each array of its one dependency's values.
 fn forward_arrays_i32(ctx: &graphrefly::Ctx) {
     for wave in ctx.dep(0).waves::<i32>() {
-        ctx.emit_all(wave.iter().map(|v| **v));
+        ctx.down(
+            wave.iter()
+                .map(|v| Message::Data(Rc::new(**v) as graphrefly::AnyValue))
+                .collect(),
+        );
     }
 }
 
@@ -3664,18 +3668,16 @@ fn derived_and_effect_wait_until_every_dependency_has_a_value() {
     assert_eq!(*effects.borrow(), vec![3, 7]);
 }
 
-/// Review Q4 (R-wave-boundary) — each ctx.emit is one array of its own, and
-/// ctx.emit_all is one array of every value it is given: emits are never joined.
+/// Review Q4 (R-wave-boundary) — each ctx.emit is one array of its own: emits are
+/// never joined.
 #[test]
-fn each_emit_is_one_array_and_emit_all_sends_one() {
+fn each_emit_is_one_array() {
     let g = graphrefly::graph();
     let trigger = g.state(0i32);
     let n = g.node::<i32, _>(vec![trigger.erased()], |ctx| {
         if ctx.dep(0).values::<i32>().iter().any(|v| **v == 1) {
             ctx.emit(1i32);
             ctx.emit(2i32);
-            ctx.emit_all([3i32, 4]);
-            ctx.emit_all(Vec::<i32>::new());
         }
     });
     let (log, _u) = record_values(&n);
@@ -3687,11 +3689,11 @@ fn each_emit_is_one_array_and_emit_all_sends_one() {
         .filter(|w| !w.is_empty())
         .cloned()
         .collect();
-    assert_eq!(data, vec![vec![1], vec![2], vec![3, 4]]);
+    assert_eq!(data, vec![vec![1], vec![2]]);
     let (snap, _u2) = record_values(&n);
     assert_eq!(
         *snap.borrow(),
-        vec![vec![3, 4]],
+        vec![vec![2]],
         "a new subscriber's snapshot is the last array that carried DATA"
     );
 }

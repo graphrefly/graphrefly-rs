@@ -99,7 +99,9 @@ pub(crate) fn init_node_in_arena_with_dispatcher<T: 'static>(
 pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T> {
     Operator::new("map", move |ctx| {
         for wave in ctx.dep(0).waves::<S>() {
-            ctx.emit_all(wave.iter().map(|value| f(value.as_ref())));
+            ctx.down(crate::protocol::data_wave(
+                wave.iter().map(|value| f(value.as_ref())),
+            ));
         }
     })
 }
@@ -108,11 +110,11 @@ pub fn map<S: 'static, T: 'static>(f: impl Fn(&S) -> T + 'static) -> Operator<T>
 pub fn filter<S: Clone + 'static>(pred: impl Fn(&S) -> bool + 'static) -> Operator<S> {
     Operator::new("filter", move |ctx| {
         for wave in ctx.dep(0).waves::<S>() {
-            ctx.emit_all(
+            ctx.down(crate::protocol::data_wave(
                 wave.iter()
                     .filter(|value| pred(value.as_ref()))
                     .map(|value| (**value).clone()),
-            );
+            ));
         }
     })
 }
@@ -133,7 +135,7 @@ pub fn scan<S: 'static, T: Clone + 'static>(
                 acc = reducer(acc, value.as_ref());
                 out.push(acc.clone());
             }
-            ctx.emit_all(out);
+            ctx.down(crate::protocol::data_wave(out));
         }
         ctx.state_set(acc);
     })
@@ -191,7 +193,7 @@ pub fn distinct_until_changed<S: Clone + 'static>(
                 last = Some((*value).clone());
                 out.push((*value).clone());
             }
-            ctx.emit_all(out);
+            ctx.down(crate::protocol::data_wave(out));
         }
         if let Some(value) = last {
             ctx.state_set(value);
@@ -213,7 +215,9 @@ fn merge_op<T: Clone + 'static>() -> Operator<T> {
         move |ctx| {
             for i in 0..ctx.dep_len() {
                 for wave in ctx.dep(i).waves::<T>() {
-                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
+                    ctx.down(crate::protocol::data_wave(
+                        wave.iter().map(|value| (**value).clone()),
+                    ));
                 }
             }
         },
@@ -259,7 +263,7 @@ pub fn pairwise<S: Clone + 'static>() -> Operator<(S, S)> {
                 }
                 prev = Some((*value).clone());
             }
-            ctx.emit_all(out);
+            ctx.down(crate::protocol::data_wave(out));
         }
         if let Some(value) = prev {
             ctx.state_set(value);
@@ -284,7 +288,7 @@ fn skip_op<S: Clone + 'static>(n: usize) -> Operator<S> {
                     out.push((*value).clone());
                 }
             }
-            ctx.emit_all(out);
+            ctx.down(crate::protocol::data_wave(out));
         }
         ctx.state_set(count);
     })
@@ -437,7 +441,7 @@ pub fn tap<S: Clone + 'static>(f: impl Fn(&S) + 'static) -> Operator<S> {
             f(value.as_ref());
             emitted.push((*value).clone());
         }
-        ctx.emit_all(emitted);
+        ctx.down(crate::protocol::data_wave(emitted));
     })
 }
 
@@ -461,7 +465,7 @@ pub fn on_first_data_where<S: Clone + 'static>(
             }
             emitted.push((*value).clone());
         }
-        ctx.emit_all(emitted);
+        ctx.down(crate::protocol::data_wave(emitted));
         ctx.state_set(fired);
     })
 }
@@ -515,7 +519,7 @@ pub fn settle_by<S: Clone + 'static>(
             st.last = Some(next.clone());
             emitted.push(next);
         }
-        ctx.emit_all(emitted);
+        ctx.down(crate::protocol::data_wave(emitted));
         st.quiet = if saw_change { 0 } else { st.quiet + 1 };
         let settled = st.last.is_some() && st.quiet >= quiet_waves;
         let exhausted = max_waves.is_some_and(|max| st.waves >= max);
@@ -551,7 +555,7 @@ pub fn rescue<S: Clone + 'static>(recover: impl Fn(&str) -> S + 'static) -> Oper
             for value in ctx.dep(0).values::<S>() {
                 emitted.push((*value).clone());
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             match ctx.dep(0).terminal() {
                 Some(DepTerminal::Complete) => ctx.down(vec![Message::Complete]),
                 Some(DepTerminal::Error(error)) => ctx.emit(recover(error.as_ref())),
@@ -609,7 +613,7 @@ fn valve_op<S: Clone + 'static>() -> Operator<S> {
                 for value in source_batch {
                     emitted.push((*value).clone());
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             }
         },
     )

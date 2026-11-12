@@ -696,7 +696,7 @@ pub fn process_bundle<
                                     emitted.push(fact);
                                 }
                             }
-                            ctx.emit_all(emitted);
+                            ctx.down(crate::protocol::data_wave(emitted));
                             return;
                         }
                     },
@@ -714,7 +714,7 @@ pub fn process_bundle<
                     }
                     ctx.state_set(state.to_json());
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             }
         }),
         vec![command.erased()],
@@ -847,7 +847,7 @@ where
             for request in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
                 emitted.push((*request).clone());
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![process.effect_request.erased()],
         effect_runner_meta_opts(format!("{name}/requests"), "requests"),
@@ -881,7 +881,7 @@ where
                         }
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             }
         }),
         outcome_deps,
@@ -939,7 +939,7 @@ where
                     rejected: counters.rejected,
                 });
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             for fact in ctx
                 .dep(1)
                 .values::<ProcessEffectRunnerFact<TCommand, TResult>>()

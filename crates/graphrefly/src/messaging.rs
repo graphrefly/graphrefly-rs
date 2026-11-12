@@ -930,7 +930,7 @@ impl<T: Clone + 'static> MessageBus<T> {
                         emitted.push(event);
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             },
             node_opts(format!("{name}/runtime"), "messageBusRuntime"),
         );
@@ -947,7 +947,7 @@ impl<T: Clone + 'static> MessageBus<T> {
                         emitted.push(message.clone());
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             },
             node_opts(format!("{name}/messages"), "messageBusMessages"),
         );
@@ -960,7 +960,7 @@ impl<T: Clone + 'static> MessageBus<T> {
                         emitted.push(status.clone());
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             },
             node_opts(format!("{name}/status"), "messageBusStatus"),
         );
@@ -973,7 +973,7 @@ impl<T: Clone + 'static> MessageBus<T> {
                         emitted.push(issue.clone());
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             },
             node_opts(format!("{name}/issues"), "messageBusIssues"),
         );
@@ -1200,7 +1200,7 @@ impl<T: Clone + 'static> MessageBus<T> {
                         emitted.push(cursor_snapshot(&cursor_state.borrow(), &cursor_sub));
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             },
             node_opts(
                 format!("{projection_name}/cursor"),
@@ -1324,7 +1324,7 @@ pub fn to_topic<T: Clone + 'static>(
                     idempotency_key: None,
                 });
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         node_opts(name.into(), "messageBusToTopic"),
     );

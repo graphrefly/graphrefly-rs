@@ -324,7 +324,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
                     _ => {}
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             ctx.state_set(st);
         },
         GraphNodeOpts {

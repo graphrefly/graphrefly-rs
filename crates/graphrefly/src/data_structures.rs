@@ -1642,7 +1642,7 @@ pub fn merge_reactive_logs<T: Clone + 'static>(
                     emitted.push((*change).clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         deps,
         GraphNodeOpts::default(),
@@ -2093,7 +2093,7 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
             for change in ctx.dep(0).values::<C>() {
                 emitted.push((*change).clone());
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
     );
     let delta = {

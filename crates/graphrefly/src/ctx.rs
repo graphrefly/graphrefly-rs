@@ -253,19 +253,6 @@ impl Ctx {
         self.down(vec![Message::Data(Rc::new(v) as AnyValue)]);
     }
 
-    /// Emits `values` as one array, in order; nothing when `values` is empty. A
-    /// source that has several values at once sends them this way, so its snapshot
-    /// keeps them all (R-subscription).
-    pub fn emit_all<T: 'static>(&self, values: impl IntoIterator<Item = T>) {
-        let msgs: Wave<AnyValue> = values
-            .into_iter()
-            .map(|v| Message::Data(Rc::new(v) as AnyValue))
-            .collect();
-        if !msgs.is_empty() {
-            self.down(msgs);
-        }
-    }
-
     /// Emit a raw array downstream toward sinks (the ctx-level power surface, DR-1).
     ///
     /// # Panics

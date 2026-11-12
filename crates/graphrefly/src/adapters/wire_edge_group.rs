@@ -581,6 +581,6 @@ fn issues_fn(ctx: &Ctx) {
         .flat_map(|g| g.issues.clone())
         .collect();
     if !issues.is_empty() {
-        ctx.emit_all(issues);
+        ctx.down(crate::protocol::data_wave(issues));
     }
 }

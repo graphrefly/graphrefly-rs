@@ -276,7 +276,7 @@ pub fn process_effect_submit_commands<TEffect: Clone + 'static>(
             for effect in ctx.dep(0).values::<ProcessEffectRequest<TEffect>>() {
                 emitted.push(process_effect_submit_command((*effect).clone()));
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(name.into()),
     )
@@ -468,7 +468,7 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
                     emitted.push(value);
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(name),
     )

@@ -1007,7 +1007,7 @@ where
             for snapshot in ctx.dep(0).values::<KnowledgeGraphSnapshot>() {
                 emitted.push(select(snapshot.as_ref()));
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![snapshot.erased()],
         named_graph_node_opts(name),
@@ -1210,7 +1210,7 @@ where
             for snapshot in ctx.dep(0).values::<MemoryRetrievalSnapshot<T>>() {
                 emitted.push(select(snapshot.as_ref()));
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![snapshot.erased()],
         named_graph_node_opts(name),

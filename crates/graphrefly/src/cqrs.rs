@@ -346,7 +346,7 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
                         emitted.push(fact);
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
                 ctx.state_set(state.to_json());
             }
         }),
@@ -546,12 +546,12 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
                                     cursor: event.runtime_cursor.clone(),
                                 },
                             ));
-                            ctx.emit_all(emitted);
+                            ctx.down(crate::protocol::data_wave(emitted));
                             return;
                         }
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             }
         }),
         vec![source.events.erased()],
@@ -565,7 +565,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
                     emitted.push(state.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![frames.erased()],
         GraphNodeOpts::named(format!("{name}/value")),
@@ -591,7 +591,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
                     }),
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![frames.erased()],
         GraphNodeOpts::named(format!("{name}/status")),
@@ -604,7 +604,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
                     emitted.push(error.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![frames.erased()],
         GraphNodeOpts::named(format!("{name}/errors")),
@@ -939,7 +939,7 @@ fn runtime_projection<TCommand: Clone + 'static, TEvent: Clone + 'static, TOut: 
                     emitted.push(selected);
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![runtime.erased()],
         GraphNodeOpts::named(name),

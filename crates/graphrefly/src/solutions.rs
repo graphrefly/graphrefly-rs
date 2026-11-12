@@ -1580,7 +1580,7 @@ where
             for projection in ctx.dep(0).values::<AgenticMemoryProjection<T>>() {
                 emitted.push(select(projection.as_ref()));
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![projection.erased()],
         named_solution_node_opts(name),
@@ -1605,7 +1605,7 @@ where
             for context in ctx.dep(0).values::<AgenticMemoryContext<T>>() {
                 emitted.push(select(context.as_ref()));
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![context.erased()],
         named_solution_node_opts(name),
@@ -1630,7 +1630,7 @@ where
             for snapshot in ctx.dep(0).values::<S>() {
                 emitted.push(select(snapshot.as_ref()));
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         }),
         vec![snapshot.erased()],
         named_solution_node_opts(name),

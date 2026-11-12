@@ -856,7 +856,7 @@ fn websocket_session_nodes(
                     emitted.push(message.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/inbound")),
     );
@@ -914,7 +914,7 @@ fn websocket_session_nodes(
                     WebSocketSessionEvent::Outbound(_) => {}
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/lifecycle")),
     );
@@ -927,7 +927,7 @@ fn websocket_session_nodes(
                     emitted.push(fact.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/outbound")),
     );
@@ -972,7 +972,7 @@ fn websocket_session_nodes(
                     | WebSocketSessionEvent::Outbound(_) => {}
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/errors")),
     );
@@ -985,7 +985,7 @@ fn websocket_session_nodes(
                     emitted.push(*attempt);
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/attempts")),
     );
@@ -1624,7 +1624,7 @@ where
                     OutboundEvent::UpstreamComplete | OutboundEvent::UpstreamError { .. } => {}
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/attempts")),
     );
@@ -1642,7 +1642,7 @@ where
                     | OutboundEvent::UpstreamComplete => {}
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/errors")),
     );

@@ -620,7 +620,7 @@ fn project<TIn: Clone + 'static, TOut: 'static>(
                     emitted.push(value);
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(name),
     )

@@ -179,7 +179,7 @@ macro_rules! command_messaging_recipe {
                             }
                         }
                     }
-                    ctx.emit_all(emitted);
+                    ctx.down(crate::protocol::data_wave(emitted));
                 },
                 GraphNodeOpts::named(format!("{name}/runtime")),
             );
@@ -282,7 +282,7 @@ macro_rules! command_messaging_recipe {
                             ));
                         }
                     }
-                    ctx.emit_all(emitted);
+                    ctx.down(crate::protocol::data_wave(emitted));
                     if opts.issues.is_some() {
                         let mut emitted = Vec::new();
                         for issue in ctx.dep(2).values::<DataIssue>() {
@@ -293,7 +293,7 @@ macro_rules! command_messaging_recipe {
                                 ));
                             }
                         }
-                        ctx.emit_all(emitted);
+                        ctx.down(crate::protocol::data_wave(emitted));
                     }
                     crate::ledger::store(ctx, &state);
                 },
@@ -341,7 +341,7 @@ macro_rules! command_messaging_recipe {
                             idempotency_key: Some(event.id.clone()),
                         });
                     }
-                    ctx.emit_all(emitted);
+                    ctx.down(crate::protocol::data_wave(emitted));
                 },
                 GraphNodeOpts::named(name.into()),
             )
@@ -362,7 +362,7 @@ macro_rules! command_messaging_recipe {
                             emitted.push(value);
                         }
                     }
-                    ctx.emit_all(emitted);
+                    ctx.down(crate::protocol::data_wave(emitted));
                 },
                 GraphNodeOpts::named(name),
             )

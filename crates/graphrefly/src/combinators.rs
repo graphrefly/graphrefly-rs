@@ -54,10 +54,10 @@ pub fn with_latest_from<A: Clone + 'static, B: Clone + 'static>() -> Operator<(A
                 return;
             };
             for wave in ctx.dep(0).waves::<A>() {
-                ctx.emit_all(
+                ctx.down(crate::protocol::data_wave(
                     wave.iter()
                         .map(|primary| ((**primary).clone(), (*secondary).clone())),
-                );
+                ));
             }
         },
     )
@@ -113,7 +113,7 @@ pub fn zip<T: Clone + 'static>() -> Operator<Vec<T>> {
                     .collect::<Vec<_>>();
                 emitted.push(tuple);
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
 
             let should_complete = st
                 .complete
@@ -170,20 +170,20 @@ pub fn concat<T: Clone + 'static>() -> Operator<T> {
                 if is_complete(ctx.dep(0).terminal()) {
                     st.phase = 1;
                     emitted.append(&mut st.pending);
-                    ctx.emit_all(emitted);
+                    ctx.down(crate::protocol::data_wave(emitted));
                     if st.second_done {
                         ctx.down(vec![Message::Complete]);
                     }
                 } else {
-                    ctx.emit_all(emitted);
+                    ctx.down(crate::protocol::data_wave(emitted));
                 }
             } else {
-                ctx.emit_all(
+                ctx.down(crate::protocol::data_wave(
                     ctx.dep(1)
                         .values::<T>()
                         .iter()
                         .map(|value| (**value).clone()),
-                );
+                ));
                 if is_complete(ctx.dep(1).terminal()) {
                     ctx.down(vec![Message::Complete]);
                 }
@@ -227,7 +227,9 @@ pub fn race<T: Clone + 'static>() -> Operator<T> {
 
             if let Some(winner) = st.winner {
                 for wave in ctx.dep(winner).waves::<T>() {
-                    ctx.emit_all(wave.iter().map(|value| (**value).clone()));
+                    ctx.down(crate::protocol::data_wave(
+                        wave.iter().map(|value| (**value).clone()),
+                    ));
                 }
                 match ctx.dep(winner).terminal() {
                     Some(DepTerminal::Complete) => {
@@ -254,7 +256,7 @@ pub fn race<T: Clone + 'static>() -> Operator<T> {
                         break;
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
                 if st.winner.is_none() && st.terminals.iter().all(|t| *t) {
                     ctx.state_set(st);
                     ctx.down(vec![Message::Complete]);
@@ -326,11 +328,11 @@ pub fn buffer_count<T: Clone + 'static>(count: usize) -> Operator<Vec<T>> {
                 if !buf.is_empty() {
                     emitted.push(std::mem::take(&mut buf));
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
                 ctx.state_set(Vec::<T>::new());
                 ctx.down(vec![Message::Complete]);
             } else {
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
                 ctx.state_set(buf);
             }
         },
@@ -411,7 +413,7 @@ fn take_until_op<T: Clone + 'static>() -> Operator<T> {
             for value in ctx.dep(0).values::<T>() {
                 emitted.push((*value).clone());
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             if is_complete(ctx.dep(0).terminal()) {
                 ctx.down(vec![Message::Complete]);
             }

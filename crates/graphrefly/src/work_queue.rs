@@ -1145,7 +1145,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                         emitted.push(event);
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             }
             let mut emitted = Vec::new();
             for command in ctx.dep(0).values::<WorkQueueCommand<T>>() {
@@ -1160,7 +1160,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                     emitted.push(event);
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         node_opts(format!("{name}/runtime"), "workQueueRuntime"),
     );
@@ -1173,7 +1173,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                     emitted.push(record.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         node_opts(format!("{name}/records"), "workQueueRecords"),
     );
@@ -1186,7 +1186,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                     emitted.push(status.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         node_opts(format!("{name}/status"), "workQueueStatus"),
     );
@@ -1199,7 +1199,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                     emitted.push(issue.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         node_opts(format!("{name}/issues"), "workQueueIssues"),
     );
@@ -1213,7 +1213,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
                         emitted.push(command);
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             }
         },
         node_opts(
@@ -1261,7 +1261,7 @@ fn work_queue_command_body<T: Clone + 'static>(
                 emitted.push((*command).clone());
             }
         }
-        ctx.emit_all(emitted);
+        ctx.down(crate::protocol::data_wave(emitted));
     }
 }
 

@@ -366,7 +366,7 @@ where
                     status,
                 });
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             ctx.state_set(state);
         },
         GraphNodeOpts::named(format!("{name}/events")),
@@ -380,7 +380,7 @@ where
                     emitted.push(event.value.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/allowed")),
     );
@@ -393,7 +393,7 @@ where
                     emitted.push(event.value.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/dropped")),
     );
@@ -404,7 +404,7 @@ where
             for event in ctx.dep(0).values::<RateLimitEvent<T>>() {
                 emitted.push(event.status.clone());
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/status")),
     );

@@ -197,7 +197,7 @@ where
                         emitted.push((*value).clone());
                     }
                 }
-                ctx.emit_all(emitted);
+                ctx.down(crate::protocol::data_wave(emitted));
             }
 
             match ctx.dep(source_index).terminal() {

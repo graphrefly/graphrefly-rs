@@ -1066,7 +1066,7 @@ where
             for response in ready {
                 emitted.push(response);
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         {
             let mut opts = no_terminal_graph_opts(format!("{name}/responses"));
@@ -1335,7 +1335,7 @@ where
                     });
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         no_terminal_graph_opts(format!("{name}/results")),
     )
@@ -1657,7 +1657,7 @@ where
                     RemoteCallResponse::Status { .. } => {}
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             let mut emitted = Vec::new();
             for timeout in ctx.dep(1).values::<RemoteCallTimeout>() {
                 pending.remove_by_request_id(&timeout.request_id);
@@ -1667,7 +1667,7 @@ where
                     error: timeout.error.clone(),
                 });
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             for event in ctx.dep(2).values::<
                 WireBridgeIndexedEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
             >() {
@@ -1873,7 +1873,7 @@ where
                     command,
                 });
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
             crate::ledger::store(ctx, &cursor);
         },
         {
@@ -2240,7 +2240,7 @@ fn emit_events<TOutbound: Clone + 'static, TInbound: Clone + 'static>(
         .into_iter()
         .map(|event| indexed(state, event))
         .collect();
-    ctx.emit_all(events);
+    ctx.down(crate::protocol::data_wave(events));
 }
 
 fn indexed<TOutbound, TInbound>(
@@ -2940,7 +2940,7 @@ where
                     emitted.push(envelope.clone());
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/outbound")),
     )
@@ -2975,7 +2975,7 @@ where
                     });
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/acks")),
     )
@@ -3012,7 +3012,7 @@ where
                     });
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/nacks")),
     )
@@ -3232,7 +3232,7 @@ where
                     | WireBridgeEvent::Duplicate { .. } => {}
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{node_name}/errors")),
     )
@@ -3259,7 +3259,7 @@ where
                     emitted.push(*cursor);
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/cursor")),
     )
@@ -3292,7 +3292,7 @@ where
                     }
                 }
             }
-            ctx.emit_all(emitted);
+            ctx.down(crate::protocol::data_wave(emitted));
         },
         GraphNodeOpts::named(format!("{name}/attempts")),
     )

@@ -110,6 +110,15 @@ impl<T> std::fmt::Debug for Message<T> {
 /// One array of messages delivered by one call (R-wave).
 pub type Wave<T> = Vec<Message<T>>;
 
+/// `values` as one array of DATA, in order, for a single `ctx.down` (review Q4: the
+/// kernel's only per-call value sugar is `ctx.emit`; an empty array sends nothing).
+pub(crate) fn data_wave<T: 'static>(values: impl IntoIterator<Item = T>) -> Wave<AnyValue> {
+    values
+        .into_iter()
+        .map(|v| Message::Data(Rc::new(v) as AnyValue))
+        .collect()
+}
+
 /// Rejects node output that only the kernel may send (R-wave, R-subscription,
 /// R-failure).
 ///
