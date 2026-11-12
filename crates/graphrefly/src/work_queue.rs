@@ -662,38 +662,6 @@ struct RuntimeState<T> {
     dead_letters: Vec<WorkQueueRecord<T>>,
 }
 
-/// The runtime's sequences and dedupe sets: a ledger the bundle owns (review Q13).
-/// The queue's content (works, records, dead letters) stays in the runtime state the
-/// page nodes read.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct QueueLedger {
-    record_seq: u64,
-    lease_seq: u64,
-    source_seqs: HashSet<String>,
-    command_ids: HashSet<String>,
-    idempotency_keys: HashSet<String>,
-}
-
-impl<T> RuntimeState<T> {
-    fn seed(&mut self, ledger: QueueLedger) {
-        self.record_seq = ledger.record_seq;
-        self.lease_seq = ledger.lease_seq;
-        self.source_seqs = ledger.source_seqs;
-        self.command_ids = ledger.command_ids;
-        self.idempotency_keys = ledger.idempotency_keys;
-    }
-
-    fn ledger_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "record_seq": self.record_seq,
-            "lease_seq": self.lease_seq,
-            "source_seqs": self.source_seqs,
-            "command_ids": self.command_ids,
-            "idempotency_keys": self.idempotency_keys,
-        })
-    }
-}
-
 impl<T> Default for RuntimeState<T> {
     fn default() -> Self {
         Self {
@@ -1159,23 +1127,9 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
         lease_duration_ms: opts.lease_duration_ms,
         retry: opts.retry,
     };
-    let ledger = crate::ledger::Ledger::new(
-        graph,
-        format!("{name}/ledger"),
-        serde_json::to_value(QueueLedger::default()).unwrap_or_default(),
-    );
-    let written_back = state.clone();
     let runtime = graph.node_opts::<QueueEvent<T>, _>(
-        vec![commands.erased(), admission_pages.erased(), ledger.erased()],
+        vec![commands.erased(), admission_pages.erased()],
         move |ctx| {
-            // A lifetime's first run takes the sequences and dedupe sets from the
-            // ledger; the private state marks that it did.
-            if ctx.state_get::<bool>().is_none() {
-                runtime_state
-                    .borrow_mut()
-                    .seed(crate::ledger::from_ledger(ctx, 2));
-                ctx.state_set(true);
-            }
             for page in ctx
                 .dep(1)
                 .values::<MessageBusAvailablePage<WorkQueueSubmit<T>>>()
@@ -1208,13 +1162,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
             }
             ctx.emit_all(emitted);
         },
-        {
-            let mut opts = node_opts(format!("{name}/runtime"), "workQueueRuntime");
-            opts.node = crate::ledger::write_back(opts.node, move |_: &bool| {
-                written_back.borrow().ledger_json()
-            });
-            opts
-        },
+        node_opts(format!("{name}/runtime"), "workQueueRuntime"),
     );
     let records = graph.node_opts::<WorkQueueRecord<T>, _>(
         vec![runtime.erased()],

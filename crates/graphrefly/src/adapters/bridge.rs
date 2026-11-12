@@ -760,25 +760,6 @@ struct PendingEnvelope<T> {
     retry_due_at_ms: Option<u64>,
 }
 
-/// The bridge's sequence and cursors: a ledger the bundle owns (review Q13). The
-/// pending sends carry the payload type and are the lifetime's own work.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct BridgeLedger {
-    next_seq: u64,
-    cursor: u64,
-    remote_cursor: u64,
-}
-
-impl Default for BridgeLedger {
-    fn default() -> Self {
-        Self {
-            next_seq: 1,
-            cursor: 0,
-            remote_cursor: 0,
-        }
-    }
-}
-
 struct BridgeState<T> {
     active: bool,
     next_seq: u64,
@@ -823,7 +804,8 @@ where
         wire_bridge_events_node(graph, &command, &inbound_node, name.clone(), opts.clone());
     // The event fold must keep receiving: the inbound state keeps only its last
     // envelope, so an inactive fold would miss what arrives meanwhile. It is held for
-    // the graph's life (R-graph-surface@1 retain); its ledger is the sequence's owner.
+    // the graph's life (R-graph-surface@1 retain), so its private state keeps the
+    // sequence and cursors for that long.
     let _receiving = graph.retain(&format!("{name}/events"));
     let outbound = project_outbound(graph, &events, &name);
     let acks = project_acks(graph, &events, &name);
@@ -2142,43 +2124,27 @@ where
         .now_ms
         .clone()
         .unwrap_or_else(|| Rc::new(|| 0_u64) as Rc<dyn Fn() -> u64>);
-    let ledger = crate::ledger::Ledger::new(
-        graph,
-        format!("{name}/ledger"),
-        serde_json::to_value(BridgeLedger::default()).unwrap_or_default(),
-    );
     let event_opts = GraphNodeOpts {
         name: Some(format!("{name}/events")),
-        // The lifetime's cleanup writes the sequence and cursors back to the ledger,
-        // then marks the bridge state inactive and drops the pending sends.
-        node: crate::ledger::write_back(
-            NodeOpts {
-                complete: Policy::Manual,
-                error: Policy::Manual,
-                ..NodeOpts::default()
-            }
-            .with_setup(|_| {
-                crate::lifetime::cleanup(|closing| {
-                    if let Some(state) = closing.state_get::<RefCell<BridgeState<TOutbound>>>() {
-                        let mut state = state.borrow_mut();
-                        state.active = false;
-                        state.pending.clear();
-                    }
-                })
-            }),
-            |state: &RefCell<BridgeState<TOutbound>>| {
-                let state = state.borrow();
-                serde_json::json!({
-                    "next_seq": state.next_seq,
-                    "cursor": state.cursor,
-                    "remote_cursor": state.remote_cursor,
-                })
-            },
-        ),
+        node: NodeOpts {
+            complete: Policy::Manual,
+            error: Policy::Manual,
+            ..NodeOpts::default()
+        }
+        // The lifetime's cleanup marks the bridge state inactive (R-lifetime@2).
+        .with_setup(|_| {
+            crate::lifetime::cleanup(|closing| {
+                if let Some(state) = closing.state_get::<RefCell<BridgeState<TOutbound>>>() {
+                    let mut state = state.borrow_mut();
+                    state.active = false;
+                    state.pending.clear();
+                }
+            })
+        }),
         ..GraphNodeOpts::default()
     };
     graph.node_opts::<WireBridgeEvent<TOutbound, TInbound>, _>(
-        vec![command.erased(), inbound.erased(), ledger.erased()],
+        vec![command.erased(), inbound.erased()],
         move |ctx| {
             let state = bridge_state::<TOutbound>(ctx);
             state.borrow_mut().active = true;
@@ -2238,12 +2204,11 @@ fn bridge_state<T: Clone + 'static>(ctx: &Ctx) -> Rc<RefCell<BridgeState<T>>> {
     if let Some(state) = ctx.state_get::<RefCell<BridgeState<T>>>() {
         return state;
     }
-    let ledger: BridgeLedger = crate::ledger::from_ledger(ctx, ctx.dep_len() - 1);
     let state = RefCell::new(BridgeState::<T> {
         active: true,
-        next_seq: ledger.next_seq,
-        cursor: ledger.cursor,
-        remote_cursor: ledger.remote_cursor,
+        next_seq: 1,
+        cursor: 0,
+        remote_cursor: 0,
         pending: BTreeMap::new(),
     });
     ctx.state_set(state);
@@ -3371,18 +3336,18 @@ mod tests {
                 "bridge/errors",
                 "bridge/events",
                 "bridge/inbound",
-                "bridge/ledger",
                 "bridge/nacks",
                 "bridge/outbound",
                 "bridge/status",
                 "bridge/statusLedger",
             ]
         );
-        // The sequence and the status counters are ledgers the bundle owns (Q13).
+        // The status counters are a ledger the bundle owns (Q13); the event fold is
+        // held for the graph's life and keeps its sequence in its private state.
         assert!(snap
             .edges
             .iter()
-            .any(|edge| edge.from == "bridge/ledger" && edge.to == "bridge/events"));
+            .any(|edge| edge.from == "bridge/statusLedger" && edge.to == "bridge/status"));
         assert!(snap
             .edges
             .iter()

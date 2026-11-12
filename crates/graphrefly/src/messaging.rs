@@ -819,73 +819,13 @@ struct TopicState<T> {
     messages: Vec<MessageEnvelope<T>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SubscriptionState {
     topic: String,
     subscription_id: String,
     next_seq: u64,
     closed: bool,
     retention_gap: bool,
-}
-
-/// A topic's sequence position, part of the bus ledger.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct TopicLedger {
-    closed: bool,
-    head_seq: u64,
-    next_seq: u64,
-}
-
-/// The bus's dedupe sets, sequences and subscription cursors: a ledger the bundle
-/// owns (review Q13). The topics' messages and the dead letters are the bus's content
-/// and stay in the runtime state.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct BusLedger {
-    topics: BTreeMap<String, TopicLedger>,
-    subscriptions: BTreeMap<String, SubscriptionState>,
-    seen_command_ids: HashSet<String>,
-    seen_idempotency_keys: HashSet<String>,
-    dead_letter_seq: u64,
-}
-
-impl<T> MessageBusState<T> {
-    fn seed(&mut self, ledger: BusLedger) {
-        for (topic, position) in ledger.topics {
-            let state = self.topics.entry(topic).or_insert_with(make_topic_state);
-            state.closed = position.closed;
-            state.head_seq = position.head_seq;
-            state.next_seq = position.next_seq;
-        }
-        self.subscriptions.extend(ledger.subscriptions);
-        self.seen_command_ids.extend(ledger.seen_command_ids);
-        self.seen_idempotency_keys
-            .extend(ledger.seen_idempotency_keys);
-        self.dead_letter_seq = self.dead_letter_seq.max(ledger.dead_letter_seq);
-    }
-
-    fn ledger_json(&self) -> serde_json::Value {
-        let topics: BTreeMap<&String, TopicLedger> = self
-            .topics
-            .iter()
-            .map(|(topic, state)| {
-                (
-                    topic,
-                    TopicLedger {
-                        closed: state.closed,
-                        head_seq: state.head_seq,
-                        next_seq: state.next_seq,
-                    },
-                )
-            })
-            .collect();
-        serde_json::json!({
-            "topics": topics,
-            "subscriptions": self.subscriptions,
-            "seen_command_ids": self.seen_command_ids,
-            "seen_idempotency_keys": self.seen_idempotency_keys,
-            "dead_letter_seq": self.dead_letter_seq,
-        })
-    }
 }
 
 struct MessageBusState<T = AnyValue> {
@@ -977,22 +917,9 @@ impl<T: Clone + 'static> MessageBus<T> {
             dead_letter_seq: 0,
         }));
         let runtime_state = state.clone();
-        let written_back = state.clone();
-        let ledger = crate::ledger::Ledger::new(
-            graph,
-            format!("{name}/ledger"),
-            serde_json::to_value(BusLedger::default()).unwrap_or_default(),
-        );
         let runtime = graph.node_opts::<RuntimeEvent<T>, _>(
-            vec![commands.erased(), ledger.erased()],
+            vec![commands.erased()],
             move |ctx| {
-                // A lifetime's first run takes the ledger; the private state marks it.
-                if ctx.state_get::<bool>().is_none() {
-                    runtime_state
-                        .borrow_mut()
-                        .seed(crate::ledger::from_ledger(ctx, 1));
-                    ctx.state_set(true);
-                }
                 let mut emitted = Vec::new();
                 for command in ctx.dep(0).values::<MessageBusCommand<T>>() {
                     let events = {
@@ -1005,13 +932,7 @@ impl<T: Clone + 'static> MessageBus<T> {
                 }
                 ctx.emit_all(emitted);
             },
-            {
-                let mut opts = node_opts(format!("{name}/runtime"), "messageBusRuntime");
-                opts.node = crate::ledger::write_back(opts.node, move |_: &bool| {
-                    written_back.borrow().ledger_json()
-                });
-                opts
-            },
+            node_opts(format!("{name}/runtime"), "messageBusRuntime"),
         );
         // Held for the graph's life with retain (R-graph-surface@1): these nodes must keep
         // processing what is written into their command states, which keep only the last

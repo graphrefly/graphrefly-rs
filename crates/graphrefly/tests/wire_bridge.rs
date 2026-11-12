@@ -1024,7 +1024,8 @@ fn remote_responder_release_is_retryable_when_external_subscriber_blocks_release
 }
 
 /// Review Q13 — the bridge's sequence is a cursor: it does not restart from 1 when
-/// every subscriber leaves and a new one arrives; the bundle owns its ledger.
+/// every subscriber leaves and a new one arrives: the event fold is held for the
+/// graph's life.
 #[test]
 fn bridge_sequence_survives_its_subscribers_leaving() {
     let g = graph();
