@@ -117,7 +117,8 @@ impl Status {
 
 /// An auto or manual policy for COMPLETE, ERROR or INVALIDATE, per node (R-terminals,
 /// R-invalidation). Both default to auto.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Policy {
     /// The kernel handles the message without running the function.
     #[default]
@@ -2166,6 +2167,25 @@ impl Core {
         self.refs.set(0);
         free_taken_slot(&self.graph, key, slot);
         true
+    }
+
+    pub(crate) fn checkpoint_policies(&self) -> (bool, Policy, Policy, Policy) {
+        self.with_config(|c| (c.quiet, c.complete, c.error, c.invalidate))
+    }
+
+    pub(crate) fn restore_policies(
+        &self,
+        quiet: bool,
+        complete: Policy,
+        error: Policy,
+        invalidate: Policy,
+    ) {
+        self.with_node_state_aux_mut(|_, _, cfg, _, _| {
+            cfg.quiet = quiet;
+            cfg.complete = complete;
+            cfg.error = error;
+            cfg.invalidate = invalidate;
+        });
     }
 
     pub(crate) fn checkpoint_runtime(&self) -> NodeCheckpointRuntime {

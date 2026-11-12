@@ -42,7 +42,7 @@ use crate::ctx::DepTerminal;
 use crate::dispatcher::NodeFn;
 use crate::graph::{Graph, GraphNodeOpts, GraphOptions, RestoreFactoryMeta};
 use crate::json::validate_strict_json_value;
-use crate::node::{Core, NodeSeed};
+use crate::node::{Core, NodeSeed, Policy};
 use crate::protocol::AnyValue;
 
 /// The tag of this package's checkpoint layout (R-checkpoint@1, graphrefly:D802; review
@@ -80,6 +80,16 @@ pub enum GraphCheckpointFactory {
     LocalOnly { name: String, reason: String },
 }
 
+/// The node-owned policies captured independently of its recipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphCheckpointPolicies {
+    pub quiet: bool,
+    pub complete: Policy,
+    pub error: Policy,
+    pub invalidate: Policy,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// One node of a checkpoint (R-checkpoint@1).
 pub struct GraphCheckpointNode {
@@ -90,6 +100,8 @@ pub struct GraphCheckpointNode {
     pub name: Option<String>,
     /// The current instance's recipe, or local-only.
     pub factory: GraphCheckpointFactory,
+    /// The actual node policies, restored independently of factory defaults.
+    pub policies: GraphCheckpointPolicies,
     /// The declared dependencies.
     pub deps: Vec<String>,
     /// The current lifetime's dependencies, when a ctx.rewire changed them.
@@ -468,7 +480,7 @@ impl GraphRestoreDescriptor for StateRestoreDescriptor {
 }
 
 /// A built-in operator or source, rebuilt over JSON values from its recipe config
-/// (R-checkpoint@1): the operator's own policies and setup come with it.
+/// (R-checkpoint@1): the operator supplies its function/setup; saved node policies win.
 pub struct OperatorRestoreDescriptor(pub &'static str);
 
 impl OperatorRestoreDescriptor {
@@ -525,7 +537,7 @@ impl GraphRestoreDescriptor for OperatorRestoreDescriptor {
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
         let op = self.operator(&ctx)?;
         let mut opts = restored_opts(ctx.checkpoint)?;
-        opts.node = op.opts.clone();
+        opts.node.setup = op.opts.setup.clone();
         Ok(RestoreNodeDefinition {
             factory: op.factory.to_owned(),
             kind: RestoreNodeKind::NodeJson(op.body.clone()),
@@ -1123,10 +1135,17 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             .transpose()?
             // Restored and not run since: what it had received is its seed's note.
             .or_else(|| runtime.seed_note.as_ref().and_then(received_in_note));
+        let (quiet, complete, error, invalidate) = entry.core.checkpoint_policies();
         let saved_node = GraphCheckpointNode {
             id: entry.id.clone(),
             name: entry.name.clone(),
             factory: checkpoint_factory(entry, runtime.is_state),
+            policies: GraphCheckpointPolicies {
+                quiet,
+                complete,
+                error,
+                invalidate,
+            },
             deps: dep_ids,
             lifetime_deps,
             values,
@@ -1764,6 +1783,14 @@ fn build_node(
                 .erased()
         }
     };
+    // Policies belong to the saved node, never to the reconstruction recipe.
+    let policies = item.checkpoint.policies;
+    core.restore_policies(
+        policies.quiet,
+        policies.complete,
+        policies.error,
+        policies.invalidate,
+    );
     let restored_deps = core.deps();
     if restored_deps.len() != deps.len()
         || restored_deps
