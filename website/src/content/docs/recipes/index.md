@@ -22,6 +22,6 @@ ordinary graph-visible data rather than hidden runtime state.
 
 ## Prefer graph-owned composition
 
-Use `pipe`, `stratify`, `topology_diff`, `reactive_list`, `reactive_map`, and the
+Use `pipe`, `stratify`, `topology::diff`, `reactive_list`, `reactive_map`, and the
 recipe modules under `cqrs` and `process` when a workflow should remain visible
 to `describe()` and diagnostic tools.

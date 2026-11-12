@@ -6,8 +6,8 @@ use graphrefly::{
     from_iter, from_sse_with_options, graph, graph_opts, knowledge_graph_reducer_bundle, map,
     memory_append_log, memory_kv, message_bus, persist_agentic_memory_records, pipe, reactive_map,
     retry_status_node, scheduled_readiness_projector, single_sync_value_from, timeout_bundle,
-    to_http_with_options, to_process_with_options, topology_diff, validate_topic_message_payload,
-    work_queue, work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
+    to_http_with_options, to_process_with_options, validate_topic_message_payload, work_queue,
+    work_queue_readiness_handoff_projector, work_queue_scheduled_readiness_projector,
     AgenticMemoryArtifactKind, AgenticMemoryBundleOptions, AgenticMemoryConsolidationBundleOptions,
     AgenticMemoryConsolidationOutcome, AgenticMemoryContextPackingBundleOptions,
     AgenticMemoryContextPackingPolicy, AgenticMemoryKgAssertionDraft,
@@ -676,7 +676,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
 
     assert_eq!(doubled_values.borrow().as_slice(), &[2, 4]);
     let after_pipe = graphrefly::topology::snapshot(&g);
-    let pipe_diff = topology_diff(&before_pipe, &after_pipe);
+    let pipe_diff = graphrefly::topology::diff(&before_pipe, &after_pipe);
     assert!(pipe_diff.events.iter().any(|event| matches!(
         event,
         DescribeEvent::NodeAdded { id, node }
@@ -745,7 +745,7 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     unsubscribe_selected_snapshot();
     selected.dispose();
     let after_dispose = graphrefly::topology::snapshot(&g);
-    let dispose_diff = topology_diff(&with_view, &after_dispose);
+    let dispose_diff = graphrefly::topology::diff(&with_view, &after_dispose);
     assert!(dispose_diff.events.iter().any(|event| matches!(
         event,
         DescribeEvent::NodeRemoved { id } if id == "acceptance/items.select#0.delta"

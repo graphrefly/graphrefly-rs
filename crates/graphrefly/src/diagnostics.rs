@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::graph::{Graph, Profile, TopologyEdge, TopologyNode, TopologySnapshot};
+use crate::graph::{Graph, Profile, TopologyNode, TopologySnapshot};
 use crate::node::Status;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,13 +159,6 @@ impl ValidateNoIslandsResult {
 }
 
 #[derive(Debug, Default)]
-struct FlatSnapshot {
-    nodes: BTreeMap<String, TopologyNode>,
-    edges: BTreeMap<(String, String), TopologyEdge>,
-    subgraphs: BTreeSet<String>,
-}
-
-#[derive(Debug, Default)]
 struct SnapshotIndex {
     nodes: BTreeMap<String, TopologyNode>,
     outgoing: BTreeMap<String, BTreeSet<String>>,
@@ -177,114 +170,6 @@ fn flatten(snapshot: &TopologySnapshot, nodes: &mut Vec<TopologyNode>) {
     for child in snapshot.subgraphs.iter().flatten() {
         flatten(child, nodes);
     }
-}
-
-fn flatten_for_diff(snapshot: &TopologySnapshot) -> FlatSnapshot {
-    fn visit(snapshot: &TopologySnapshot, index_path: &str, flat: &mut FlatSnapshot) {
-        for node in &snapshot.nodes {
-            flat.nodes.insert(node.id.clone(), node.clone());
-        }
-        for edge in &snapshot.edges() {
-            flat.edges
-                .insert((edge.from.clone(), edge.to.clone()), edge.clone());
-        }
-        if let Some(children) = &snapshot.subgraphs {
-            for (index, child) in children.iter().enumerate() {
-                let prefixed = child.nodes.iter().find_map(|node| {
-                    node.id
-                        .rsplit_once("::")
-                        .map(|(prefix, _)| prefix.to_owned())
-                });
-                let key = prefixed.unwrap_or_else(|| {
-                    child
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("{index_path}{index}"))
-                });
-                flat.subgraphs.insert(key.clone());
-                visit(child, &format!("{key}/"), flat);
-            }
-        }
-    }
-
-    let mut flat = FlatSnapshot::default();
-    visit(snapshot, "", &mut flat);
-    flat
-}
-
-fn meta_or_empty(node: &TopologyNode) -> BTreeMap<String, String> {
-    node.meta.clone().unwrap_or_default()
-}
-
-/// Pure topology delta from one D39 `describe()` snapshot to another.
-///
-/// Values/status changes are intentionally not topology events; use observe/profile for runtime
-/// data. This helper never reads live nodes and does not create a topology stream.
-pub fn topology_diff(prev: &TopologySnapshot, next: &TopologySnapshot) -> DescribeChangeset {
-    let prev = flatten_for_diff(prev);
-    let next = flatten_for_diff(next);
-    let mut events = Vec::new();
-
-    for path in next.subgraphs.difference(&prev.subgraphs) {
-        events.push(DescribeEvent::SubgraphMounted { path: path.clone() });
-    }
-    for (id, node) in next
-        .nodes
-        .iter()
-        .filter(|(id, _)| !prev.nodes.contains_key(*id))
-    {
-        events.push(DescribeEvent::NodeAdded {
-            id: id.clone(),
-            node: node.clone(),
-        });
-    }
-    for (id, node) in next
-        .nodes
-        .iter()
-        .filter(|(id, _)| prev.nodes.contains_key(*id))
-    {
-        let prev_meta = meta_or_empty(
-            prev.nodes
-                .get(id)
-                .expect("filtered to nodes present in the previous snapshot"),
-        );
-        let next_meta = meta_or_empty(node);
-        if prev_meta != next_meta {
-            events.push(DescribeEvent::NodeMetaChanged {
-                id: id.clone(),
-                prev_meta,
-                next_meta,
-            });
-        }
-    }
-    for ((from, to), _) in next
-        .edges
-        .iter()
-        .filter(|(key, _)| !prev.edges.contains_key(*key))
-    {
-        events.push(DescribeEvent::EdgeAdded {
-            from: from.clone(),
-            to: to.clone(),
-        });
-    }
-    for ((from, to), _) in prev
-        .edges
-        .iter()
-        .filter(|(key, _)| !next.edges.contains_key(*key))
-    {
-        events.push(DescribeEvent::EdgeRemoved {
-            from: from.clone(),
-            to: to.clone(),
-        });
-    }
-    for id in prev.nodes.keys().filter(|id| !next.nodes.contains_key(*id)) {
-        events.push(DescribeEvent::NodeRemoved { id: id.clone() });
-    }
-    for path in prev.subgraphs.difference(&next.subgraphs) {
-        events.push(DescribeEvent::SubgraphUnmounted { path: path.clone() });
-    }
-
-    DescribeChangeset { events }
 }
 
 /// Summarize an opt-in D39/R-profile snapshot using `describe()` for node cardinality.

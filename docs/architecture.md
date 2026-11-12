@@ -86,8 +86,8 @@ The clean-slate crate includes:
 - Graph-layer Rust API: `graph`, state/producer/derived/effect/mount helpers,
   describe/observe/profile, operators, sources, and passive storage helpers.
 - Composition and diagnostics helpers such as `pipe`, `stratify`, and
-  `topology_diff`, all derived from declared graph topology or `describe()`
-  snapshots.
+  `topology::diff`, derived from declared graph topology or `topology::snapshot`
+  results.
 - Reactive data structures and views: `reactive_list`, `reactive_log`,
   `reactive_index`, `reactive_map`, pull-driven snapshots, and graph-visible
   `ReactiveView` helper nodes.
@@ -104,7 +104,7 @@ product-specific WorkItem/Canvas/agent semantics.
 Useful entry points:
 
 - `graphrefly::pipe`, `graphrefly::stratify`, and
-  `graphrefly::topology_diff` for Rust-native composition and snapshot
+  `graphrefly::topology::diff` for Rust-native composition and snapshot
   diagnostics.
 - `graphrefly::reactive_list`, `graphrefly::reactive_log`,
   `graphrefly::reactive_index`, and `graphrefly::reactive_map` for collection

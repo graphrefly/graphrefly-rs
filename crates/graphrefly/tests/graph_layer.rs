@@ -5,13 +5,13 @@ use std::rc::Rc;
 use graphrefly::{
     default_dispatcher, default_restore_registry, distinct_until_changed, explain_path, filter,
     from_iter, graph, graph_opts, map, merge, profile_summary, profile_summary_from_snapshots,
-    reachable, restore_graph, restore_registry, scan, take, timeout, topology_diff,
-    topology_to_ascii, topology_to_d2, topology_to_d2_with_direction, topology_to_json,
-    topology_to_mermaid, topology_to_mermaid_url, topology_to_mermaid_with_direction,
-    topology_to_pretty, validate_no_islands, DescribeEvent, DiagramDirection, Dispatcher, Explain,
-    ExplainPathOptions, ExplainPathReason, GraphCheckpointFactory, GraphCheckpointJson,
-    GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry, IslandReport, Message,
-    NodeOpts, ProfileSummaryOptions, ReachableDirection, ReachableOptions, RestoreFactoryMeta,
+    reachable, restore_graph, restore_registry, scan, take, timeout, topology_to_ascii,
+    topology_to_d2, topology_to_d2_with_direction, topology_to_json, topology_to_mermaid,
+    topology_to_mermaid_url, topology_to_mermaid_with_direction, topology_to_pretty,
+    validate_no_islands, DescribeEvent, DiagramDirection, Dispatcher, Explain, ExplainPathOptions,
+    ExplainPathReason, GraphCheckpointFactory, GraphCheckpointJson, GraphNodeOpts, GraphOptions,
+    GraphRestoreDefinition, GraphRestoreEntry, IslandReport, Message, NodeOpts,
+    ProfileSummaryOptions, ReachableDirection, ReachableOptions, RestoreFactoryMeta,
     RestoreGraphOptions, TopologyEdge, TopologyEvent, TopologyEventKind, TopologyGroupOptions,
     TopologyNode, TopologyOpts, TopologySnapshot, Values, GRAPH_CHECKPOINT_VERSION,
 };
@@ -770,20 +770,25 @@ fn graph_diagnostics_explain_path_and_islands_are_pure_snapshot_helpers() {
 }
 
 #[test]
-fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
+fn topology_diff_is_pure_snapshot_delta_without_activation() {
     let g = graph();
     let source = g.state_opts(1i32, GraphNodeOpts::named("source"));
     let prev = graphrefly::topology::snapshot(&g);
 
     let mut opts = GraphNodeOpts::named("mapped");
     opts.meta.insert("role".to_owned(), "projection".to_owned());
+    let invocations = Rc::new(Cell::new(0));
+    let count = invocations.clone();
     let mapped = g.derived_opts(
         vec![source.erased()],
-        |values| Some(*last_or_prev(values, 0).unwrap() + 1),
+        move |values| {
+            count.set(count.get() + 1);
+            Some(*last_or_prev(values, 0).unwrap() + 1)
+        },
         opts,
     );
     let next = graphrefly::topology::snapshot(&g);
-    let diff = topology_diff(&prev, &next);
+    let diff = graphrefly::topology::diff(&prev, &next);
 
     assert!(diff.events.iter().any(|event| matches!(
         event,
@@ -797,7 +802,7 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
 
     source.set(2);
     assert!(
-        topology_diff(&next, &graphrefly::topology::snapshot(&g))
+        graphrefly::topology::diff(&next, &graphrefly::topology::snapshot(&g))
             .events
             .is_empty(),
         "value/status changes are observe/profile data, not topology"
@@ -820,7 +825,7 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
         .as_mut()
         .unwrap()
         .insert("role".to_owned(), "view".to_owned());
-    assert!(topology_diff(&meta_prev, &meta_next)
+    assert!(graphrefly::topology::diff(&meta_prev, &meta_next)
         .events
         .iter()
         .any(|event| matches!(
@@ -833,7 +838,7 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
     child.state_opts(1i32, GraphNodeOpts::named("leaf"));
     let before_mount = graphrefly::topology::snapshot(&g);
     graphrefly::topology::mount(&g, child, "child");
-    let mounted = topology_diff(&before_mount, &graphrefly::topology::snapshot(&g));
+    let mounted = graphrefly::topology::diff(&before_mount, &graphrefly::topology::snapshot(&g));
     assert!(mounted.events.iter().any(|event| matches!(
         event,
         DescribeEvent::SubgraphMounted { path } if path == "child"
@@ -846,7 +851,8 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
     let empty_child = graph_opts(GraphOptions::named("ignored-child-name"));
     let before_empty_mount = graphrefly::topology::snapshot(&g);
     graphrefly::topology::mount(&g, empty_child, "empty");
-    let empty_mounted = topology_diff(&before_empty_mount, &graphrefly::topology::snapshot(&g));
+    let empty_mounted =
+        graphrefly::topology::diff(&before_empty_mount, &graphrefly::topology::snapshot(&g));
     assert!(empty_mounted.events.iter().any(|event| matches!(
         event,
         DescribeEvent::SubgraphMounted { path } if path == "empty"
@@ -854,8 +860,7 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
 
     let mut removed = next.clone();
     removed.nodes.retain(|node| node.id != "mapped");
-    removed.edges().clear();
-    let removed_diff = topology_diff(&next, &removed);
+    let removed_diff = graphrefly::topology::diff(&next, &removed);
     assert!(removed_diff.events.iter().any(|event| matches!(
         event,
         DescribeEvent::EdgeRemoved { from, to } if from == "source" && to == "mapped"
@@ -865,6 +870,11 @@ fn graph_diagnostics_topology_diff_is_pure_snapshot_delta() {
         DescribeEvent::NodeRemoved { id } if id == "mapped"
     )));
 
+    assert_eq!(
+        invocations.get(),
+        0,
+        "snapshot diff must not activate nodes"
+    );
     drop(mapped);
 }
 
