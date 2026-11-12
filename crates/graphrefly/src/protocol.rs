@@ -17,20 +17,17 @@ use std::rc::Rc;
 /// boundary.
 pub type AnyValue = Rc<dyn std::any::Any>;
 
-/// A pool-relative pool callback handle — **pure data, no methods** (D7).
-///
-/// `(pool_id, handle_id)` per D7/DR-2; the Rust pool adds a local `generation`
-/// (B32) so a recycled slotmap slot can be told apart from a stale handle (the
-/// pool frees a dropped node's fn slot and reuses it). `generation` is a
-/// PER-LANGUAGE impl detail (D24), NOT part of the protocol/IDL Handle — it is
-/// wire-meaningless and is dropped at the wire boundary (a wired handle is
-/// re-resolved against the remote pool). User-approved Handle-widening 2026-05-29
-/// (see `CLEAN-SLATE.md`). A node is NOT a handle; a handle is inert routing data.
+/// A node function's place in its dispatcher's one function table — **pure data, no
+/// methods** (D7). The table is this crate's implementation, not protocol, and has
+/// no pools (graphrefly:D807): a handle is the function's index, plus the slot's
+/// `generation` (B32), because the table frees a dropped node's slot and reuses it,
+/// and a stale handle must never reach the slot's next function. A node is NOT a
+/// handle; a handle is inert routing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle {
-    pub pool_id: u32,
-    pub handle_id: u32,
-    /// Local slotmap generation (B32, per-language) — NOT in the protocol IDL.
+    /// The function's index in the table.
+    pub index: u32,
+    /// The slot's generation when the function was registered (B32).
     pub generation: u32,
 }
 

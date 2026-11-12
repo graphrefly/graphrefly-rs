@@ -127,8 +127,8 @@ pub enum Policy {
 }
 
 /// Node construction options (substrate-level). Sugar/operator opts are the graph layer
-/// (D6/D24); this is the minimal substrate surface needed to select a pool (D20) and
-/// the dep-terminal propagation policy (R-deps-terminal).
+/// (D6/D24); this is the minimal substrate surface: the node's policies (the
+/// dep-terminal propagation policy among them, R-deps-terminal), setup and recipe.
 ///
 /// A node has no runtime version (D109 is retired, review Q7):
 ///
@@ -957,12 +957,12 @@ impl NodeSlot {
         let NodeSlot {
             call, edges, aux, ..
         } = self;
-        // B32: free this node's fn slot so the dispatcher pool no longer holds the fn —
+        // B32: free this node's fn slot so the dispatcher's function table no longer holds the fn —
         // and thus the upstream `Core`s the fn captured (e.g. a `Node: Clone` handle, the
         // idiomatic feedback pattern) — alive for the whole process. Safe: invoke clones
-        // the fn out before calling (the pool is unborrowed during the fn run), so a node
-        // dropped from inside a fn can re-borrow the pool here. A fn that captures its OWN
-        // node is a genuine Rc cycle this cannot break (the pool keeps that node alive →
+        // the fn out before calling (the table is unborrowed during the fn run), so a node
+        // dropped from inside a fn can re-borrow the table here. A fn that captures its OWN
+        // node is a genuine Rc cycle this cannot break (the table keeps that node alive →
         // Drop never runs) — that is a user-level self-cycle (use a Weak self-handle).
         // Run this before user cleanup callbacks so a panicking cleanup cannot strand the
         // dispatcher slot and its captures.
@@ -2602,7 +2602,7 @@ impl Core {
                 e.state = DepState::new(deps.len());
                 (unsubs, lifetime, a.state.take(), old_deps)
             });
-        self.swap_fn_preserving_pool(fn_);
+        self.swap_fn(fn_);
         with_wave_owner(
             self,
             || {
@@ -3063,11 +3063,11 @@ impl Core {
         // QA-F1: clear `in_dep_mutation` on EVERY exit, including a panic unwind during
         // the mutation (an added dep's activation or a removed dep's cleanup).
         let mut_guard = DepMutationGuard(DeferredNodeAction::from_core(self));
-        // fn swap (SD-1 + B32 GC): register the new fn in the SAME pool, then unregister
+        // fn swap (SD-1 + B32 GC): register the new fn in the function table, then unregister
         // the old handle so the rewired-away closure (and its captures) is freed. A
         // ctx.rewire keeps the function (R-request-order@2).
         if let Some(fn_) = fn_ {
-            self.swap_fn_preserving_pool(fn_);
+            self.swap_fn(fn_);
         }
         if same_ordered_deps(&old_deps, &new_deps) {
             return;
@@ -3179,11 +3179,11 @@ impl Core {
     pub(crate) fn wrap_fn(&self, wrap: impl FnOnce(NodeFn) -> NodeFn) {
         let current = self.with_call(|c| c.handle.and_then(|h| c.dispatcher.function(h)));
         if let Some(current) = current {
-            self.swap_fn_preserving_pool(wrap(current));
+            self.swap_fn(wrap(current));
         }
     }
 
-    fn swap_fn_preserving_pool(&self, fn_: NodeFn) {
+    fn swap_fn(&self, fn_: NodeFn) {
         let (old_handle, disp) = { self.with_call(|call| (call.handle, call.dispatcher.clone())) };
         let new_handle = disp.register(fn_);
         self.with_node_state_mut(|_n, call, _cfg, _e| {
@@ -4468,7 +4468,7 @@ mod tests {
     #[test]
     fn b32_dropped_node_unregisters_its_fn_releasing_captures() {
         let g = TestArena::new();
-        // B32: the dispatcher pool no longer holds a dropped node's fn forever. Before the
+        // B32: the dispatcher's function table no longer holds a dropped node's fn forever. Before the
         // slotmap + unregister-on-Drop, a registered fn lived for the process, pinning the
         // upstream `Core`s it captured (the no-GC leak). Probe via a guard captured by the
         // fn: when the node drops, its fn slot is freed → the fn (and the guard) drop.
@@ -4491,11 +4491,11 @@ mod tests {
                 "the fn (and its capture) is live while the node is"
             );
             // `p` + `_u` drop here → p's Core refcount → 0 → the slot is freed → dispatcher
-            // .unregister → the pool drops the fn → the captured guard drops.
+            // .unregister → the table drops the fn → the captured guard drops.
         }
         assert!(
             fn_dropped.get(),
-            "a dropped node unregisters its fn from the pool, releasing the fn's captures (B32)"
+            "a dropped node unregisters its fn from the table, releasing the fn's captures (B32)"
         );
     }
 

@@ -1,4 +1,5 @@
-//! The dispatcher — first-class invoke funnel + pool host (D20 / D21).
+//! The dispatcher — first-class invoke funnel over one function table (D21,
+//! graphrefly:D807).
 //!
 //! [`Dispatcher::invoke`] is synchronous and returns `()`: a node function has the
 //! shape `(ctx) => void` (R-invocation@2). The wave core never blocks on async;
@@ -6,8 +7,9 @@
 //! and comes back as a later wave (R-wave@2, R-graph-domain@3).
 //!
 //! Every node function is registered in the dispatcher's one function table and
-//! addressed by a pure-data [`Handle`] `(pool_id, handle_id)` (D7). The table's
-//! make-up is this crate's implementation, not protocol, and it has no pool kind
+//! addressed by a pure-data [`Handle`]: its index and the slot's generation (D7,
+//! B32). The table's
+//! make-up is this crate's implementation, not protocol, and it has no pools
 //! (graphrefly:D807; review §5.6 of the D797 migration): an async function kicks
 //! off work and emits later through a kept [`crate::ctx::DeferredCtx`], with the
 //! same synchronous invoke.
@@ -26,8 +28,8 @@ pub use crate::protocol::Handle;
 
 /// A node fn: `(&Ctx) -> ()` (R-fn-contract / D8). Single-thread (D22) ⇒ no
 /// `Send` bound. Stored as `Rc` so [`Dispatcher::invoke`] can clone it out of the
-/// pool and **release the pool borrow before calling it** — a fn that re-drives a
-/// downstream node (nested `invoke`) must not find the pool already borrowed.
+/// table and **release the table borrow before calling it** — a fn that re-drives a
+/// downstream node (nested `invoke`) must not find the table already borrowed.
 pub type NodeFn = Rc<dyn Fn(&Ctx)>;
 
 /// One slotmap entry: a fn (`None` once freed) + a generation bumped on each free,
@@ -37,20 +39,21 @@ struct Slot {
     generation: u32,
 }
 
-/// A dispatch pool: a **slotmap** of fns addressed by `(handle_id, generation)`.
+/// The dispatcher's one function table: a **slotmap** of fns addressed by
+/// `(index, generation)`.
 ///
-/// B32: a node's fn is freed (slot recycled) when the node drops, so the pool no
+/// B32: a node's fn is freed (slot recycled) when the node drops, so the table no
 /// longer holds a dropped node's fn — and thus its captured upstream handles —
 /// alive for the whole process (the no-GC leak; `Node: Clone` made capturing
 /// handles-into-fns idiomatic). Without this, every registered fn leaked, pinning
 /// its captured `Core`s forever.
-struct Pool {
+struct FunctionTable {
     slots: Vec<Slot>,
     /// Recycled (freed) slot ids, reused on the next register.
     free: Vec<u32>,
 }
 
-impl Pool {
+impl FunctionTable {
     fn new() -> Self {
         Self {
             slots: Vec::new(),
@@ -58,20 +61,26 @@ impl Pool {
         }
     }
 
-    /// Register a fn, returning `(handle_id, generation)`. Reuses a freed slot if one
-    /// is available (keeping the slot vec bounded under churn).
-    fn register(&mut self, f: NodeFn) -> (u32, u32) {
-        if let Some(id) = self.free.pop() {
-            let slot = &mut self.slots[id as usize];
+    /// Register a fn, returning its handle. Reuses a freed slot if one is available
+    /// (keeping the slot vec bounded under churn).
+    fn register(&mut self, f: NodeFn) -> Handle {
+        if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index as usize];
             slot.f = Some(f);
-            (id, slot.generation)
+            Handle {
+                index,
+                generation: slot.generation,
+            }
         } else {
-            let id = self.slots.len() as u32;
+            let index = self.slots.len() as u32;
             self.slots.push(Slot {
                 f: Some(f),
                 generation: 0,
             });
-            (id, 0)
+            Handle {
+                index,
+                generation: 0,
+            }
         }
     }
 
@@ -79,31 +88,30 @@ impl Pool {
     /// unregister (generation mismatch, or already free) is a no-op.
     /// Returns the freed fn, for the caller to drop after its borrow ends: the fn may
     /// hold the last handles to other nodes, whose drop unregisters their fns.
-    fn unregister(&mut self, id: u32, generation: u32) -> Option<NodeFn> {
-        let slot = self.slots.get_mut(id as usize)?;
-        if slot.generation != generation || slot.f.is_none() {
+    fn unregister(&mut self, handle: Handle) -> Option<NodeFn> {
+        let slot = self.slots.get_mut(handle.index as usize)?;
+        if slot.generation != handle.generation || slot.f.is_none() {
             return None;
         }
         let freed = slot.f.take();
         slot.generation = slot.generation.wrapping_add(1);
-        self.free.push(id);
+        self.free.push(handle.index);
         freed
     }
 
     /// Clone out the fn for a handle, iff the generation matches and the slot is live.
     /// A stale handle (mismatched generation / freed slot) yields `None`.
-    fn get(&self, id: u32, generation: u32) -> Option<NodeFn> {
+    fn get(&self, handle: Handle) -> Option<NodeFn> {
         self.slots
-            .get(id as usize)
-            .filter(|s| s.generation == generation)
+            .get(handle.index as usize)
+            .filter(|s| s.generation == handle.generation)
             .and_then(|s| s.f.clone())
     }
 }
 
 struct DispatcherInner {
-    /// The one function table (graphrefly:D807; review §5.6), indexed by a handle's
-    /// `pool_id`; a `Vec` so a worker or remote table can still be appended (D20).
-    pools: Vec<Pool>,
+    /// The one function table (graphrefly:D807; review §5.6).
+    functions: FunctionTable,
     /// Opt-in profile recorder (D39 / R-profile). Default off = one boolean branch
     /// per invoke; counters live on the dispatcher, not on the thin node.
     recording: bool,
@@ -182,13 +190,10 @@ impl WorkerBackend {
     }
 }
 
-/// The id of the dispatcher's one function pool.
-pub const SYNC_POOL_ID: u32 = 0;
-
 impl Dispatcher {
     pub fn new() -> Self {
         Dispatcher(Rc::new(RefCell::new(DispatcherInner {
-            pools: vec![Pool::new()],
+            functions: FunctionTable::new(),
             recording: false,
             stats: HashMap::new(),
             local_async_driver: None,
@@ -244,31 +249,21 @@ impl Dispatcher {
 
     /// Register a fn in the function table, returning its [`Handle`].
     pub fn register(&self, f: NodeFn) -> Handle {
-        self.register_in(SYNC_POOL_ID, f)
-    }
-
-    fn register_in(&self, pool_id: u32, f: NodeFn) -> Handle {
-        let (handle_id, generation) = self.0.borrow_mut().pools[pool_id as usize].register(f);
-        Handle {
-            pool_id,
-            handle_id,
-            generation,
-        }
+        self.0.borrow_mut().functions.register(f)
     }
 
     /// The function registered under `handle`, if it is still registered.
     pub(crate) fn function(&self, handle: Handle) -> Option<NodeFn> {
-        self.0.borrow().pools[handle.pool_id as usize].get(handle.handle_id, handle.generation)
+        self.0.borrow().functions.get(handle)
     }
 
-    /// Free a node's fn slot (B32) — called when a node's slot is freed. The pool stops
+    /// Free a node's fn slot (B32) — called when a node's slot is freed. The table stops
     /// holding a dropped node's fn (and thus its captured upstream `Core`s) alive for
     /// the whole process. Idempotent / generation-checked: a stale unregister is a no-op.
     pub fn unregister(&self, handle: Handle) {
         let freed = {
             let mut inner = self.0.borrow_mut();
-            let freed = inner.pools[handle.pool_id as usize]
-                .unregister(handle.handle_id, handle.generation);
+            let freed = inner.functions.unregister(handle);
             inner.stats.remove(&handle);
             freed
         };
@@ -276,15 +271,12 @@ impl Dispatcher {
     }
 
     /// Uniform synchronous invoke (R-invocation@2). Clones the fn out
-    /// and drops the pool borrow before calling, so a nested downstream invoke
-    /// triggered from inside the fn does not double-borrow the pool.
+    /// and drops the table borrow before calling, so a nested downstream invoke
+    /// triggered from inside the fn does not double-borrow the table.
     pub fn invoke(&self, handle: Handle, ctx: &Ctx) {
         let (f, recording) = {
             let inner = self.0.borrow();
-            (
-                inner.pools[handle.pool_id as usize].get(handle.handle_id, handle.generation),
-                inner.recording,
-            )
+            (inner.functions.get(handle), inner.recording)
         };
         // A live node is the SOLE invoker of its own handle, so the slot is present on
         // the live path. A generation mismatch (a stale handle — e.g. a future
