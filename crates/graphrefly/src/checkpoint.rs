@@ -386,12 +386,9 @@ pub struct RestoreDefineCtx<'a> {
 
 impl RestoreDefineCtx<'_> {
     pub fn resolve_definition(&self, ref_: &str) -> RestoreResult<GraphRestoreDefinition> {
-        self.registry.definition(ref_).ok_or_else(|| {
-            GraphRestoreError::new(format!(
-                "restore_graph: missing function definition for '{ref_}' (node '{}')",
-                self.id
-            ))
-        })
+        self.registry
+            .definition(ref_)
+            .ok_or_else(|| not_restorable(self.id, "missing recipe"))
     }
 }
 
@@ -1086,7 +1083,7 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                                     &format!("{}.received[{i}]", entry.id),
                                 )
                                 .map_err(|_| {
-                                    not_restorable(&entry.id, "the values it received are not JSON")
+                                    not_restorable(&entry.id, "its received values are not JSON")
                                 })?
                             },
                             terminal: terminal_to_json(input.ended.as_ref()),
@@ -1097,7 +1094,7 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
             .transpose()?
             // Restored and not run since: what it had received is its seed's note.
             .or_else(|| runtime.seed_note.as_ref().and_then(received_in_note));
-        nodes.push(GraphCheckpointNode {
+        let saved_node = GraphCheckpointNode {
             id: entry.id.clone(),
             name: entry.name.clone(),
             factory: checkpoint_factory(entry, runtime.is_state),
@@ -1118,7 +1115,9 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                         .collect(),
                 )
             },
-        });
+        };
+        validate_checkpoint_node_json(&saved_node)?;
+        nodes.push(saved_node);
     }
     let mounts = graph
         .checkpoint_mounts()
@@ -1451,14 +1450,9 @@ fn prepare_checkpoint(
                     "local-only, built or replaced without a recipe",
                 ));
             }
-            GraphCheckpointFactory::RegistryRef { ref_, .. } => {
-                registry.descriptor(ref_).ok_or_else(|| {
-                    GraphRestoreError::new(format!(
-                        "restore_graph: missing registry descriptor for '{ref_}' (node '{}')",
-                        node.id
-                    ))
-                })?
-            }
+            GraphCheckpointFactory::RegistryRef { ref_, .. } => registry
+                .descriptor(ref_)
+                .ok_or_else(|| not_restorable(&node.id, "missing recipe"))?,
         };
         validate_checkpoint_node_json(node)?;
         if let Some(received) = &node.received {
@@ -1557,21 +1551,26 @@ fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()
         ..
     } = &node.factory
     {
-        validate_checkpoint_json(config, &format!("{}.factory.config", node.id))?;
+        validate_checkpoint_json(config, &format!("{}.factory.config", node.id))
+            .map_err(|_| not_restorable(&node.id, "its recipe config is not JSON"))?;
     }
     for (i, value) in node.values.iter().enumerate() {
-        validate_checkpoint_json(value, &format!("{}.values[{i}]", node.id))?;
+        validate_checkpoint_json(value, &format!("{}.values[{i}]", node.id))
+            .map_err(|_| not_restorable(&node.id, "its retained values are not JSON"))?;
     }
     if let Some(state) = &node.private_state {
-        validate_checkpoint_json(state, &format!("{}.privateState", node.id))?;
+        validate_checkpoint_json(state, &format!("{}.privateState", node.id))
+            .map_err(|_| not_restorable(&node.id, "its private state is not JSON"))?;
     }
     for (i, input) in node.received.iter().flatten().enumerate() {
         for value in &input.values {
-            validate_checkpoint_json(value, &format!("{}.received[{i}]", node.id))?;
+            validate_checkpoint_json(value, &format!("{}.received[{i}]", node.id))
+                .map_err(|_| not_restorable(&node.id, "its received values are not JSON"))?;
         }
     }
     if let GraphCheckpointTerminal::Error { error } = &node.terminal {
-        validate_checkpoint_json(error, &format!("{}.terminal.error", node.id))?;
+        validate_checkpoint_json(error, &format!("{}.terminal.error", node.id))
+            .map_err(|_| not_restorable(&node.id, "its ERROR payload is not JSON"))?;
     }
     if let Some(meta) = &node.meta {
         for (key, value) in meta {
@@ -1634,9 +1633,7 @@ fn construct_prepared(
             || node.lifetime_deps.is_some()
             || (matches!(node.terminal, GraphCheckpointTerminal::None) && !node.values.is_empty());
         if !core.is_state() && saved_lifetime && node.received.is_none() {
-            return Err(GraphRestoreError::new(format!(
-                "restore_graph: node '{id}' lacks the record of what it received (R-checkpoint)"
-            )));
+            return Err(not_restorable(id, "missing received records"));
         }
         let seeded = !core.is_state()
             && matches!(node.terminal, GraphCheckpointTerminal::None)

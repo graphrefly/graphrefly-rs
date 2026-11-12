@@ -4544,3 +4544,61 @@ fn dependency_ids_are_graph_ids_during_setup_runs_and_rewire() {
         vec![b_id]
     );
 }
+
+#[test]
+fn checkpoint_node_refusals_use_the_shared_reason_table() {
+    use graphrefly::{
+        default_restore_registry, restore_graph, restore_registry, GraphCheckpointFactory,
+        GraphCheckpointInput, GraphCheckpointTerminal, RestoreGraphOptions,
+    };
+    use serde_json::json;
+    let g = graphrefly::graph();
+    g.state_opts(json!(1), named("n"));
+    let checkpoint = g.checkpoint().unwrap();
+    let invalid = json!(u64::MAX);
+    for reason in [
+        "its retained values are not JSON",
+        "its private state is not JSON",
+        "its received values are not JSON",
+        "its recipe config is not JSON",
+        "its ERROR payload is not JSON",
+    ] {
+        let mut cp = checkpoint.clone();
+        let n = &mut cp.nodes[0];
+        match reason {
+            "its retained values are not JSON" => n.values = vec![invalid.clone()],
+            "its private state is not JSON" => n.private_state = Some(invalid.clone()),
+            "its received values are not JSON" => {
+                n.received = Some(vec![GraphCheckpointInput {
+                    values: vec![invalid.clone()],
+                    terminal: GraphCheckpointTerminal::None,
+                }])
+            }
+            "its recipe config is not JSON" => {
+                n.factory = GraphCheckpointFactory::RegistryRef {
+                    ref_: "state".to_owned(),
+                    config: Some(invalid.clone()),
+                }
+            }
+            _ => {
+                n.terminal = GraphCheckpointTerminal::Error {
+                    error: invalid.clone(),
+                }
+            }
+        }
+        let error = restore_graph(cp, RestoreGraphOptions::new(default_restore_registry()))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), format!("not restorable: n: {reason}"));
+    }
+    let error = restore_graph(checkpoint, RestoreGraphOptions::new(restore_registry([])))
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "not restorable: n: missing recipe");
+    let h = graphrefly::graph();
+    h.state_opts(f64::NAN, named("n"));
+    assert_eq!(
+        h.checkpoint().err().unwrap().to_string(),
+        "not restorable: n: its retained values are not JSON"
+    );
+}
