@@ -72,10 +72,11 @@
 //!         }
 //!     }
 //! });
-//! g.batch(|_| {
+//! g.batch(|| -> Result<_, ()> {
 //!     a.set(2);
 //!     a.set(3);
-//! });
+//!     Ok(())
+//! }).unwrap();
 //! assert_eq!(*seen.borrow(), vec![2, 6], "the batch is one wave");
 //! stop();
 //! ```
@@ -188,7 +189,6 @@ pub use adapters::wire_edge_group::{
 #[cfg(feature = "tokio")]
 pub use async_driver::TokioLocalDriver;
 pub use async_driver::{DriverCancel, LocalAsyncDriver};
-pub use batch::BatchCtx;
 pub use cascading_cache::{
     reactive_cascading_cache, CascadingCacheEvent, CascadingCachePolicy, CascadingCacheStatus,
     ReactiveCascadingCache, ReactiveCascadingCacheLoadFn, ReactiveCascadingCacheOptions,

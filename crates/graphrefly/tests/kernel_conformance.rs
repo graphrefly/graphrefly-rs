@@ -451,19 +451,25 @@ fn c23_ctx_deps_gives_arrays_terminal_and_latest() {
 
     // (c) [DATA 1, DATA 2, INVALIDATE, DATA 3] in one array: split at its last
     // INVALIDATE, so N sees [3].
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         a.set(1);
         a.set(2);
         a.invalidate();
         a.set(3);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(seen.borrow().last().unwrap().0, vec![vec![3]]);
 
     // (e) terminals are not arrays: A's COMPLETE and B's ERROR in one wave.
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         a.complete();
         b.error("e");
-    });
+
+        Ok(())
+    })
+    .unwrap();
     let last = seen.borrow().last().cloned().unwrap();
     assert_eq!(last.0, Vec::<Vec<i32>>::new());
     assert_eq!(last.1, Vec::<Vec<i32>>::new());
@@ -577,10 +583,13 @@ fn c41_snapshot_is_the_last_array_that_carried_data() {
 
     // A batch's writes to one state are one array, so its snapshot carries both.
     let q = g.state_empty::<i32>();
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         q.set(10);
         q.set(11);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     let (q_late, uq) = record_values(&q);
     assert_eq!(*q_late.borrow(), vec![vec![10, 11]]);
 
@@ -662,12 +671,15 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
     let s = g.state::<i32>(0);
     let (sb, _usb) = record_arrays(&s);
     sb.borrow_mut().clear();
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         s.set(23);
         s.set(23);
         s.set(30);
         assert!(arrays(&sb).is_empty(), "nothing before the commit");
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         arrays(&sb),
         vec![shape(&["PENDING", "DATA", "DATA", "DATA"])]
@@ -703,12 +715,15 @@ fn c28_arrays_stay_intact_with_one_kernel_prefix_each() {
     let t = g.state_empty::<i32>();
     let (tb, _ut) = record_arrays(&t);
     tb.borrow_mut().clear();
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         t.set(1);
         t.complete();
         let rejected = catch_unwind(AssertUnwindSafe(|| t.set(2))).is_err();
         assert!(rejected, "a DATA staged after a terminal is rejected");
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(arrays(&tb), vec![shape(&["PENDING", "DATA", "COMPLETE"])]);
 }
 
@@ -979,10 +994,13 @@ fn c15_dependency_terminal_settles_its_pending_mark() {
     let (log, _u) = record_arrays(&d);
     runs.borrow_mut().clear();
     log.borrow_mut().clear();
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         a.complete();
         a2.set(20);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         *runs.borrow(),
         vec![(Some("COMPLETE".to_owned()), vec![20])],
@@ -1005,10 +1023,13 @@ fn c15_dependency_terminal_settles_its_pending_mark() {
     let (a, a2, d, runs) = build(&g);
     let _u = d.subscribe(|_| {});
     runs.borrow_mut().clear();
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         a.error("boom");
         a2.set(30);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         *runs.borrow(),
         vec![(Some("ERROR boom".to_owned()), vec![30])],
@@ -1505,10 +1526,13 @@ fn auto_error_applies_an_earlier_invalidate_first() {
         assert_eq!(d.cache(), Some(3));
         log.borrow_mut().clear();
         let before = runs.get();
-        g.batch(|_| {
+        g.batch(|| -> Result<_, ()> {
             a.invalidate();
             b.error("x");
-        });
+
+            Ok(())
+        })
+        .unwrap();
         let flat: Vec<String> = arrays(&log).into_iter().flatten().collect();
         let inv = flat.iter().position(|k| k == "INVALIDATE");
         let err = flat.iter().position(|k| k == "ERROR");
@@ -2259,7 +2283,11 @@ fn c33_requests_wait_and_closed_lifetime_staging_is_dropped() {
             if replace_first.get() {
                 p.replace(Vec::new(), |_| {}, graphrefly::ReplaceOpts::default());
             }
-            g.batch(|_| send(&slot, vec![data(3)]));
+            g.batch(|| {
+                send(&slot, vec![data(3)]);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
         })
     };
     // Control: without the replace the staged output commits after the wave.
@@ -2303,30 +2331,32 @@ fn c29_batch_delivers_nothing_before_commit() {
     s_log.borrow_mut().clear();
     let t_log: Rc<RefCell<Vec<Vec<i32>>>> = Rc::new(RefCell::new(Vec::new()));
     let t_unsub: Rc<RefCell<Option<Unsub>>> = Rc::new(RefCell::new(None));
-    let read = g.batch(|_| {
-        a.set(2);
-        let t_log = t_log.clone();
-        *t_unsub.borrow_mut() = Some(b.subscribe(move |msgs: &[Message<AnyValue>]| {
-            t_log.borrow_mut().push(
-                msgs.iter()
-                    .filter_map(|m| match m {
-                        Message::Data(v) => v.downcast_ref::<i32>().copied(),
-                        _ => None,
-                    })
-                    .collect(),
-            )
-        }));
-        kept.borrow()
-            .as_ref()
-            .unwrap()
-            .rewire(vec![a.erased(), c.erased()]);
-        assert!(
-            arrays(&s_log).is_empty(),
-            "nothing is delivered in the body"
-        );
-        assert_eq!(deps_of(&g, "b"), vec!["a"], "nothing changes in the body");
-        a.cache()
-    });
+    let read = g
+        .batch(|| -> Result<_, ()> {
+            a.set(2);
+            let t_log = t_log.clone();
+            *t_unsub.borrow_mut() = Some(b.subscribe(move |msgs: &[Message<AnyValue>]| {
+                t_log.borrow_mut().push(
+                    msgs.iter()
+                        .filter_map(|m| match m {
+                            Message::Data(v) => v.downcast_ref::<i32>().copied(),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }));
+            kept.borrow()
+                .as_ref()
+                .unwrap()
+                .rewire(vec![a.erased(), c.erased()]);
+            assert!(
+                arrays(&s_log).is_empty(),
+                "nothing is delivered in the body"
+            );
+            assert_eq!(deps_of(&g, "b"), vec!["a"], "nothing changes in the body");
+            Ok(a.cache())
+        })
+        .unwrap();
     assert_eq!(
         read,
         Some(1),
@@ -2351,10 +2381,11 @@ fn c29_batch_delivers_nothing_before_commit() {
     // A throwing body delivers nothing and drops its sets and requests.
     s_log.borrow_mut().clear();
     let thrown = catch_unwind(AssertUnwindSafe(|| {
-        g.batch(|_| {
+        g.batch(|| -> Result<(), ()> {
             a.set(9);
-            panic!("body boom");
+            panic!("body boom")
         })
+        .unwrap()
     }));
     assert!(thrown.is_err());
     assert!(arrays(&s_log).is_empty());
@@ -2362,13 +2393,16 @@ fn c29_batch_delivers_nothing_before_commit() {
 
     // A nested batch joins the outer one and returns its value.
     s_log.borrow_mut().clear();
-    let inner = g.batch(|_| {
-        a.set(3);
-        g.batch(|_| {
-            a.set(4);
-            7
+    let inner = g
+        .batch(|| -> Result<_, ()> {
+            a.set(3);
+            Ok(g.batch(|| -> Result<_, ()> {
+                a.set(4);
+                Ok(7)
+            })
+            .unwrap())
         })
-    });
+        .unwrap();
     assert_eq!(inner, 7);
     assert_eq!(arrays(&s_log).len(), 1, "one commit wave");
 
@@ -2381,24 +2415,30 @@ fn c29_batch_delivers_nothing_before_commit() {
             next
         })
     };
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         a.set(record_and(Some(20)));
         a.set(30);
         a.set(record_and(Some(40)));
         a.invalidate();
         a.set(record_and(Some(50)));
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*seen.borrow(), vec![Some(4), Some(30), None]);
     assert_eq!(a.cache(), Some(50));
 
     // A throwing function commits nothing, not even the set of B's input.
     let thrown = catch_unwind(AssertUnwindSafe(|| {
-        g.batch(|_| {
+        g.batch(|| -> Result<_, ()> {
             c.set(101);
             a.set(graphrefly::StateWrite::from_fn(
                 |_: Option<&i32>| -> Option<i32> { panic!("write boom") },
             ));
+
+            Ok(())
         })
+        .unwrap()
     }));
     assert!(thrown.is_err());
     assert_eq!(c.cache(), Some(100));
@@ -2425,11 +2465,13 @@ fn c29_batch_delivers_nothing_before_commit() {
             }
             order.borrow_mut().push("cb".into());
             if first.replace(false) {
-                let r = g.batch(|_| {
-                    let seen = a.cache().unwrap_or(-1);
-                    a.set(60);
-                    seen
-                });
+                let r = g
+                    .batch(|| -> Result<_, ()> {
+                        let seen = a.cache().unwrap_or(-1);
+                        a.set(60);
+                        Ok(seen)
+                    })
+                    .unwrap();
                 returned.set(r);
             }
         })
@@ -2508,19 +2550,22 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
     let (sp, slot) = driven_in(&g);
     let (log, _u) = record_arrays(&sp);
     log.borrow_mut().clear();
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         send(&slot, vec![data(7)]);
         let resolved = catch_unwind(AssertUnwindSafe(|| send(&slot, vec![Message::Resolved])));
         assert!(resolved.is_err(), "RESOLVED is the kernel's");
         send(&slot, vec![Message::Complete]);
-        send(&slot, vec![data(8)]); // a later request, dropped once COMPLETE closes its lifetime
-    });
+        send(&slot, vec![data(8)]);
+        // a later request is dropped once COMPLETE closes its lifetime
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         arrays(&log),
         vec![shape(&["PENDING", "DATA"]), shape(&["PENDING", "COMPLETE"])]
     );
     let staged = g.state(0i32);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         staged.set(7);
         staged.complete();
         let after = catch_unwind(AssertUnwindSafe(|| staged.set(8)));
@@ -2528,7 +2573,10 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
             after.is_err(),
             "a host write cannot follow a staged terminal"
         );
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(staged.cache(), Some(7));
 
     // A sink that throws after a commit goes to the reporter; nothing rolls back.
@@ -2538,7 +2586,11 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
             panic!("sink boom");
         }
     });
-    g.batch(|_| t.set(3));
+    g.batch(|| {
+        t.set(3);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
     assert_eq!(t.cache(), Some(3));
     assert!(reports.borrow().iter().any(|r| r.error == "sink boom"));
 }
@@ -2862,7 +2914,7 @@ fn c38_capture_and_restore() {
     assert_eq!(again.nodes, checkpoint.nodes);
 
     // Capture is refused inside a wave and inside a batch body.
-    let in_batch = g.batch(|_| g.checkpoint().map(|_| ()));
+    let in_batch = g.batch(|| g.checkpoint().map(|_| ()));
     assert!(in_batch.is_err());
     let in_wave: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
     // The trigger is in g: a capture of g during g's own wave is refused.
@@ -3302,13 +3354,15 @@ fn c47_graphs_on_one_thread_share_no_wave_queue_or_batch() {
     // In a g1 batch body, the write of b is g2's own request and runs at once.
     let (a_log, _ua) = record_arrays(&a);
     a_log.borrow_mut().clear();
-    let read = g1.batch(|_| {
-        a.set(json!(2));
-        b.set(json!(5));
-        let read = b.cache();
-        assert!(arrays(&a_log).is_empty(), "a's write waits for the commit");
-        read
-    });
+    let read = g1
+        .batch(|| -> Result<_, ()> {
+            a.set(json!(2));
+            b.set(json!(5));
+            let read = b.cache();
+            assert!(arrays(&a_log).is_empty(), "a's write waits for the commit");
+            Ok(read)
+        })
+        .unwrap();
     assert_eq!(read, Some(json!(5)), "the read sees b's new value");
     assert_eq!(arrays(&a_log), vec![shape(&["PENDING", "DATA"])]);
 }
@@ -3525,12 +3579,15 @@ fn queued_replaces_cannot_commit_a_cycle() {
     let b = producer_in::<i32>(&g, graphrefly::NodeOpts::default(), |_| {});
     let c = producer_in::<i32>(&g, graphrefly::NodeOpts::default(), |_| {});
     let noop = |_: &graphrefly::Ctx| {};
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         a.replace(vec![b.erased()], noop, graphrefly::ReplaceOpts::default());
         b.replace(vec![c.erased()], noop, graphrefly::ReplaceOpts::default());
         // Legal when asked for; a cycle a -> b -> c -> a once the two above have run.
         c.replace(vec![a.erased()], noop, graphrefly::ReplaceOpts::default());
-    });
+
+        Ok(())
+    })
+    .unwrap();
     let deps = |n: &Node<i32>| n.definition().deps.len();
     assert_eq!((deps(&a), deps(&b), deps(&c)), (1, 1, 0));
     let errors: Vec<(String, String)> = reports
@@ -4073,11 +4130,14 @@ fn queued_rewires_cannot_commit_a_cycle() {
     let _uy = y.subscribe(|_| {});
     let x_ctx = x_ctx.borrow_mut().take().unwrap();
     let y_ctx = y_ctx.borrow_mut().take().unwrap();
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         x_ctx.rewire(vec![y.erased()]);
         // Legal when asked for; a cycle x -> y -> x once the one above has run.
         y_ctx.rewire(vec![x.erased()]);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     let deps_of = |id: &str| {
         g.describe()
             .into_iter()
@@ -4416,7 +4476,7 @@ fn queued_batch_refuses_an_ended_target_before_any_updater_or_commit() {
                     return;
                 }
                 ended.complete();
-                g.batch(|_| {
+                g.batch(|| -> Result<_, ()> {
                     let runs = runs.clone();
                     other.set(graphrefly::StateWrite::from_fn(move |v: Option<&i32>| {
                         runs.set(runs.get() + 1);
@@ -4430,7 +4490,10 @@ fn queued_batch_refuses_an_ended_target_before_any_updater_or_commit() {
                         ended.set(2);
                     }
                     let _stop = requested.subscribe(|_| {});
-                });
+
+                    Ok(())
+                })
+                .unwrap();
             }
         });
         trigger.set(1);
@@ -4662,22 +4725,61 @@ fn late_output_survives_commit_failure_but_not_body_failure() {
     let (log, _stop) = record_values(&producer);
     let state = g.state(0i32);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        g.batch(|_| {
+        g.batch(|| -> Result<_, ()> {
             send(&slot, vec![data(42)]);
             state.set(graphrefly::StateWrite::from_fn(|_: Option<&i32>| {
                 panic!("updater failed")
             }));
-        });
+
+            Ok(())
+        })
+        .unwrap();
     }));
     assert!(failed.is_err());
     assert_eq!(*log.borrow(), vec![vec![], vec![42]]);
     log.borrow_mut().clear();
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        g.batch(|_| {
+        g.batch(|| -> Result<(), ()> {
             send(&slot, vec![data(43)]);
-            panic!("body failed");
-        });
+            panic!("body failed")
+        })
+        .unwrap();
     }));
     assert!(failed.is_err());
     assert!(log.borrow().is_empty());
+}
+
+#[test]
+fn nested_batch_result_errors_follow_the_outer_body() {
+    let g = graphrefly::graph();
+    let s = g.state(0i32);
+    let caught = g.batch(|| -> Result<(), &str> {
+        s.set(1);
+        let inner = g.batch(|| {
+            s.set(2);
+            Err::<(), _>("inner")
+        });
+        assert_eq!(inner, Err("inner"));
+        Ok(())
+    });
+    assert_eq!(caught, Ok(()));
+    assert_eq!(
+        s.cache(),
+        Some(2),
+        "caught inner Err keeps the flattened staging"
+    );
+    let propagated = g.batch(|| -> Result<(), &str> {
+        s.set(3);
+        g.batch(|| {
+            s.set(4);
+            Err::<(), _>("inner")
+        })?;
+        Ok(())
+    });
+    assert_eq!(propagated, Err("inner"));
+    assert_eq!(
+        s.cache(),
+        Some(2),
+        "outer Err discards everything it staged"
+    );
 }

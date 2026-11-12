@@ -3655,7 +3655,7 @@ fn same_ordered_deps(old_deps: &[Core], new_deps: &[Core]) -> bool {
 /// ```
 /// let g = graphrefly::graph();
 /// let s = g.state(1i32);
-/// g.batch(|_| s.set(2));
+/// g.batch(|| { s.set(2); Ok::<_, ()>(()) }).unwrap();
 /// assert_eq!(s.cache(), Some(2));
 /// ```
 pub struct Node<T> {
@@ -4155,7 +4155,7 @@ mod tests {
             Node::producer_opts_in_arena(&self.0, opts.node, f)
         }
 
-        fn batch<R>(&self, f: impl FnOnce(&crate::batch::BatchCtx) -> R) -> R {
+        fn batch<R, E>(&self, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
             crate::batch::batch_in(&self.0.domain(), f)
         }
     }
@@ -4226,21 +4226,25 @@ mod tests {
         let _u = s.subscribe(sink);
         log.borrow_mut().clear();
 
-        g.batch(|_| {
+        g.batch(|| -> Result<_, ()> {
             s.set(1);
             s.set(2);
             assert!(log.borrow().is_empty());
             assert_eq!(s.cache(), Some(0));
-        });
+
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(*log.borrow(), vec!["PENDING", "DATA", "DATA"]);
         assert_eq!(s.cache(), Some(2));
 
         log.borrow_mut().clear();
-        g.batch(|bctx| {
+        let failed = g.batch(|| {
             s.set(3);
-            bctx.rollback();
             assert!(log.borrow().is_empty());
+            Err::<(), _>("cancelled")
         });
+        assert_eq!(failed, Err("cancelled"));
         assert!(log.borrow().is_empty());
         assert_eq!(s.cache(), Some(2));
     }
@@ -5378,7 +5382,7 @@ mod tests {
         let source = g.state::<i32>(1);
         let refs = source.core.refs.clone();
 
-        g.batch(|_| {
+        g.batch(|| -> Result<_, ()> {
             let before = refs.get();
             source.core.request_down_next(vec![Message::Invalidate]);
             assert_eq!(
@@ -5386,7 +5390,10 @@ mod tests {
                 before,
                 "the queued request holds a weak handle, not a counted Core"
             );
-        });
+
+            Ok(())
+        })
+        .unwrap();
 
         assert_eq!(refs.get(), 1);
     }
@@ -5398,7 +5405,7 @@ mod tests {
         let refs = source.core.refs.clone();
         let before = refs.get();
 
-        g.batch(|_| {
+        g.batch(|| -> Result<_, ()> {
             source.set(2);
             source.set(3);
             source.set(4);
@@ -5407,7 +5414,10 @@ mod tests {
                 before,
                 "defer_to_batch should use generation-checked batch pins, not counted Core handles"
             );
-        });
+
+            Ok(())
+        })
+        .unwrap();
 
         assert_eq!(
             refs.get(),
@@ -5432,7 +5442,7 @@ mod tests {
             crate::batch::batch_in(&arena.domain(), {
                 let graph = graph.clone();
                 let refs = refs.clone();
-                move |_| {
+                move || {
                     let owned = source;
                     owned.set(1);
                     drop(owned);
@@ -5446,8 +5456,10 @@ mod tests {
                         graph.borrow().is_live_key(key),
                         "arena pin keeps the node slot live for open batch finish"
                     );
+                    Ok::<_, ()>(())
                 }
-            });
+            })
+            .unwrap();
 
             assert_eq!(refs.get(), 0);
             assert!(
@@ -5459,10 +5471,10 @@ mod tests {
         let source = Node::<i32>::state_in_arena(&arena, 0);
         let refs = source.core.refs.clone();
         let key = source.core.key();
-        crate::batch::batch_in(&arena.domain(), {
+        let cancelled = crate::batch::batch_in(&arena.domain(), {
             let graph = graph.clone();
             let refs = refs.clone();
-            move |bctx| {
+            move || {
                 let owned = source;
                 owned.set(2);
                 drop(owned);
@@ -5476,9 +5488,10 @@ mod tests {
                     graph.borrow().is_live_key(key),
                     "rollback also runs with a pinned slot while the batch remains open"
                 );
-                bctx.rollback();
+                Err::<(), _>("cancelled")
             }
         });
+        assert_eq!(cancelled, Err("cancelled"));
 
         assert_eq!(refs.get(), 0);
         assert!(

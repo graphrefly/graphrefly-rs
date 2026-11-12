@@ -2022,7 +2022,7 @@ mod tests {
     fn checkpoint_is_refused_inside_a_wave_or_a_batch_body() {
         let g = crate::graph::graph();
         let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let in_batch = g.batch(|_| g.checkpoint().map(|_| ()));
+        let in_batch = g.batch(|| g.checkpoint().map(|_| ()));
         assert!(in_batch.unwrap_err().to_string().contains("batch body"));
         let in_wave = Rc::new(RefCell::new(None));
         let _sub = {

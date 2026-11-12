@@ -284,10 +284,13 @@ fn c1b_gate_releases_each_cause_whole_in_order_at_most_once() {
     tx.set(vec![4]);
     y.set(vec![5]);
     assert_eq!(q.borrow().len(), 3, "separate waves, separate causes");
-    s.batch(|_| {
+    s.batch(|| -> Result<_, ()> {
         tx.set(vec![6]);
         y.set(vec![7]);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(q.borrow().len(), 4);
     assert_eq!(
         q.borrow()[3].edges.len(),

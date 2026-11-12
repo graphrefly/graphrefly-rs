@@ -410,7 +410,7 @@ fn remote_call_accepts_same_wave_response_after_request_registration() {
     let results = collect_data(&remote.results);
     let status = collect_data(&remote.status);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         remote.call("echo", "req-1", "payload".to_owned());
         bridge.inbound.set(envelope_with_request(
             "session-a",
@@ -423,7 +423,10 @@ fn remote_call_accepts_same_wave_response_after_request_registration() {
             })),
             Some("req-1"),
         ));
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(
         *results.borrow(),
@@ -449,7 +452,7 @@ fn remote_call_duplicate_after_completion_is_visible_in_same_event_batch() {
 
     remote.call("echo", "req-1", "payload".to_owned());
     // Both responses arrive in one inbound array, as one batch commits them.
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         bridge.inbound.set(envelope_with_request(
             "session-a",
             WireBridgeEnvelopeType::Data,
@@ -472,7 +475,10 @@ fn remote_call_duplicate_after_completion_is_visible_in_same_event_batch() {
             })),
             Some("req-1"),
         ));
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(
         *results.borrow(),

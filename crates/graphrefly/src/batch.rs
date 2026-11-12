@@ -1,9 +1,8 @@
 //! Batch — declarative transactional wave grouping (D12 / L2.E).
 //!
 //! `batch` runs a closure that may drive multiple nodes; **commit is always
-//! implicit** on success, **rollback on panic or explicit rollback**. This eliminates the
-//! forgot-to-commit class of bugs, and the three languages align naturally.
-//! `bctx.rollback()` is an explicit escape hatch within the closure.
+//! implicit** on `Ok`, **discard on `Err` or panic**. Nested bodies join the outer
+//! transaction: a caught inner error does not discard its accumulated writes.
 //!
 //! ## Interaction with message classes
 //!
@@ -13,30 +12,16 @@
 //! ctx.rewire) wait. When `body` returns, its inputs commit as one wave, and its
 //! requests then run in order (R-request-order@2). The commit is itself a request:
 //! during a wave it runs after the wave. A body that panics commits nothing and drops
-//! its requests; output a ctx staged through a lifetime that closed before the commit
-//! is dropped at the commit.
+//! its requests. Late ctx output is a separate request and survives a commit failure.
 //!
 //! Conformance touchpoints: C-3 (INVALIDATE fan-in idempotency exercised via
 //! batch) and C-22 (batch-before-rewire).
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::rc::Rc;
 
 use crate::node::{commit_batched_waves, BatchTarget, Core, Domain, DomainRef};
 use crate::protocol::{AnyValue, Message, Wave};
-
-/// The rollback escape hatch of [`crate::Graph::batch`] (D12).
-pub struct BatchCtx {
-    rolled_back: Rc<Cell<bool>>,
-}
-
-impl BatchCtx {
-    /// Discard all deferred settle slices instead of committing them.
-    pub fn rollback(&self) {
-        self.rolled_back.set(true);
-    }
-}
 
 /// A state write function staged in a batch: it computes from the value the writes
 /// staged before it leave, at the commit (R-request-order@2).
@@ -44,12 +29,8 @@ pub(crate) type StagedWrite = Box<dyn FnOnce(Option<AnyValue>) -> Option<AnyValu
 
 /// One staged item of a target, in staging order.
 enum Staged {
-    /// Messages, with the lifetime of the ctx that staged them, if any: output staged
-    /// through a lifetime that closed before the commit is dropped at the commit.
-    Msgs {
-        msgs: Wave<AnyValue>,
-        lifetime: Option<u64>,
-    },
+    /// Host messages, accumulated into one array at commit.
+    Msgs { msgs: Wave<AnyValue> },
     /// A state write function.
     Write(StagedWrite),
 }
@@ -70,16 +51,14 @@ fn ends_with_terminal(items: &[Staged]) -> bool {
 pub(crate) struct ActiveBatch {
     targets: Vec<BatchTarget>,
     deferred: Vec<Option<StagedItems>>,
-    rolled_back: Rc<Cell<bool>>,
     collecting: bool,
 }
 
 impl ActiveBatch {
-    fn new(rolled_back: Rc<Cell<bool>>) -> Self {
+    fn new() -> Self {
         Self {
             targets: Vec::new(),
             deferred: Vec::new(),
-            rolled_back,
             collecting: true,
         }
     }
@@ -120,10 +99,7 @@ pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
             wave.is_empty() || !ends_with_terminal(staged),
             "batch: output staged after a terminal (R-wave)"
         );
-        staged.push(Staged::Msgs {
-            msgs: wave,
-            lifetime: None,
-        });
+        staged.push(Staged::Msgs { msgs: wave });
     })
 }
 
@@ -189,7 +165,6 @@ pub(crate) fn assert_stageable(target: &Core, wave: &[Message<AnyValue>]) {
 struct BatchFinish {
     targets: Vec<BatchTarget>,
     deferred: Vec<Option<StagedItems>>,
-    explicit_rollback: bool,
 }
 
 fn take_for_finish(d: &Domain) -> BatchFinish {
@@ -200,7 +175,6 @@ fn take_for_finish(d: &Domain) -> BatchFinish {
         BatchFinish {
             targets: std::mem::take(&mut batch.targets),
             deferred: std::mem::take(&mut batch.deferred),
-            explicit_rollback: batch.rolled_back.get(),
         }
     })
 }
@@ -239,10 +213,7 @@ fn resolve(
         let mut wave: Wave<AnyValue> = Vec::new();
         for item in items {
             match item {
-                Staged::Msgs { msgs, lifetime } => {
-                    if lifetime.is_some_and(|id| !core.lifetime_open(id)) {
-                        continue;
-                    }
+                Staged::Msgs { msgs } => {
                     for m in &msgs {
                         match m {
                             Message::Data(v) => current = Some(v.clone()),
@@ -276,33 +247,18 @@ fn commit(targets: &[BatchTarget], resolved: Vec<(usize, Wave<AnyValue>)>) {
 }
 
 /// A batch of domain `d` (R-request-order@2, R-graph-domain@3).
-pub(crate) fn batch_in<R>(d: &DomainRef, f: impl FnOnce(&BatchCtx) -> R) -> R {
-    if let Some(rolled_back) = with_batch(d, |b| {
-        b.borrow().as_ref().map(|batch| batch.rolled_back.clone())
-    }) {
-        return f(&BatchCtx { rolled_back });
+pub(crate) fn batch_in<R, E>(d: &DomainRef, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
+    if batch_frame_open(d) {
+        return f();
     }
-
-    let rolled_back = Rc::new(Cell::new(false));
-    with_batch(d, |b| {
-        *b.borrow_mut() = Some(ActiveBatch::new(rolled_back.clone()));
-    });
-
-    let ctx = BatchCtx {
-        rolled_back: rolled_back.clone(),
-    };
+    with_batch(d, |b| *b.borrow_mut() = Some(ActiveBatch::new()));
     let request_mark = crate::node::request_mark(d);
-    let result = catch_unwind(AssertUnwindSafe(|| f(&ctx)));
+    let result = catch_unwind(AssertUnwindSafe(f));
     let finish = take_for_finish(d);
 
     match result {
-        Ok(value) => {
-            if finish.explicit_rollback {
-                // Nothing was delivered before the commit, so a rollback only drops
-                // what was staged and the body's requests (R-request-order@2).
-                crate::node::drop_requests_after(d, request_mark);
-                clear_active(d);
-            } else if crate::node::in_wave(d) {
+        Ok(Ok(value)) => {
+            if crate::node::in_wave(d) {
                 // The commit is a request: during a wave it runs after the wave, and
                 // the body's topology requests run after it (R-request-order@2).
                 clear_active(d);
@@ -345,7 +301,12 @@ pub(crate) fn batch_in<R>(d: &DomainRef, f: impl FnOnce(&BatchCtx) -> R) -> R {
                     resume_unwind(payload);
                 }
             }
-            value
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            crate::node::drop_requests_after(d, request_mark);
+            clear_active(d);
+            Err(error)
         }
         Err(payload) => {
             crate::node::drop_requests_after(d, request_mark);

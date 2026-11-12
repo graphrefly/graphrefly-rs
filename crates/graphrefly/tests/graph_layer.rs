@@ -95,11 +95,14 @@ fn graph_state_derived_effect_and_batch_are_graph_owned() {
     assert_eq!(doubled.cache(), Some(0));
     assert_eq!(*seen.borrow(), vec![0]);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         count.set(1);
         count.set(2);
         assert_eq!(doubled.cache(), Some(0));
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(doubled.cache(), Some(4));
     assert_eq!(*seen.borrow(), vec![0, 4]);
@@ -1316,10 +1319,13 @@ fn derived_values_give_the_latest_and_previous_values_only() {
     };
     let _keep_alive = sum.subscribe(|_| {});
     assert_eq!(sum.cache(), Some(1));
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(2i32);
         source.set(3i32);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(sum.cache(), Some(3));
     assert_eq!(*seen.borrow(), vec![(Some(1), None), (Some(3), Some(1))]);
 }

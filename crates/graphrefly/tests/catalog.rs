@@ -2618,10 +2618,13 @@ fn throttle_waits_for_open_window_before_source_complete() {
     let seen = collect_shapes::<i32>(&throttled);
     let data = collect_data(&throttled);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(1i32);
         src.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(*data.borrow(), vec![1]);
     assert_eq!(
@@ -2675,10 +2678,13 @@ fn throttle_reactivation_starts_a_new_lifetime_on_the_completed_snapshot() {
             }
         });
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(1i32);
         src.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*first_events.borrow(), vec!["DATA:1"]);
     unsubscribe();
 
@@ -2765,10 +2771,13 @@ fn audit_flushes_same_wave_source_data_before_complete() {
     let seen = collect_shapes::<i32>(&audited);
     let data = collect_data(&audited);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(9i32);
         src.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(*data.borrow(), vec![9]);
     assert_eq!(*seen.borrow(), vec!["DATA", "COMPLETE"]);
@@ -2790,10 +2799,13 @@ fn audit_same_wave_notifier_close_uses_pre_wave_latest() {
     let data = collect_data(&audited);
 
     src.set(1);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         notifier.set(());
         src.set(2);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         *data.borrow(),
         vec![1],
@@ -2828,10 +2840,13 @@ fn audit_same_wave_reopen_only_suppresses_the_closed_notifier() {
     let data = collect_data(&audited);
 
     src.set(1);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         old_notifier.set(());
         src.set(2);
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(
         *data.borrow(),
@@ -2910,10 +2925,13 @@ fn timeout_arms_on_subscribe_resets_and_cleans_up() {
     let src = g.state_empty::<i32>();
     let completing = timeout(&src, 10);
     let completing_seen = collect_shapes::<i32>(&completing);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(3i32);
         src.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*completing_seen.borrow(), vec!["DATA", "COMPLETE"]);
     driver.fire_sleepers();
     assert_eq!(
@@ -3004,10 +3022,13 @@ fn timeout_same_wave_data_then_error_forwards_data_then_error_and_clears_timer()
     let seen = collect_shapes::<i32>(&timed);
     let data = collect_data(&timed);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(7i32);
         src.error("source failed");
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(*data.borrow(), vec![7]);
     assert_eq!(*seen.borrow(), vec!["DATA", "ERROR"]);
@@ -3046,10 +3067,13 @@ fn buffer_time_flushes_empty_windows_values_and_terminal_remainder() {
     driver.tick_intervals();
     assert_eq!(*data.borrow(), vec![Vec::<i32>::new(), vec![1, 2]]);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(3i32);
         src.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*data.borrow(), vec![Vec::<i32>::new(), vec![1, 2], vec![3]]);
     assert_eq!(*seen.borrow(), vec!["DATA", "DATA", "DATA", "COMPLETE"]);
     driver.tick_intervals();
@@ -3166,10 +3190,13 @@ fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
     let delayed_seen = collect_shapes::<i32>(&delayed);
     let delayed_data = collect_data(&delayed);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(7i32);
         src.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert!(delayed_seen.borrow().is_empty());
     driver.fire_sleepers();
     assert_eq!(*delayed_data.borrow(), vec![7]);
@@ -3180,10 +3207,13 @@ fn delay_and_buffer_time_handle_same_wave_data_terminal_edges() {
     let buffered_seen = collect_shapes::<Vec<i32>>(&buffered);
     let buffered_data = collect_data(&buffered);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         src.set(9i32);
         src.error("source failed");
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(
         *buffered_data.borrow(),
@@ -3589,10 +3619,13 @@ fn scan_and_merge_catalog_symbols_are_directly_pinned() {
         GraphNodeOpts::named("merge"),
     );
     let merged_seen = collect_data(&merged);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         left.set(1);
         right.set(10);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     right.set(11);
     assert_eq!(*merged_seen.borrow(), vec![1, 10, 11]);
 
@@ -3622,10 +3655,13 @@ fn rescue_edges_absorb_same_wave_error_and_recover_panic_becomes_error() {
     let recovered_seen = collect_data(&recovered);
     let recovered_shapes = collect_shapes::<i32>(&recovered);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(7i32);
         source.error("boom");
-    });
+
+        Ok(())
+    })
+    .unwrap();
 
     assert_eq!(*recovered_seen.borrow(), vec![7, 42]);
     assert_eq!(*recovered_shapes.borrow(), vec!["DATA", "DATA"]);
@@ -3890,10 +3926,13 @@ fn notifier_combinators_and_race_follow_static_edges() {
         GraphNodeOpts::named("sample_error"),
     );
     let sample_shapes = collect_shapes::<i32>(&sampled);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.complete();
         notifier.error("sample notifier failed");
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*sample_shapes.borrow(), vec!["ERROR"]);
 
     let source = g.state(7i32);
@@ -3922,10 +3961,13 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("buffer_same_wave"),
     );
     let buffer_seen = collect_data(&buffered);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(2);
         notifier.set(());
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*buffer_seen.borrow(), vec![vec![1, 2]]);
 
     let source = g.state(3i32);
@@ -3936,13 +3978,19 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("buffer_multi_notifier_wave"),
     );
     let buffer_seen = collect_data(&buffered);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(4);
-        g.batch(|_| {
+        g.batch(|| -> Result<_, ()> {
             notifier.set(());
             notifier.set(());
-        });
-    });
+
+            Ok(())
+        })
+        .unwrap();
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         *buffer_seen.borrow(),
         vec![vec![3, 4]],
@@ -3957,10 +4005,13 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("sample_same_wave"),
     );
     let sample_seen = collect_data(&sampled);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(6);
         notifier.set(());
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*sample_seen.borrow(), vec![6]);
 
     let source = g.state_empty::<i32>();
@@ -3971,10 +4022,13 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("take_until_same_wave"),
     );
     let until_seen = collect_shapes::<i32>(&until);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(8);
         notifier.set(());
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*until_seen.borrow(), vec!["COMPLETE"]);
 
     let source = g.state_empty::<i32>();
@@ -3985,10 +4039,13 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("take_until_notifier_first"),
     );
     let until_seen = collect_shapes::<i32>(&until);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         notifier.set(());
         source.set(21);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*until_seen.borrow(), vec!["COMPLETE"]);
 
     let source = g.state(10i32);
@@ -3999,14 +4056,20 @@ fn batched_notifier_and_control_ordering_is_pinned() {
         GraphNodeOpts::named("valve_same_wave"),
     );
     let gated_seen = collect_data(&gated);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         control.set(true);
         source.set(11);
-    });
-    g.batch(|_| {
+
+        Ok(())
+    })
+    .unwrap();
+    g.batch(|| -> Result<_, ()> {
         control.set(false);
         source.set(12);
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(*gated_seen.borrow(), vec![11]);
 }
 
@@ -4466,12 +4529,15 @@ fn higher_order_merge_map_with_options_limits_live_inners() {
     );
     let seen = collect_data(&merged);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(1i32);
         source.set(2i32);
         source.set(3i32);
         source.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         inners.borrow().len(),
         2,
@@ -4518,11 +4584,14 @@ fn higher_order_merge_map_with_options_skips_just_completed_reused_inner() {
     );
     let seen = collect_data(&merged);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(1i32);
         source.set(2i32);
         source.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     inner.set(10);
     assert_eq!(*seen.borrow(), vec![10]);
     assert_ne!(merged.status().output, graphrefly::OutputStatus::Completed);
@@ -4547,11 +4616,14 @@ fn higher_order_merge_map_dedupes_reused_live_inner() {
     let shapes = collect_shapes::<i32>(&merged);
     let data = collect_data(&merged);
 
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(1i32);
         source.set(2i32);
         source.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     shared.set(10);
     shared.complete();
 
@@ -4581,10 +4653,13 @@ fn higher_order_switch_map_dedupes_reused_live_inner() {
     let data = collect_data(&switched);
 
     source.set(1i32);
-    g.batch(|_| {
+    g.batch(|| -> Result<_, ()> {
         source.set(2i32);
         source.complete();
-    });
+
+        Ok(())
+    })
+    .unwrap();
     shared.set(10);
     shared.complete();
 
