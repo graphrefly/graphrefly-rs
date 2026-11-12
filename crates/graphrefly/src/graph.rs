@@ -182,8 +182,6 @@ struct GraphInner {
     retired_ids: RefCell<HashSet<String>>,
     mounts: RefCell<Vec<Mount>>,
     seq: Cell<usize>,
-    synth_seq: Cell<usize>,
-    synth_ids: RefCell<HashMap<(usize, usize, u64), String>>,
     clock: Rc<Cell<u64>>,
     topology_observers: RefCell<Vec<Option<TopologyObserverEntry>>>,
     topology_observer_active: Cell<usize>,
@@ -402,8 +400,6 @@ impl Graph {
                 retired_ids: RefCell::new(HashSet::new()),
                 mounts: RefCell::new(Vec::new()),
                 seq: Cell::new(0),
-                synth_seq: Cell::new(0),
-                synth_ids: RefCell::new(HashMap::new()),
                 clock: Rc::new(Cell::new(0)),
                 topology_observers: RefCell::new(Vec::new()),
                 topology_observer_active: Cell::new(0),
@@ -430,12 +426,28 @@ impl Graph {
 
     /// Look up a registered graph node by stable id.
     pub fn find(&self, id: &str) -> Option<GraphNode> {
-        self.inner
-            .by_id
+        if let Some(core) = self.inner.by_id.borrow().get(id).cloned() {
+            return Some(GraphNode::new(core));
+        }
+        // Dynamic inner nodes share describe's identity without a second registry.
+        let mut pending: Vec<Core> = self
+            .inner
+            .entries
             .borrow()
-            .get(id)
-            .cloned()
-            .map(GraphNode::new)
+            .iter()
+            .map(|entry| entry.core.clone())
+            .collect();
+        let mut seen = HashSet::new();
+        while let Some(core) = pending.pop() {
+            if !seen.insert(core.identity_key()) {
+                continue;
+            }
+            if core.graph_id() == id {
+                return Some(GraphNode::new(core));
+            }
+            pending.extend(core.deps());
+        }
+        None
     }
 
     /// ctx-level power surface: the raw `(ctx)=>void` node factory.
@@ -941,6 +953,7 @@ impl Graph {
             !self.inner.retired_ids.borrow().contains(&id),
             "graph node id '{id}' has been released from this graph lifecycle (D122)"
         );
+        core.set_graph_id(id.clone());
         let entry = Entry {
             core: core.clone(),
             id: id.clone(),
@@ -1161,23 +1174,7 @@ impl Graph {
     }
 
     fn synthetic_id_for_core(&self, core: &Core, prefix: &str) -> String {
-        let key = core.identity_key();
-        let id = {
-            let mut synth = self.inner.synth_ids.borrow_mut();
-            if let Some(id) = synth.get(&key) {
-                id.clone()
-            } else {
-                let next = self.inner.synth_seq.get();
-                self.inner.synth_seq.set(next + 1);
-                let id = format!(
-                    "~{}#{next}",
-                    core.factory().unwrap_or_else(|| "?".to_owned())
-                );
-                synth.insert(key, id.clone());
-                id
-            }
-        };
-        format!("{prefix}{id}")
+        format!("{prefix}{}", core.graph_id())
     }
 
     fn id_for_core(&self, core: &Core, prefix: &str) -> String {

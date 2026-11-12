@@ -288,8 +288,8 @@ pub use messaging::{
     STANDARD_TOPICS, TODOS_TOPIC,
 };
 pub use node::{
-    CacheStatus, Core, Lifecycle, Node, NodeDefinition, NodeIdentity, NodeOpts, OutputStatus,
-    Policy, ReplaceOpts, State, StateWrite, Status,
+    CacheStatus, Core, Lifecycle, Node, NodeDefinition, NodeOpts, OutputStatus, Policy,
+    ReplaceOpts, State, StateWrite, Status,
 };
 pub use operators::{
     catch_error, distinct_until_changed, element_at, filter, find, first, first_any, last,

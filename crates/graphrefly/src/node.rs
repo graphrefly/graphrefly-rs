@@ -371,10 +371,9 @@ struct ArenaNodeKey {
 }
 
 /// A node's identity: which node of which graph, stable for the node's life
-/// (R-invocation@2: each input says which dependency it is). [`Core::identity`]
-/// gives a node's.
+/// Internal arena identity; public dependency ids are graph registration ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeIdentity {
+pub(crate) struct NodeIdentity {
     arena_key: ArenaNodeKey,
 }
 
@@ -932,6 +931,7 @@ pub(crate) struct NodeSeed {
 type TopologyDepsChangedObserver = Rc<dyn Fn(&[Core], &[Core])>;
 
 struct NodeTopologySlot {
+    registered_id: Option<String>,
     /// The current dependencies: the declared ones, or a ctx.rewire's for the open
     /// lifetime (R-request-order@2).
     deps: Vec<Core>,
@@ -1986,10 +1986,19 @@ fn with_wave_owner<R>(owner: &Core, body: impl FnOnce() -> R, on_error: impl FnO
 }
 
 impl Core {
-    /// This node's identity.
-    #[must_use]
-    pub fn identity(&self) -> NodeIdentity {
-        NodeIdentity::from_core(self)
+    pub(crate) fn graph_id(&self) -> String {
+        self.borrow().registered_id.clone().unwrap_or_else(|| {
+            format!(
+                "~{}#{}-{}",
+                self.factory().unwrap_or_else(|| "node".to_owned()),
+                self.id.0,
+                self.generation
+            )
+        })
+    }
+
+    pub(crate) fn set_graph_id(&self, id: String) {
+        self.with_inner_edges_mut(|node, _| node.registered_id = Some(id));
     }
 
     /// True when both handles name the same node (same graph arena, id and slot
@@ -2227,6 +2236,7 @@ impl Core {
             );
         }
         let topology = NodeTopologySlot {
+            registered_id: None,
             declared: deps.clone(),
             deps,
             topology_deps_changed: None,
@@ -3210,6 +3220,7 @@ impl Core {
         );
         // Build ctx + call snapshot under one short arena borrow, then invoke
         // borrow-free through the dispatcher (R-invocation@2).
+        let dep_ids: Vec<String> = self.deps().iter().map(Core::graph_id).collect();
         let (handle, dispatcher, ctx, setup) = self.with_node_state_aux_mut(|n, c, cfg, e, a| {
             let invalidate_manual = cfg.invalidate == Policy::Manual;
             let dep_records: Vec<DepRecord> = e
@@ -3217,8 +3228,10 @@ impl Core {
                 .inputs
                 .iter()
                 .zip(&n.deps)
-                .map(|(input, dep)| DepRecord {
+                .zip(&dep_ids)
+                .map(|((input, dep), id)| DepRecord {
                     dep: NodeIdentity::from_core(dep),
+                    id: id.clone(),
                     wave_data: input
                         .frames
                         .iter()

@@ -44,6 +44,7 @@ pub enum DepTerminal {
 pub(crate) struct DepRecord {
     /// Which node this dependency is (R-invocation: ctx.deps[i] gives its id).
     pub(crate) dep: crate::node::NodeIdentity,
+    pub(crate) id: String,
     /// The arrays this dependency delivered to this invocation, each as its DATA
     /// payloads in order (a RESOLVED array is empty), keeping array boundaries
     /// (R-invocation).
@@ -72,8 +73,8 @@ pub struct DepView<'a> {
 impl<'a> DepView<'a> {
     /// Which dependency this is.
     #[must_use]
-    pub fn id(&self) -> crate::node::NodeIdentity {
-        self.record.dep
+    pub fn id(&self) -> &'a str {
+        &self.record.id
     }
 
     /// Whether this dependency is `node`.

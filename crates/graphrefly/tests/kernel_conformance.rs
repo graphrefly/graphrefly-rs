@@ -4498,3 +4498,49 @@ fn fixed_arity_operators_refuse_before_registering_or_running() {
     )))
     .is_err());
 }
+
+#[test]
+fn dependency_ids_are_graph_ids_during_setup_runs_and_rewire() {
+    let g = graphrefly::graph();
+    let a = g.state_opts(1i32, named("named-input"));
+    let b = g.state(2i32);
+    let b_id = g
+        .describe()
+        .into_iter()
+        .find(|n| n.id != "named-input")
+        .unwrap()
+        .id;
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let slot = Rc::new(RefCell::new(None));
+    let setup_g = g.clone();
+    let n = g.node_opts::<i32, _>(
+        vec![a.erased()],
+        {
+            let (g, seen, slot) = (g.clone(), seen.clone(), slot.clone());
+            move |ctx| {
+                let id = ctx.dep(0).id().to_owned();
+                assert!(g.find(&id).is_some());
+                seen.borrow_mut().push(id);
+                *slot.borrow_mut() = Some(ctx.defer());
+            }
+        },
+        named("reader").with_node(graphrefly::NodeOpts::default().with_setup(move |ctx| {
+            assert_eq!(ctx.dep(0).id(), "named-input");
+            assert!(setup_g.find(ctx.dep(0).id()).is_some());
+            None
+        })),
+    );
+    let _stop = n.subscribe(|_| {});
+    assert_eq!(*seen.borrow(), vec!["named-input"]);
+    let kept = slot.borrow_mut().take().unwrap();
+    kept.rewire(vec![b.erased()]);
+    assert_eq!(seen.borrow().last(), Some(&b_id));
+    assert_eq!(
+        g.describe()
+            .into_iter()
+            .find(|n| n.id == "reader")
+            .unwrap()
+            .deps,
+        vec![b_id]
+    );
+}
