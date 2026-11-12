@@ -42,7 +42,7 @@ use crate::ctx::DepTerminal;
 use crate::dispatcher::NodeFn;
 use crate::graph::{Graph, GraphNodeOpts, GraphOptions, RestoreFactoryMeta};
 use crate::json::validate_strict_json_value;
-use crate::node::{Core, NodeSeed, SeedInput};
+use crate::node::{Core, NodeSeed};
 use crate::protocol::AnyValue;
 
 /// The tag of this package's checkpoint layout (R-checkpoint@1, graphrefly:D802; review
@@ -1094,7 +1094,9 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                     })
                     .collect::<RestoreResult<Vec<_>>>()
             })
-            .transpose()?;
+            .transpose()?
+            // Restored and not run since: what it had received is its seed's note.
+            .or_else(|| runtime.seed_note.as_ref().and_then(received_in_note));
         nodes.push(GraphCheckpointNode {
             id: entry.id.clone(),
             name: entry.name.clone(),
@@ -1228,9 +1230,74 @@ fn terminal_from_json(terminal: &GraphCheckpointTerminal) -> Option<DepTerminal>
     }
 }
 
-/// Whether two value lists hold the same JSON (R-checkpoint: a restored node compares
-/// what it received with what its dependencies hold at its first activation).
-pub(crate) fn same_values(a: &[AnyValue], b: &[AnyValue]) -> bool {
+fn json_values(values: &[GraphCheckpointJson]) -> Vec<AnyValue> {
+    values
+        .iter()
+        .map(|v| Rc::new(v.clone()) as AnyValue)
+        .collect()
+}
+
+/// What a restored node had received, from its seed's note.
+fn received_in_note(note: &AnyValue) -> Option<Vec<GraphCheckpointInput>> {
+    let note = note.downcast_ref::<GraphCheckpointJson>()?;
+    serde_json::from_value(note.clone()).ok()
+}
+
+/// A restored node's function (R-checkpoint@1): on the seeded instance's first run it
+/// compares each dependency with what the node had received and runs `real` only on a
+/// change, seeing only the changed dependencies (a dependency that only ended shows
+/// only its end); a first run with no change sends nothing, so the node keeps its
+/// saved value. Every other run is `real`.
+fn restored_first_run(real: NodeFn) -> NodeFn {
+    Rc::new(move |ctx: &Ctx| {
+        let Some(received) = ctx.seed.as_ref().and_then(received_in_note) else {
+            return real(ctx);
+        };
+        let mut changed = false;
+        let shown = ctx
+            .dep_records()
+            .iter()
+            .enumerate()
+            .map(|(i, record)| {
+                let saved = received.get(i);
+                let current = record.wave_data.last().map_or(&[][..], Vec::as_slice);
+                let values_same = saved.map_or(current.is_empty(), |saved| {
+                    same_values(&json_values(&saved.values), current)
+                });
+                let ended_same = saved.map_or(record.terminal.is_none(), |saved| {
+                    same_terminal(
+                        terminal_from_json(&saved.terminal).as_ref(),
+                        record.terminal.as_ref(),
+                    )
+                });
+                changed |= !(values_same && ended_same);
+                let mut shown = record.clone();
+                if values_same {
+                    shown.wave_data.clear();
+                    if ended_same {
+                        shown.terminal = None;
+                        shown.prev_data = shown.latest.clone();
+                    }
+                }
+                shown
+            })
+            .collect();
+        if changed {
+            real(&ctx.with_dep_records(shown));
+        }
+    })
+}
+
+fn same_terminal(a: Option<&DepTerminal>, b: Option<&DepTerminal>) -> bool {
+    match (a, b) {
+        (None, None) | (Some(DepTerminal::Complete), Some(DepTerminal::Complete)) => true,
+        (Some(DepTerminal::Error(x)), Some(DepTerminal::Error(y))) => x == y,
+        _ => false,
+    }
+}
+
+/// Whether two value lists hold the same JSON.
+fn same_values(a: &[AnyValue], b: &[AnyValue]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
             Rc::ptr_eq(x, y)
@@ -1538,12 +1605,6 @@ fn construct_prepared(
         graph.mount_restored(construct_prepared(child, options)?, at.clone());
     }
     // No recipe function runs: each node gets its saved state as a seed.
-    let json_values = |values: &[GraphCheckpointJson]| -> Vec<AnyValue> {
-        values
-            .iter()
-            .map(|v| Rc::new(v.clone()) as AnyValue)
-            .collect()
-    };
     for (id, core) in &built {
         let node = &prepared
             .nodes
@@ -1577,6 +1638,12 @@ fn construct_prepared(
                 "restore_graph: node '{id}' lacks the record of what it received (R-checkpoint)"
             )));
         }
+        let seeded = !core.is_state()
+            && matches!(node.terminal, GraphCheckpointTerminal::None)
+            && node.received.is_some();
+        if seeded {
+            core.wrap_fn(restored_first_run);
+        }
         core.restore_seed(NodeSeed {
             values: json_values(&node.values),
             ended: terminal_from_json(&node.terminal),
@@ -1585,15 +1652,6 @@ fn construct_prepared(
                 .as_ref()
                 .map(|state| Rc::new(state.clone()) as AnyValue),
             lifetime_deps,
-            received: node.received.as_ref().map(|inputs| {
-                inputs
-                    .iter()
-                    .map(|input| SeedInput {
-                        values: json_values(&input.values),
-                        ended: terminal_from_json(&input.terminal),
-                    })
-                    .collect()
-            }),
             // The note holds what the node had received (R-checkpoint@1).
             note: node.received.as_ref().map(|inputs| {
                 Rc::new(serde_json::to_value(inputs).unwrap_or(GraphCheckpointJson::Null))

@@ -185,6 +185,18 @@ impl Ctx {
         self.seed.clone().and_then(|note| note.downcast::<S>().ok())
     }
 
+    /// This ctx with `dep_records` in place of its own: the same node, lifetime and
+    /// note (a restored node's first run sees only its changed dependencies).
+    pub(crate) fn with_dep_records(&self, dep_records: Vec<DepRecord>) -> Ctx {
+        Ctx {
+            node: self.node.clone(),
+            dep_records,
+            lifetime: self.lifetime,
+            signal: self.signal.clone(),
+            seed: self.seed.clone(),
+        }
+    }
+
     pub(crate) fn lifetime_id(&self) -> u64 {
         self.lifetime
     }
