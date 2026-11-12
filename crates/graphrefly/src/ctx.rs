@@ -62,7 +62,7 @@ pub(crate) struct DepRecord {
 }
 
 /// One dependency's input to an invocation (R-invocation@2: `ctx.deps[i]`), from
-/// [`Ctx::dep`] or [`DeferredCtx::dep`]: which dependency it is, the arrays it
+/// [`Ctx::dep`]: which dependency it is, the arrays it
 /// delivered to this invocation, its terminal, its latest value and whether an
 /// INVALIDATE arrived on it. This is the function's only per-dependency read.
 #[derive(Clone, Copy)]
@@ -359,12 +359,19 @@ impl Ctx {
     /// back onto the single thread). The Rust analogue of the TS async fn capturing its
     /// `ctx` — here `&Ctx` is a borrow that cannot outlive `invoke`, so an async fn must
     /// stash this owned handle and call [`DeferredCtx::emit`] / [`DeferredCtx::down`]
-    /// later. Carries the wave's dep snapshot so a deferred read sees this wave's view
-    /// (matches the TS per-invocation async ctx snapshot).
+    /// later. Dependency views stay borrowed from this invocation and cannot cross
+    /// that boundary; capture ordinary values while the function or setup runs.
+    ///
+    /// ```compile_fail
+    /// let g = graphrefly::graph();
+    /// let n = g.producer::<i32, _>(|ctx| {
+    ///     let later = ctx.defer();
+    ///     later.dep(0); // no dependency-read capability after the invocation
+    /// });
+    /// ```
     pub fn defer(&self) -> DeferredCtx {
         DeferredCtx {
             node: self.node.clone(),
-            dep_records: self.dep_records.clone(),
             lifetime: self.lifetime,
             signal: self.signal.clone(),
         }
@@ -375,10 +382,9 @@ impl Ctx {
 /// boundary. An async node fn stashes one and emits LATER (the deferred result of
 /// async work). The emit re-enters the wave engine as a FRESH external wave (its own
 /// wave-owner / D30 catch boundary; the leading PENDING is the kernel's, R-wave). Holds the node handle ([`Core`] = an `Rc`) + the
-/// dep snapshot at defer time.
+/// lifetime-scoped output, state, rewire and signal capabilities.
 pub struct DeferredCtx {
     node: Core,
-    dep_records: Vec<DepRecord>,
     lifetime: u64,
     signal: AbortSignal,
 }
@@ -417,17 +423,6 @@ impl DeferredCtx {
         self.node.check_new_deps("rewire", &deps);
         self.node
             .request_lifetime_rewire(self.lifetime, LifetimeRewire::Set(deps));
-    }
-
-    /// Dependency `i`'s input to the invocation this ctx was kept from.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `i` is not one of the node's dependencies.
-    #[track_caller]
-    #[must_use]
-    pub fn dep(&self, i: usize) -> DepView<'_> {
-        dep_view(&self.dep_records, i)
     }
 
     /// Emit one typed DATA downstream as the deferred async result.

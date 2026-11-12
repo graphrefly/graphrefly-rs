@@ -127,20 +127,6 @@ pub(crate) fn defer_to_batch(target: &Core, wave: Wave<AnyValue>) -> bool {
     })
 }
 
-/// [`defer_to_batch`] for output a ctx of `lifetime` staged.
-pub(crate) fn defer_to_batch_from(target: &Core, wave: Wave<AnyValue>, lifetime: u64) -> bool {
-    stage(target, |staged| {
-        assert!(
-            wave.is_empty() || !ends_with_terminal(staged),
-            "batch: output staged after a terminal (R-wave)"
-        );
-        staged.push(Staged::Msgs {
-            msgs: wave,
-            lifetime: Some(lifetime),
-        });
-    })
-}
-
 /// Stages a state write function for `target` in the collecting batch.
 pub(crate) fn stage_write(target: &Core, write: StagedWrite) -> bool {
     stage(target, |staged| staged.push(Staged::Write(write)))

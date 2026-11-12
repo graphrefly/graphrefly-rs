@@ -2513,10 +2513,23 @@ fn c28_sink_requests_follow_the_fanout_and_batches_keep_their_staging() {
         let resolved = catch_unwind(AssertUnwindSafe(|| send(&slot, vec![Message::Resolved])));
         assert!(resolved.is_err(), "RESOLVED is the kernel's");
         send(&slot, vec![Message::Complete]);
-        let after = catch_unwind(AssertUnwindSafe(|| send(&slot, vec![data(8)])));
-        assert!(after.is_err(), "nothing follows a staged terminal");
+        send(&slot, vec![data(8)]); // a later request, dropped once COMPLETE closes its lifetime
     });
-    assert_eq!(arrays(&log), vec![shape(&["PENDING", "DATA", "COMPLETE"])]);
+    assert_eq!(
+        arrays(&log),
+        vec![shape(&["PENDING", "DATA"]), shape(&["PENDING", "COMPLETE"])]
+    );
+    let staged = g.state(0i32);
+    g.batch(|_| {
+        staged.set(7);
+        staged.complete();
+        let after = catch_unwind(AssertUnwindSafe(|| staged.set(8)));
+        assert!(
+            after.is_err(),
+            "a host write cannot follow a staged terminal"
+        );
+    });
+    assert_eq!(staged.cache(), Some(7));
 
     // A sink that throws after a commit goes to the reporter; nothing rolls back.
     let t = state_in::<i32>(&g, 0);
@@ -4601,4 +4614,70 @@ fn checkpoint_node_refusals_use_the_shared_reason_table() {
         h.checkpoint().err().unwrap().to_string(),
         "not restorable: n: its retained values are not JSON"
     );
+}
+
+#[test]
+fn quiet_last_terminal_and_function_output_share_one_later_wave() {
+    let g = graphrefly::graph();
+    let source = g.state(1i32);
+    let quiet = g.node_opts::<i32, _>(
+        vec![source.erased()],
+        |ctx| ctx.emit(99),
+        named("quiet").with_node(quiet_opts()),
+    );
+    let inputs = Rc::new(RefCell::new(Vec::new()));
+    let n = g.node_opts::<i32, _>(
+        vec![quiet.erased()],
+        {
+            let inputs = inputs.clone();
+            move |ctx| {
+                inputs.borrow_mut().push((
+                    ctx.dep(0)
+                        .waves::<i32>()
+                        .into_iter()
+                        .map(|w| w.into_iter().map(|v| *v).collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                    terminal_name(ctx.dep(0).terminal()),
+                ))
+            }
+        },
+        named("downstream").with_node(graphrefly::NodeOpts {
+            complete: graphrefly::Policy::Manual,
+            ..graphrefly::NodeOpts::default()
+        }),
+    );
+    let _stop = n.subscribe(|_| {});
+    inputs.borrow_mut().clear();
+    source.complete();
+    assert_eq!(
+        *inputs.borrow(),
+        vec![(vec![vec![99]], Some("COMPLETE".to_owned()))]
+    );
+}
+
+#[test]
+fn late_output_survives_commit_failure_but_not_body_failure() {
+    let g = graphrefly::graph();
+    let (producer, slot) = driven_in(&g);
+    let (log, _stop) = record_values(&producer);
+    let state = g.state(0i32);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        g.batch(|_| {
+            send(&slot, vec![data(42)]);
+            state.set(graphrefly::StateWrite::from_fn(|_: Option<&i32>| {
+                panic!("updater failed")
+            }));
+        });
+    }));
+    assert!(failed.is_err());
+    assert_eq!(*log.borrow(), vec![vec![], vec![42]]);
+    log.borrow_mut().clear();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        g.batch(|_| {
+            send(&slot, vec![data(43)]);
+            panic!("body failed");
+        });
+    }));
+    assert!(failed.is_err());
+    assert!(log.borrow().is_empty());
 }

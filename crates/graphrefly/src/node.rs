@@ -2943,10 +2943,9 @@ impl Core {
                     }
                     let lifetime = self.open_lifetime();
                     if lifetime.is_some() {
-                        self.publish_later(lifetime, out);
-                        if !postlude.is_empty() {
-                            self.publish_later(lifetime, postlude);
-                        }
+                        let mut output = out;
+                        output.extend(postlude);
+                        self.publish_later(lifetime, output);
                     }
                     return;
                 }
@@ -3482,24 +3481,14 @@ impl Core {
     /// External deferred emit — the async late-emit path used by
     /// [`crate::ctx::DeferredCtx`]: a FRESH wave from this node, under its own
     /// wave-owner boundary (D30).
-    /// Output through a kept ctx of `lifetime`: in a batch body it is staged with
-    /// its lifetime, so it is dropped at the commit if that lifetime has closed by
-    /// then (R-request-order@2).
-    /// The array is checked at the call, so an invalid one panics there (R-failure@3);
-    /// during a wave it is a request, dropped if the lifetime has closed by the time it
-    /// runs (R-lifetime@2).
+    /// A kept ctx's output is an ordinary request, even inside a batch body. It runs
+    /// after the commit in request order, including when an updater failed; a body
+    /// that fails drops it with the body's other requests (R-request-order@3).
     pub(crate) fn owned_down_from(&self, lifetime: u64, msgs: Wave<AnyValue>) {
         if self.with_inner_edges(|_, e| e.value.terminal) {
             return;
         }
         let frames = prepare_output(msgs);
-        if crate::batch::collecting_batch(&self.domain()) {
-            let flat: Wave<AnyValue> = frames.into_iter().flatten().collect();
-            if !flat.is_empty() {
-                crate::batch::defer_to_batch_from(self, flat, lifetime);
-            }
-            return;
-        }
         self.publish_later(Some(lifetime), frames);
     }
 
