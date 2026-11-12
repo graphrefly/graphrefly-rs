@@ -621,7 +621,6 @@ fn is_complete(terminal: Option<&DepTerminal>) -> bool {
 
 fn is_default_node_opts(opts: &NodeOpts) -> bool {
     opts.factory.is_none()
-        && opts.pool == Default::default()
         && !opts.quiet
         && opts.complete == Policy::Auto
         && opts.error == Policy::Auto
@@ -636,9 +635,6 @@ fn merge_node_opts(base: &NodeOpts, caller: NodeOpts) -> NodeOpts {
     let mut opts = base.clone();
     if caller.factory.is_some() {
         opts.factory = caller.factory;
-    }
-    if caller.pool != default.pool {
-        opts.pool = caller.pool;
     }
     if caller.quiet {
         opts.quiet = true;

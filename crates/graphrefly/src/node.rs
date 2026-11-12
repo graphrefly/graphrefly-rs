@@ -46,7 +46,7 @@ use crate::checkpoint::{
 use crate::ctx::{Ctx, DepRecord, DepTerminal};
 #[cfg(test)]
 use crate::dispatcher::default_dispatcher;
-use crate::dispatcher::{Dispatcher, NodeFn, PoolKind};
+use crate::dispatcher::{Dispatcher, NodeFn};
 use crate::environment::EnvironmentDrivers;
 use crate::protocol::{reject_kernel_only_output, AnyValue, GraphError, Handle, Message, Wave};
 
@@ -148,8 +148,6 @@ pub struct NodeOpts {
     /// (D43/D51), such as an operator's internal node.
     /// Registered graph entries still carry their own graph-layer factory string.
     pub factory: Option<String>,
-    /// The dispatch pool (default LocalSync, R-sync-core).
-    pub pool: PoolKind,
     /// A quiet node consumes its input waves without being marked pending or passing
     /// a mark on, and publishes its function's output as a later wave of its own
     /// (R-wave). Default false.
@@ -194,7 +192,6 @@ impl Default for NodeOpts {
     fn default() -> Self {
         Self {
             factory: None,
-            pool: PoolKind::default(),
             quiet: false,
             complete: Policy::Auto,
             error: Policy::Auto,
@@ -3473,10 +3470,7 @@ impl Core {
 
     fn swap_fn_preserving_pool(&self, fn_: NodeFn) {
         let (old_handle, disp) = { self.with_call(|call| (call.handle, call.dispatcher.clone())) };
-        let kind = old_handle
-            .map(|h| disp.pool_kind(h.pool_id))
-            .unwrap_or(PoolKind::Sync);
-        let new_handle = register_with(&disp, kind, fn_);
+        let new_handle = disp.register(fn_);
         self.with_node_state_mut(|_n, call, _cfg, _e| {
             call.handle = Some(new_handle);
         });
@@ -3943,16 +3937,6 @@ fn same_ordered_deps(old_deps: &[Core], new_deps: &[Core]) -> bool {
             .all(|(old_dep, new_dep)| old_dep.ptr_eq(new_dep))
 }
 
-/// Register a fn into the pool selected by `pool` (R-dispatch-all). The async pool's
-/// invoke is still sync void (R-sync-core); the pool kind only labels the node's
-/// deferred-emit / pause-buffering behavior.
-fn register_with(disp: &Dispatcher, pool: PoolKind, f: NodeFn) -> Handle {
-    match pool {
-        PoolKind::Sync => disp.register(f),
-        PoolKind::Async => disp.register_async(f),
-    }
-}
-
 /// The typed facade over the erased substrate node (D5). Re-types the boundary:
 /// `cache()`/`set()` downcast to `T`; deps are erased via [`Node::erased`].
 ///
@@ -4068,7 +4052,7 @@ impl<T: 'static> Node<T> {
         f: F,
     ) -> Node<T> {
         let factory = opts.factory.clone();
-        let handle = register_with(&dispatcher, opts.pool, Rc::new(f));
+        let handle = dispatcher.register(Rc::new(f));
         let node = Node {
             core: Core::new_in_arena(arena, vec![], Some(handle), dispatcher, None, opts.clone()),
             _t: PhantomData,
@@ -4098,7 +4082,7 @@ impl<T: 'static> Node<T> {
         f: F,
     ) -> Node<T> {
         let factory = opts.factory.clone();
-        let handle = register_with(&dispatcher, opts.pool, Rc::new(f));
+        let handle = dispatcher.register(Rc::new(f));
         let initial = initial.map(|value| Rc::new(value) as AnyValue);
         let node = Node {
             core: Core::new_in_arena(arena, deps, Some(handle), dispatcher, initial, opts.clone()),

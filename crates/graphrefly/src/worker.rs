@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ctx::Ctx;
-use crate::dispatcher::{PoolKind, WorkerSubmitError};
+use crate::dispatcher::WorkerSubmitError;
 use crate::graph::{Graph, GraphNodeOpts};
 use crate::node::{Core, Node, NodeOpts, Policy};
 use crate::operators::Operator;
@@ -30,7 +30,7 @@ pub fn worker_derived<I, R, E, P, C>(
     deps: Vec<Core>,
     prepare: P,
     compute: C,
-    mut opts: GraphNodeOpts,
+    opts: GraphNodeOpts,
 ) -> Node<R>
 where
     I: Send + 'static,
@@ -39,7 +39,6 @@ where
     P: Fn(&Ctx) -> Option<I> + 'static,
     C: Fn(I) -> Result<R, E> + Send + Sync + 'static,
 {
-    opts.node.pool = PoolKind::Async;
     let compute = Arc::new(compute);
     let latest_invocation = Rc::new(Cell::new(0u64));
     let op = Operator::with_opts(
@@ -48,7 +47,6 @@ where
             // A dep COMPLETE must not seal the worker before an in-flight owned
             // compute result returns through DeferredCtx.
             complete: Policy::Manual,
-            pool: PoolKind::Async,
             ..NodeOpts::default()
         }
         // The latest run's cancel lives in private state; the lifetime's cleanup runs

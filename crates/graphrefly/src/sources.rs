@@ -323,7 +323,6 @@ fn process_source(factory: &'static str, command: ProcessCommand) -> Operator<Pr
     source_op(
         factory,
         NodeOpts {
-            pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
         move |ctx, on_close| {
@@ -378,7 +377,6 @@ pub fn from_http_with_options(request: HttpRequest) -> Operator<HttpResponse> {
     source_op(
         "fromHttp",
         NodeOpts {
-            pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
         move |ctx, on_close| {
@@ -425,7 +423,6 @@ pub fn from_sse_with_options(request: SseRequest) -> Operator<SseEvent> {
     source_op(
         "fromSSE",
         NodeOpts {
-            pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
         move |ctx, on_close| {
@@ -762,7 +759,6 @@ pub fn from_websocket_with_options(request: WebSocketRequest) -> Operator<WebSoc
     source_op(
         "fromWebSocket",
         NodeOpts {
-            pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
         move |ctx, on_close| {
@@ -825,7 +821,6 @@ pub fn from_webhook_with_options(registration: WebhookRegistration) -> Operator<
     source_op(
         "fromWebhook",
         NodeOpts {
-            pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
         move |ctx, on_close| {
@@ -1961,7 +1956,6 @@ where
     source_op(
         "futureLocal",
         NodeOpts {
-            pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
         move |ctx, on_close| {
@@ -1996,7 +1990,6 @@ where
     source_op(
         "streamLocal",
         NodeOpts {
-            pool: crate::dispatcher::PoolKind::Async,
             ..NodeOpts::default()
         },
         move |ctx, on_close| {

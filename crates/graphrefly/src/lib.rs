@@ -35,7 +35,8 @@
 //!   wire bridge. Each graph has its own wave, request queue and batch
 //!   (R-graph-domain@3).
 //! - **F-SYNC-CORE** — the wave core is synchronous; a node function is
-//!   `Fn(&Ctx)` returning `()`. Async lives in pools (LocalAsync) and the wire bridge.
+//!   `Fn(&Ctx)` returning `()`. Async work runs through the local async driver, a
+//!   worker or the wire bridge, and comes back as a new wave.
 //! - **F-DISPATCH-ALL** — every node function goes through the dispatcher.
 //!
 //! ## The kernel and its graph (graphrefly:D797)
@@ -235,7 +236,7 @@ pub use diagnostics::{
     ProfileSummaryOptions, ProfileSummaryStatus, ReachableDirection, ReachableOptions,
     ReachableResult, ValidateNoIslandsResult,
 };
-pub use dispatcher::{default_dispatcher, Dispatcher, NodeFn, PoolKind};
+pub use dispatcher::{default_dispatcher, Dispatcher, NodeFn};
 #[cfg(feature = "tokio-http")]
 pub use environment::TokioHttpDriver;
 #[cfg(feature = "tokio-http-stream")]

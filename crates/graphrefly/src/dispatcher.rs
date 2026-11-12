@@ -1,19 +1,16 @@
 //! The dispatcher — first-class invoke funnel + pool host (D20 / D21).
 //!
 //! **F-SYNC-CORE:** [`Dispatcher::invoke`] is synchronous and returns `()`. The
-//! wave-protocol core never blocks on async; async lives only in pools
-//! (LocalAsync, a later slice) and the wire bridge.
+//! wave-protocol core never blocks on async; async work runs through the local
+//! async driver, a worker, or the wire bridge, and comes back as a new wave.
 //!
 //! **F-DISPATCH-ALL:** every node fn goes through the dispatcher — no inline-fn
 //! bypass. A fn is registered into a pool and addressed by a pure-data [`Handle`]
 //! `(pool_id, handle_id)` (D7).
 //!
-//! Slice scope: LocalSync + LocalAsync pools (D20). The async pool's `invoke` is
-//! ALSO sync void (R-sync-core) — "async" is a node-kind LABEL, not a different
-//! call mechanism: an async fn kicks off work and emits LATER via a stashed
-//! [`crate::ctx::DeferredCtx`] (the Rust analogue of TS capturing `ctx`). The
-//! grouped `DispatcherOpts` (DR-6) and the opt-in profile recorder (D39) land in
-//! later slices.
+//! One pool serves every node: an async function kicks off work and emits later
+//! through a kept [`crate::ctx::DeferredCtx`], with the same synchronous invoke
+//! (R-sync-core), so no pool kind is needed (review §5.6 of the D797 migration).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,19 +30,6 @@ pub use crate::protocol::Handle;
 /// downstream node (nested `invoke`) must not find the pool already borrowed.
 pub type NodeFn = Rc<dyn Fn(&Ctx)>;
 
-/// Pool kind label. LocalSync + LocalAsync ship in 1.0 (D20). The kind drives the
-/// NODE'S behavior (async-paused buffering / per-invocation ctx snapshot — see
-/// [`crate::node`]); the dispatcher invoke is sync void either way (R-sync-core).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PoolKind {
-    /// LocalSync — the fn runs to completion synchronously.
-    #[default]
-    Sync,
-    /// LocalAsync — the fn kicks off async work and emits later via a stashed
-    /// [`crate::ctx::DeferredCtx`] (the emit serializes back onto the single thread).
-    Async,
-}
-
 /// One slotmap entry: a fn (`None` once freed) + a generation bumped on each free,
 /// so a recycled slot is distinguishable from a stale handle (B32).
 struct Slot {
@@ -61,16 +45,14 @@ struct Slot {
 /// handles-into-fns idiomatic). Without this, every registered fn leaked, pinning
 /// its captured `Core`s forever.
 struct Pool {
-    kind: PoolKind,
     slots: Vec<Slot>,
     /// Recycled (freed) slot ids, reused on the next register.
     free: Vec<u32>,
 }
 
 impl Pool {
-    fn new(kind: PoolKind) -> Self {
+    fn new() -> Self {
         Self {
-            kind,
             slots: Vec::new(),
             free: Vec::new(),
         }
@@ -119,9 +101,9 @@ impl Pool {
 }
 
 struct DispatcherInner {
-    /// 1.0 ships LocalSync + LocalAsync (D20), indexed by `pool_id`:
-    /// `pools[SYNC_POOL_ID]` = sync, `pools[ASYNC_POOL_ID]` = async. The trait stays
-    /// pluggable for WorkerPool/RemotePool (D20) — a `Vec` so a new pool just appends.
+    /// One pool (the LocalSync and LocalAsync pools behaved alike and were merged in
+    /// the D797 migration, review §5.6), indexed by a handle's `pool_id`; a `Vec` so
+    /// a worker or remote pool can still be appended (D20).
     pools: Vec<Pool>,
     /// Opt-in profile recorder (D39 / R-profile). Default off = one boolean branch
     /// per invoke; counters live on the dispatcher, not on the thin node.
@@ -201,16 +183,13 @@ impl WorkerBackend {
     }
 }
 
-/// The LocalSync pool id (D20).
+/// The id of the dispatcher's one function pool.
 pub const SYNC_POOL_ID: u32 = 0;
-/// The LocalAsync pool id (D20).
-pub const ASYNC_POOL_ID: u32 = 1;
 
 impl Dispatcher {
     pub fn new() -> Self {
         Dispatcher(Rc::new(RefCell::new(DispatcherInner {
-            // index order MUST match SYNC_POOL_ID / ASYNC_POOL_ID.
-            pools: vec![Pool::new(PoolKind::Sync), Pool::new(PoolKind::Async)],
+            pools: vec![Pool::new()],
             recording: false,
             stats: HashMap::new(),
             local_async_driver: None,
@@ -269,13 +248,6 @@ impl Dispatcher {
         self.register_in(SYNC_POOL_ID, f)
     }
 
-    /// Register a fn in the LocalAsync pool (D20). The invoke is still sync void
-    /// (R-sync-core) — the node's async-pool kind drives the deferred-emit / pause
-    /// buffering behavior, not the call mechanism.
-    pub fn register_async(&self, f: NodeFn) -> Handle {
-        self.register_in(ASYNC_POOL_ID, f)
-    }
-
     fn register_in(&self, pool_id: u32, f: NodeFn) -> Handle {
         let (handle_id, generation) = self.0.borrow_mut().pools[pool_id as usize].register(f);
         Handle {
@@ -283,12 +255,6 @@ impl Dispatcher {
             handle_id,
             generation,
         }
-    }
-
-    /// The kind of a pool by id — the node reads this to decide async-paused
-    /// buffering + per-invocation ctx snapshotting (R-pause-modes / R-async-paused).
-    pub fn pool_kind(&self, pool_id: u32) -> PoolKind {
-        self.0.borrow().pools[pool_id as usize].kind
     }
 
     /// The function registered under `handle`, if it is still registered.
