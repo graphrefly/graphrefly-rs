@@ -2662,6 +2662,7 @@ impl Core {
         setup: Option<crate::lifetime::Setup>,
         recipe: Option<serde_json::Value>,
     ) {
+        unregister_backend_state_contributor_key(self.identity_key());
         let active = self.with_aux(|a| a.activated);
         let (old_unsubs, old_lifetime, old_state, old_deps) =
             self.with_node_state_aux_mut(|n, _c, cfg, e, a| {

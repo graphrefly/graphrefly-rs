@@ -105,11 +105,18 @@ pub struct GraphCheckpointNode {
     #[serde(rename = "privateState", skip_serializing_if = "Option::is_none")]
     pub private_state: Option<GraphCheckpointJson>,
     /// What a computed node with a lifetime received from each current dependency.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Explicit null is cold; an absent field is a truncated/older checkpoint.
+    #[serde(deserialize_with = "required_received")]
     pub received: Option<Vec<GraphCheckpointInput>>,
     /// The node's graph metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<BTreeMap<String, GraphCheckpointJson>>,
+}
+
+fn required_received<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<GraphCheckpointInput>>, D::Error> {
+    Option::<Vec<GraphCheckpointInput>>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,8 +190,14 @@ type CheckpointJsonEncoder =
 static CHECKPOINT_JSON_ENCODERS: OnceLock<Mutex<HashMap<TypeId, Arc<CheckpointJsonEncoder>>>> =
     OnceLock::new();
 
+#[derive(Default)]
+struct CollectionCheckpoint {
+    backend: Option<Rc<BackendStateContributor>>,
+    helper: bool,
+}
+
 thread_local! {
-    static BACKEND_STATE_CONTRIBUTORS: RefCell<HashMap<(usize, usize, u64), Rc<BackendStateContributor>>> =
+    static BACKEND_STATE_CONTRIBUTORS: RefCell<HashMap<(usize, usize, u64), CollectionCheckpoint>> =
         RefCell::new(HashMap::new());
 }
 
@@ -221,7 +234,19 @@ pub(crate) fn register_backend_state_contributor(
     BACKEND_STATE_CONTRIBUTORS.with(|contributors| {
         contributors
             .borrow_mut()
-            .insert(core.identity_key(), contributor);
+            .entry(core.identity_key())
+            .or_default()
+            .backend = Some(contributor);
+    });
+}
+
+pub(crate) fn register_collection_checkpoint_helper(core: &Core) {
+    BACKEND_STATE_CONTRIBUTORS.with(|contributors| {
+        contributors
+            .borrow_mut()
+            .entry(core.identity_key())
+            .or_default()
+            .helper = true;
     });
 }
 
@@ -232,8 +257,12 @@ pub(crate) fn unregister_backend_state_contributor_key(key: (usize, usize, u64))
 }
 
 fn checkpoint_backend_state(core: &Core, path: &str) -> RestoreResult<Option<GraphCheckpointJson>> {
-    let contributor = BACKEND_STATE_CONTRIBUTORS
-        .with(|contributors| contributors.borrow().get(&core.identity_key()).cloned());
+    let contributor = BACKEND_STATE_CONTRIBUTORS.with(|contributors| {
+        contributors
+            .borrow()
+            .get(&core.identity_key())
+            .and_then(|entry| entry.backend.clone())
+    });
     contributor
         .map(|contributor| {
             let value = contributor(path).map_err(|err| {
@@ -1051,7 +1080,7 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
         }));
         let backend = checkpoint_backend_state(&entry.core, &format!("{}.privateState", entry.id))
             .map_err(|_| not_restorable(&entry.id, "its private state is not JSON"))?;
-        let helper = is_non_authoritative_helper(entry.meta.get("kind").map(String::as_str));
+        let helper = is_non_authoritative_helper(&entry.core);
         let values = if helper {
             Vec::new()
         } else {
@@ -1144,18 +1173,13 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
 
 /// Nodes whose value a checkpoint does not record: collection helpers rebuilt from
 /// their backend.
-fn is_non_authoritative_helper(kind: Option<&str>) -> bool {
-    matches!(
-        kind,
-        Some(
-            "collection_delta"
-                | "collection_snapshot"
-                | "collection_snapshot_request"
-                | "collection_view_delta"
-                | "collection_view_snapshot"
-                | "collection_view_snapshot_request"
-        )
-    )
+fn is_non_authoritative_helper(core: &Core) -> bool {
+    BACKEND_STATE_CONTRIBUTORS.with(|contributors| {
+        contributors
+            .borrow()
+            .get(&core.identity_key())
+            .is_some_and(|entry| entry.helper)
+    })
 }
 
 fn checkpoint_factory(entry: &CheckpointEntry, is_state: bool) -> GraphCheckpointFactory {
@@ -1567,6 +1591,10 @@ fn validate_checkpoint_node_json(node: &GraphCheckpointNode) -> RestoreResult<()
             validate_checkpoint_json(value, &format!("{}.received[{i}]", node.id))
                 .map_err(|_| not_restorable(&node.id, "its received values are not JSON"))?;
         }
+        if let GraphCheckpointTerminal::Error { error } = &input.terminal {
+            validate_checkpoint_json(error, &format!("{}.received[{i}].terminal.error", node.id))
+                .map_err(|_| not_restorable(&node.id, "its ERROR payload is not JSON"))?;
+        }
     }
     if let GraphCheckpointTerminal::Error { error } = &node.terminal {
         validate_checkpoint_json(error, &format!("{}.terminal.error", node.id))
@@ -1876,7 +1904,10 @@ mod tests {
             Ok(_) => panic!("subnormal checkpoint number must fail restore validation"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("subnormal"));
+        assert_eq!(
+            err.to_string(),
+            "not restorable: source: its retained values are not JSON"
+        );
     }
 
     #[test]

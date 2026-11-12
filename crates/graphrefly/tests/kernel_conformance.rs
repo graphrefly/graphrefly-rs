@@ -4821,3 +4821,88 @@ fn kept_state_reads_retiring_lifetime_only_during_cleanup() {
         assert!(kept.borrow().as_ref().unwrap().state_get::<i32>().is_none());
     }
 }
+
+#[test]
+fn checkpoint_received_records_require_values_and_terminal() {
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({"values": []}),
+        serde_json::json!({"terminal": "NONE"}),
+    ] {
+        assert!(serde_json::from_value::<graphrefly::GraphCheckpointInput>(invalid).is_err());
+    }
+}
+
+#[test]
+fn diagnostic_metadata_cannot_suppress_checkpoint_values() {
+    for kind in [
+        "collection_delta",
+        "collection_snapshot",
+        "collection_snapshot_request",
+        "collection_view_delta",
+        "collection_view_snapshot",
+        "collection_view_snapshot_request",
+    ] {
+        for invalid in [false, true] {
+            let g = graphrefly::graph();
+            let mut opts = named("n");
+            opts.meta.insert("kind".into(), kind.into());
+            let _n = g.state_opts(if invalid { f64::NAN } else { 42.0 }, opts);
+            if invalid {
+                assert_eq!(
+                    g.checkpoint().err().unwrap().to_string(),
+                    "not restorable: n: its retained values are not JSON"
+                );
+            } else {
+                assert_eq!(
+                    g.checkpoint().unwrap().nodes[0].values,
+                    vec![serde_json::json!(42.0)]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn replacing_a_collection_helper_removes_its_checkpoint_exemption() {
+    let g = graphrefly::graph();
+    let list = graphrefly::reactive_list::<i32>(
+        &g,
+        vec![1],
+        graphrefly::ReactiveListOptions::named("list"),
+    );
+    list.snapshot.replace(
+        vec![],
+        |ctx| ctx.emit(42i32),
+        graphrefly::ReplaceOpts::default(),
+    );
+    let _stop = list.snapshot.subscribe(|_| {});
+    let saved = g.checkpoint().unwrap();
+    let snapshot = saved
+        .nodes
+        .iter()
+        .find(|n| n.id == "list.snapshot")
+        .unwrap();
+    assert_eq!(snapshot.values, vec![serde_json::json!(42)]);
+}
+
+#[test]
+fn checkpoint_cold_received_null_is_distinct_from_missing_field() {
+    let g = graphrefly::graph();
+    let n = g.init_node(graphrefly::never::<i32>(), vec![], named("n"));
+    let cold = serde_json::to_value(g.checkpoint().unwrap()).unwrap();
+    assert!(cold["nodes"][0]
+        .as_object()
+        .unwrap()
+        .contains_key("received"));
+    assert!(cold["nodes"][0]["received"].is_null());
+    let _stop = n.subscribe(|_| {});
+    let mut active = serde_json::to_value(g.checkpoint().unwrap()).unwrap();
+    assert_eq!(active["nodes"][0]["received"], serde_json::json!([]));
+    active["nodes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("received");
+    let error = serde_json::from_value::<graphrefly::GraphCheckpoint>(active).unwrap_err();
+    assert!(error.to_string().contains("missing field `received`"));
+}

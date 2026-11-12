@@ -13,7 +13,9 @@ use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Number, Value};
 
-use crate::checkpoint::register_backend_state_contributor;
+use crate::checkpoint::{
+    register_backend_state_contributor, register_collection_checkpoint_helper,
+};
 use crate::graph::{Graph, GraphNodeOpts, RestoreFactoryMeta, TopologyGroupOptions};
 use crate::node::{Node, NodeOpts, State};
 use crate::operators::Operator;
@@ -1663,7 +1665,7 @@ fn make_delta_node<T: Clone + 'static>(
     restorable: bool,
     max_size: Option<usize>,
 ) -> Node<ListChange<T>> {
-    graph.empty_source(
+    checkpoint_helper(graph.empty_source(
         "reactiveList.delta",
         collection_node_opts_with_restore_config(
             id_prefix,
@@ -1673,7 +1675,7 @@ fn make_delta_node<T: Clone + 'static>(
             restorable,
             max_size.map(|max_size| json!({ "maxSize": max_size })),
         ),
-    )
+    ))
 }
 
 fn make_log_delta_node<T: Clone + 'static>(
@@ -1682,7 +1684,7 @@ fn make_log_delta_node<T: Clone + 'static>(
     restorable: bool,
     max_size: Option<usize>,
 ) -> Node<LogChange<T>> {
-    graph.empty_source(
+    checkpoint_helper(graph.empty_source(
         "reactiveLog.delta",
         collection_node_opts_with_restore_config(
             id_prefix,
@@ -1692,7 +1694,7 @@ fn make_log_delta_node<T: Clone + 'static>(
             restorable,
             max_size.map(|max_size| json!({ "maxSize": max_size })),
         ),
-    )
+    ))
 }
 
 fn make_index_delta_node<K: Clone + Ord + 'static, S: Clone + Ord + 'static, V: Clone + 'static>(
@@ -1700,7 +1702,7 @@ fn make_index_delta_node<K: Clone + Ord + 'static, S: Clone + Ord + 'static, V: 
     id_prefix: &str,
     restorable: bool,
 ) -> Node<IndexChange<K, S, V>> {
-    graph.empty_source(
+    checkpoint_helper(graph.empty_source(
         "reactiveIndex.delta",
         collection_node_opts(
             id_prefix,
@@ -1709,7 +1711,7 @@ fn make_index_delta_node<K: Clone + Ord + 'static, S: Clone + Ord + 'static, V: 
             "reactiveIndex.delta",
             restorable,
         ),
-    )
+    ))
 }
 
 fn make_map_delta_node<K: Clone + Ord + 'static, V: Clone + 'static>(
@@ -1717,7 +1719,7 @@ fn make_map_delta_node<K: Clone + Ord + 'static, V: Clone + 'static>(
     id_prefix: &str,
     restorable: bool,
 ) -> Node<MapChange<K, V>> {
-    graph.empty_source(
+    checkpoint_helper(graph.empty_source(
         "reactiveMap.delta",
         collection_node_opts(
             id_prefix,
@@ -1726,7 +1728,7 @@ fn make_map_delta_node<K: Clone + Ord + 'static, V: Clone + 'static>(
             "reactiveMap.delta",
             restorable,
         ),
-    )
+    ))
 }
 
 fn make_snapshot_node<T: Clone + 'static>(
@@ -1757,7 +1759,7 @@ fn make_snapshot_node<T: Clone + 'static>(
             ctx.emit(backend.snapshot());
         },
     );
-    graph.init_node(
+    checkpoint_helper(graph.init_node(
         op,
         vec![delta.erased(), request.erased()],
         collection_node_opts(
@@ -1767,7 +1769,7 @@ fn make_snapshot_node<T: Clone + 'static>(
             "reactiveList.snapshot",
             restorable,
         ),
-    )
+    ))
 }
 
 fn make_log_snapshot_node<T: Clone + 'static>(
@@ -1798,7 +1800,7 @@ fn make_log_snapshot_node<T: Clone + 'static>(
             ctx.emit(backend.snapshot());
         },
     );
-    graph.init_node(
+    checkpoint_helper(graph.init_node(
         op,
         vec![delta.erased(), request.erased()],
         collection_node_opts(
@@ -1808,7 +1810,7 @@ fn make_log_snapshot_node<T: Clone + 'static>(
             "reactiveLog.snapshot",
             restorable,
         ),
-    )
+    ))
 }
 
 fn make_index_snapshot_node<
@@ -1843,7 +1845,7 @@ fn make_index_snapshot_node<
             ctx.emit(backend.snapshot());
         },
     );
-    graph.init_node(
+    checkpoint_helper(graph.init_node(
         op,
         vec![delta.erased(), request.erased()],
         collection_node_opts(
@@ -1853,7 +1855,7 @@ fn make_index_snapshot_node<
             "reactiveIndex.snapshot",
             restorable,
         ),
-    )
+    ))
 }
 
 fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
@@ -1884,7 +1886,7 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
             ctx.emit(backend.snapshot());
         },
     );
-    graph.init_node(
+    checkpoint_helper(graph.init_node(
         op,
         vec![delta.erased(), request.erased()],
         collection_node_opts(
@@ -1894,7 +1896,7 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
             "reactiveMap.snapshot",
             restorable,
         ),
-    )
+    ))
 }
 
 fn node_name(prefix: &str, suffix: &str) -> String {
@@ -1909,13 +1911,20 @@ fn make_snapshot_request_node(
     restore_ref: &str,
     restorable: bool,
 ) -> State<()> {
-    graph.state_empty_opts(collection_node_opts(
+    let request = graph.state_empty_opts(collection_node_opts(
         id_prefix,
         "snapshotRequest",
         "collection_snapshot_request",
         restore_ref,
         restorable,
-    ))
+    ));
+    register_collection_checkpoint_helper(&request.erased());
+    request
+}
+
+fn checkpoint_helper<T: 'static>(node: Node<T>) -> Node<T> {
+    register_collection_checkpoint_helper(&node.erased());
+    node
 }
 
 fn collection_node_opts(
@@ -2140,6 +2149,9 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
             .insert("factory".to_owned(), factories.group.to_owned());
         group.init_node(snapshot_op, snapshot_deps, opts)
     };
+    for core in [delta.erased(), snapshot_request.erased(), snapshot.erased()] {
+        register_collection_checkpoint_helper(&core);
+    }
     let group_for_dispose = group;
     let on_dispose = Rc::new(RefCell::new(on_dispose));
     let dispose_action = Rc::new(move || {
