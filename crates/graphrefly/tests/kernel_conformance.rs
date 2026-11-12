@@ -4904,3 +4904,80 @@ fn checkpoint_cold_received_null_is_distinct_from_missing_field() {
     let error = serde_json::from_value::<graphrefly::GraphCheckpoint>(active).unwrap_err();
     assert!(error.to_string().contains("missing field `received`"));
 }
+
+#[test]
+fn restore_factory_errors_and_missing_dependencies_identify_the_node() {
+    use graphrefly::{
+        GraphRestoreDescriptor, GraphRestoreEntry, GraphRestoreError, GraphRestoreResult,
+        RestoreDefineCtx, RestoreGraphOptions, RestoreNodeDefinition, RestoreNodeKind,
+    };
+    struct Refuse(bool);
+    impl GraphRestoreDescriptor for Refuse {
+        fn ref_(&self) -> &str {
+            "bad"
+        }
+        fn define(&self, _: RestoreDefineCtx<'_>) -> GraphRestoreResult<RestoreNodeDefinition> {
+            if self.0 {
+                return Err(GraphRestoreError::new("author refused config"));
+            }
+            Ok(RestoreNodeDefinition {
+                factory: "bad".into(),
+                opts: graphrefly::GraphNodeOpts::default(),
+                kind: RestoreNodeKind::Custom(Rc::new(|_| {
+                    Err(GraphRestoreError::new("author refused construction"))
+                })),
+            })
+        }
+    }
+    let g = graphrefly::graph();
+    let mut opts = named("n");
+    opts.restore = Some(graphrefly::RestoreFactoryMeta::registry_ref("bad"));
+    let _n = g.node_opts::<i32, _>(vec![], |_| {}, opts);
+    let saved = g.checkpoint().unwrap();
+    for (define, reason) in [
+        (true, "author refused config"),
+        (false, "author refused construction"),
+    ] {
+        let options = RestoreGraphOptions::new(graphrefly::restore_registry([
+            GraphRestoreEntry::descriptor(Refuse(define)),
+        ]));
+        let error = graphrefly::restore_graph(saved.clone(), options)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), format!("not restorable: n: {reason}"));
+    }
+    let g = graphrefly::graph();
+    let _n = g.init_node(graphrefly::never::<i32>(), vec![], named("n"));
+    let saved = g.checkpoint().unwrap();
+    for lifetime in [false, true] {
+        let mut missing = saved.clone();
+        if lifetime {
+            missing.nodes[0].lifetime_deps = Some(vec!["absent".into()]);
+        } else {
+            missing.nodes[0].deps = vec!["absent".into()];
+        }
+        let error = graphrefly::restore_graph(
+            missing,
+            RestoreGraphOptions::new(graphrefly::default_restore_registry()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().starts_with("not restorable: n:"));
+        assert!(error.to_string().contains("absent"));
+    }
+    let mut wrong_length = saved;
+    wrong_length.nodes[0].received = Some(vec![graphrefly::GraphCheckpointInput {
+        values: vec![],
+        terminal: graphrefly::GraphCheckpointTerminal::None,
+    }]);
+    let error = graphrefly::restore_graph(
+        wrong_length,
+        RestoreGraphOptions::new(graphrefly::default_restore_registry()),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "not restorable: n: missing received records"
+    );
+}

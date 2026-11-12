@@ -1221,6 +1221,17 @@ fn not_restorable(id: &str, reason: &str) -> GraphRestoreError {
     GraphRestoreError::new(format!("not restorable: {id}: {reason}"))
 }
 
+fn node_restore_error(id: &str, error: GraphRestoreError) -> GraphRestoreError {
+    if error.0.starts_with("not restorable: ") {
+        error
+    } else {
+        not_restorable(
+            id,
+            error.0.strip_prefix("restore_graph: ").unwrap_or(&error.0),
+        )
+    }
+}
+
 fn values_to_json(values: &[AnyValue], path: &str) -> RestoreResult<Vec<GraphCheckpointJson>> {
     values
         .iter()
@@ -1478,14 +1489,11 @@ fn prepare_checkpoint(
                 .descriptor(ref_)
                 .ok_or_else(|| not_restorable(&node.id, "missing recipe"))?,
         };
-        validate_checkpoint_node_json(node)?;
+        validate_checkpoint_node_json(node).map_err(|error| node_restore_error(&node.id, error))?;
         if let Some(received) = &node.received {
             let current = node.lifetime_deps.as_ref().unwrap_or(&node.deps);
             if received.len() != current.len() {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: node '{}' received records do not match its dependencies",
-                    node.id
-                )));
+                return Err(not_restorable(&node.id, "missing received records"));
             }
         }
         nodes.insert(
@@ -1500,10 +1508,10 @@ fn prepare_checkpoint(
     for node in nodes.values() {
         for dep in &node.deps {
             if !nodes.contains_key(dep) {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: node '{}' has missing dep '{dep}'",
-                    node.checkpoint.id
-                )));
+                return Err(not_restorable(
+                    &node.checkpoint.id,
+                    &format!("missing dep '{dep}'"),
+                ));
             }
         }
     }
@@ -1531,10 +1539,10 @@ fn prepare_checkpoint(
     for node in nodes.values() {
         for dep in &node.deps {
             if !edge_keys.contains(&(dep.clone(), node.checkpoint.id.clone())) {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: node '{}' dep '{dep}' is missing its edge",
-                    node.checkpoint.id
-                )));
+                return Err(not_restorable(
+                    &node.checkpoint.id,
+                    &format!("dep '{dep}' is missing its edge"),
+                ));
             }
         }
     }
@@ -1645,9 +1653,7 @@ fn construct_prepared(
                 ids.iter()
                     .map(|dep| {
                         built.get(dep).cloned().ok_or_else(|| {
-                            GraphRestoreError::new(format!(
-                                "restore_graph: node '{id}' lifetime dependency '{dep}' is missing"
-                            ))
+                            not_restorable(id, &format!("lifetime dependency '{dep}' is missing"))
                         })
                     })
                     .collect::<RestoreResult<Vec<_>>>()
@@ -1699,9 +1705,7 @@ fn build_node(
         return Ok(core.clone());
     }
     if !visiting.insert(id.to_owned()) {
-        return Err(GraphRestoreError::new(format!(
-            "restore_graph: dependency cycle at '{id}'"
-        )));
+        return Err(not_restorable(id, "dependency cycle"));
     }
     let item = prepared.nodes.get(id).ok_or_else(|| {
         GraphRestoreError::new(format!("restore_graph: missing prepared node '{id}'"))
@@ -1715,13 +1719,16 @@ fn build_node(
         GraphCheckpointFactory::RegistryRef { config, .. } => config.as_ref(),
         GraphCheckpointFactory::LocalOnly { .. } => None,
     };
-    let definition = item.descriptor.define(RestoreDefineCtx {
-        id,
-        deps: &item.deps,
-        config,
-        checkpoint: &item.checkpoint,
-        registry,
-    })?;
+    let definition = item
+        .descriptor
+        .define(RestoreDefineCtx {
+            id,
+            deps: &item.deps,
+            config,
+            checkpoint: &item.checkpoint,
+            registry,
+        })
+        .map_err(|error| node_restore_error(id, error))?;
     let core = match definition.kind {
         RestoreNodeKind::StateJson => graph
             .restore_state_json_with_id(id.to_owned(), definition.opts)
@@ -1735,7 +1742,9 @@ fn build_node(
                 definition.opts,
             )
             .erased(),
-        RestoreNodeKind::Custom(restore) => restore(graph)?,
+        RestoreNodeKind::Custom(restore) => {
+            restore(graph).map_err(|error| node_restore_error(id, error))?
+        }
         RestoreNodeKind::Derived(callback) => {
             if definition.opts.node.setup.is_some() {
                 return Err(not_restorable(
@@ -1762,11 +1771,13 @@ fn build_node(
             .zip(deps.iter())
             .any(|(restored, expected)| !restored.ptr_eq(expected))
     {
-        return Err(GraphRestoreError::new(format!(
-            "restore_graph: descriptor '{}' registered node '{}' with deps that do not match the checkpoint",
-            item.descriptor.ref_(),
-            id
-        )));
+        return Err(not_restorable(
+            id,
+            &format!(
+                "descriptor '{}' registered dependencies that do not match the checkpoint",
+                item.descriptor.ref_()
+            ),
+        ));
     }
     built.insert(id.to_owned(), core.clone());
     visiting.remove(id);
