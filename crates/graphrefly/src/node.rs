@@ -862,6 +862,7 @@ struct NodeAux {
     lifetime: Option<crate::lifetime::Lifetime>,
     /// The closing lifetime's cleanup is running.
     closing: bool,
+    closing_state: Option<(u64, Option<AnyValue>)>,
     /// A restored node's construction seed, consumed by its first activation
     /// (R-checkpoint).
     seed: Option<NodeSeedRuntime>,
@@ -886,6 +887,7 @@ impl NodeAux {
             state: None,
             lifetime: None,
             closing: false,
+            closing_state: None,
             seed: None,
             seed_note: None,
         }
@@ -2512,17 +2514,51 @@ impl Core {
     /// The end of a close, after the releases: the cleanup, which may still read the
     /// private state, then the private state is dropped.
     fn finish_cleanup(&self, lifetime: Option<crate::lifetime::Lifetime>) {
-        if let Some(cleanup) = lifetime.and_then(|lt| lt.cleanup) {
-            let cctx = crate::lifetime::CleanupCtx {
-                state: self.get_state(),
-            };
-            self.with_aux_mut(|a| a.closing = true);
-            run_reported(self.reporter().as_ref(), "cleanup", move || cleanup(&cctx));
-            self.with_aux_mut(|a| a.closing = false);
+        if let Some(mut lifetime) = lifetime {
+            if let Some(cleanup) = lifetime.cleanup.take() {
+                self.run_lifetime_cleanup(lifetime.id, self.get_state(), cleanup);
+            }
         }
         let state = self.with_aux_mut(|a| a.state.take());
         // Dropping private state may drop captured handles: after the arena borrow.
         drop(state);
+    }
+
+    /// Keep only the retiring lifetime's state readable while its cleanup runs.
+    fn run_lifetime_cleanup(
+        &self,
+        lifetime: u64,
+        state: Option<AnyValue>,
+        cleanup: crate::lifetime::Cleanup,
+    ) {
+        let cctx = crate::lifetime::CleanupCtx {
+            state: state.clone(),
+        };
+        self.with_aux_mut(|a| {
+            a.closing = true;
+            a.closing_state = Some((lifetime, state));
+        });
+        run_reported(self.reporter().as_ref(), "cleanup", move || cleanup(&cctx));
+        let retired = self.with_aux_mut(|a| {
+            a.closing = false;
+            a.closing_state.take()
+        });
+        drop(retired);
+    }
+
+    pub(crate) fn state_for_lifetime(&self, lifetime: u64) -> Option<AnyValue> {
+        self.with_aux(|a| {
+            if let Some((id, state)) = &a.closing_state {
+                if *id == lifetime {
+                    return state.clone();
+                }
+            }
+            if a.lifetime.as_ref().is_some_and(|lt| lt.id == lifetime) {
+                a.state.clone()
+            } else {
+                None
+            }
+        })
     }
 
     /// Refuses a dependency list for a replace or a rewire (R-request-order@2): a
@@ -2635,9 +2671,10 @@ impl Core {
                 for u in old_unsubs {
                     run_reported(self.reporter().as_ref(), "release", u);
                 }
-                if let Some(cleanup) = old_lifetime.and_then(|lt| lt.cleanup) {
-                    let cctx = crate::lifetime::CleanupCtx { state: old_state };
-                    run_reported(self.reporter().as_ref(), "cleanup", move || cleanup(&cctx));
+                if let Some(mut lifetime) = old_lifetime {
+                    if let Some(cleanup) = lifetime.cleanup.take() {
+                        self.run_lifetime_cleanup(lifetime.id, old_state, cleanup);
+                    }
                 }
                 if active {
                     self.first_run_of_replace();

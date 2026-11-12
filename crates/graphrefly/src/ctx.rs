@@ -395,12 +395,11 @@ impl DeferredCtx {
         self.signal.clone()
     }
 
-    /// The lifetime's private state, typed; `None` once the lifetime has closed.
+    /// The lifetime's private state, including during its cleanup; `None` after it closes.
     pub fn state_get<S: 'static>(&self) -> Option<Rc<S>> {
-        if !self.node.lifetime_open(self.lifetime) {
-            return None;
-        }
-        self.node.get_state().and_then(|a| a.downcast::<S>().ok())
+        self.node
+            .state_for_lifetime(self.lifetime)
+            .and_then(|a| a.downcast::<S>().ok())
     }
 
     /// Sets the lifetime's private state; dropped once the lifetime has closed.

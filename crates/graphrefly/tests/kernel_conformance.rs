@@ -4783,3 +4783,41 @@ fn nested_batch_result_errors_follow_the_outer_body() {
         "outer Err discards everything it staged"
     );
 }
+
+#[test]
+fn kept_state_reads_retiring_lifetime_only_during_cleanup() {
+    for replace in [false, true] {
+        let g = graphrefly::graph();
+        let ledger = g.state(0i32);
+        let kept = Rc::new(RefCell::new(None));
+        let n = g.node_opts::<i32, _>(
+            vec![],
+            |_| {},
+            named("n").with_node(graphrefly::NodeOpts::default().with_setup({
+                let (ledger, kept) = (ledger.clone(), kept.clone());
+                move |ctx| {
+                    ctx.state_set(42i32);
+                    *kept.borrow_mut() = Some(ctx.defer());
+                    let (ledger, kept) = (ledger.clone(), kept.clone());
+                    Some(Box::new(move |_| {
+                        ledger.set(*kept.borrow().as_ref().unwrap().state_get::<i32>().unwrap());
+                    }))
+                }
+            })),
+        );
+        let stop = n.subscribe(|_| {});
+        let (writes, _sink) = record_values(ledger.node());
+        writes.borrow_mut().clear();
+        if replace {
+            n.replace(
+                vec![],
+                |ctx| ctx.state_set(99i32),
+                graphrefly::ReplaceOpts::default(),
+            );
+        } else {
+            stop();
+        }
+        assert_eq!(*writes.borrow(), vec![vec![42]]);
+        assert!(kept.borrow().as_ref().unwrap().state_get::<i32>().is_none());
+    }
+}
