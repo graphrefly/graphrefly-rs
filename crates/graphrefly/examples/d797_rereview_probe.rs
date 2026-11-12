@@ -332,7 +332,7 @@ fn checkpoint_reasons() -> Value {
     ] {
         let mut cp = saved.clone();
         let node = &mut cp.nodes[0];
-        // Outside the protocol's exact JSON-number range, while representable by serde_json.
+        // Outside the package's strict JSON-number range, while representable by serde_json.
         let invalid = json!(u64::MAX);
         match reason {
             "retainedValues" => node.values = vec![invalid],

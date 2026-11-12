@@ -199,6 +199,10 @@ GRAPHREFLY_SPEC_ROOT=../graphrefly/spec cargo run -p graphrefly-rs --example d79
 ```
 
 It compares the actual trace against the root `d797-rereview.v1.json` fixture.
+CI checks out authority commit `4771691460538cd387197571d930128abdac90a2`
+and runs both the behavior probe and its `--reasons` mode. A missing fixture is a
+hard error. This shared probe does not replace D687 qualification.
+
 Checkpoint records now require the actual kernel `kind`, the complete `policies`
 tuple, and explicit nullable `privateState` / `received` fields. Older incomplete
 records are refused; no defaults reconstruct omitted data. Saved policies override

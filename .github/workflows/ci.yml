@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, d797-kernel-migration]
   pull_request:
     branches: [main]
 
@@ -77,7 +77,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: graphrefly/graphrefly
-          ref: main
+          ref: 4771691460538cd387197571d930128abdac90a2
           path: graphrefly-authority
 
       # nextest `ci` profile: `default-filter = "all()"`, so every test runs
@@ -86,6 +86,14 @@ jobs:
       # wall-clock budget.
       - name: Cargo nextest (graphrefly-rs, ci profile)
         run: cargo nextest run -p graphrefly-rs --profile ci --all-targets
+        env:
+          GRAPHREFLY_SPEC_ROOT: ${{ github.workspace }}/graphrefly-authority/spec
+          RUSTFLAGS: "-D warnings"
+
+      - name: Shared D808 behavior and checkpoint probes
+        run: |
+          cargo run -p graphrefly-rs --example d797_rereview_probe
+          cargo run -p graphrefly-rs --example d797_rereview_probe -- --reasons
         env:
           GRAPHREFLY_SPEC_ROOT: ${{ github.workspace }}/graphrefly-authority/spec
           RUSTFLAGS: "-D warnings"
