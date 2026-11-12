@@ -179,27 +179,29 @@ pub struct GraphCheckpointInput {
     pub terminal: GraphCheckpointTerminal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// A declared dependency membership edge. Ordered occurrences live in `deps` and
-/// `received`; repeated initial dependency positions share one membership edge.
-pub struct GraphCheckpointEdge {
-    pub from: String,
-    pub to: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphCheckpointMount {
     pub at: String,
     pub checkpoint: GraphCheckpoint,
 }
 
+/// A graph snapshot whose dependency edges are derived from each node's `deps`.
+/// Records with removed or unknown fields are refused, including mounted snapshots.
+///
+/// ```compile_fail
+/// use graphrefly::GraphCheckpointEdge;
+/// ```
+///
+/// ```compile_fail
+/// use graphrefly::checkpoint::GraphCheckpointEdge;
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphCheckpoint {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub nodes: Vec<GraphCheckpointNode>,
-    pub edges: Vec<GraphCheckpointEdge>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mounts: Option<Vec<GraphCheckpointMount>>,
 }
@@ -1098,7 +1100,6 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
         i += 1;
     }
     let mut nodes = Vec::with_capacity(entries.len());
-    let mut edges = Vec::new();
     let id_of = |core: &Core, owner: &str| -> RestoreResult<String> {
         entries
             .iter()
@@ -1126,18 +1127,6 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
                     .collect::<RestoreResult<Vec<_>>>()
             })
             .transpose()?;
-        // Edges record membership; deps/received preserve positional occurrences.
-        // Initial construction can declare the same dependency more than once.
-        let mut seen_deps = BTreeSet::new();
-        edges.extend(
-            dep_ids
-                .iter()
-                .filter(|dep| seen_deps.insert(*dep))
-                .map(|dep| GraphCheckpointEdge {
-                    from: dep.clone(),
-                    to: entry.id.clone(),
-                }),
-        );
         let backend = checkpoint_backend_state(&entry.core, &format!("{}.privateState", entry.id))
             .map_err(|_| not_restorable(&entry.id, "its private state is not JSON"))?;
         let helper = is_non_authoritative_helper(&entry.core);
@@ -1234,7 +1223,6 @@ fn checkpoint_graph(graph: &Graph) -> RestoreResult<GraphCheckpoint> {
         version: GRAPH_CHECKPOINT_VERSION.to_owned(),
         name: crate::topology::name(graph).map(str::to_owned),
         nodes,
-        edges,
         mounts: if mounts.is_empty() {
             None
         } else {
@@ -1629,37 +1617,6 @@ fn prepare_checkpoint(
     let mut done = BTreeSet::new();
     for id in nodes.keys() {
         validate_dependency_order(id, &nodes, &mut visiting, &mut done)?;
-    }
-    let mut edge_keys = BTreeSet::new();
-    for edge in &checkpoint.edges {
-        if !edge_keys.insert((edge.from.clone(), edge.to.clone())) {
-            return Err(GraphRestoreError::new(format!(
-                "restore_graph: duplicate edge '{}' -> '{}'",
-                edge.from, edge.to
-            )));
-        }
-        let Some(target) = nodes.get(&edge.to) else {
-            return Err(GraphRestoreError::new(format!(
-                "restore_graph: edge '{}' -> '{}' references a missing node",
-                edge.from, edge.to
-            )));
-        };
-        if !nodes.contains_key(&edge.from) || !target.deps.contains(&edge.from) {
-            return Err(GraphRestoreError::new(format!(
-                "restore_graph: edge '{}' -> '{}' is not present in target deps",
-                edge.from, edge.to
-            )));
-        }
-    }
-    for node in nodes.values() {
-        for dep in &node.deps {
-            if !edge_keys.contains(&(dep.clone(), node.checkpoint.id.clone())) {
-                return Err(not_restorable(
-                    &node.checkpoint.id,
-                    &format!("dep '{dep}' is missing its edge"),
-                ));
-            }
-        }
     }
     let mut mount_paths = BTreeSet::new();
     let mut mounts = Vec::new();
@@ -2121,39 +2078,6 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("meta field 'json'"));
-    }
-
-    #[test]
-    fn restore_rejects_duplicate_edges() {
-        let g = crate::graph::graph();
-        let source = g.state_opts(json!(1), GraphNodeOpts::named("source"));
-        let mut opts = GraphNodeOpts::named("memo");
-        opts.restore = Some(RestoreFactoryMeta::registry_ref("stateful-json"));
-        let memo = g.node_opts::<GraphCheckpointJson, _>(
-            vec![source.erased()],
-            |ctx| {
-                let mut emitted = Vec::new();
-                for value in ctx.dep(0).values::<GraphCheckpointJson>() {
-                    emitted.push(value.as_ref().clone());
-                }
-                ctx.down(crate::protocol::data_wave(emitted));
-            },
-            opts,
-        );
-        let _keep_active = memo.subscribe(|_| {});
-        let mut checkpoint = g.checkpoint().expect("checkpoint succeeds");
-        let edge = checkpoint.edges[0].clone();
-        checkpoint.edges.push(edge);
-
-        let registry = restore_registry([
-            GraphRestoreEntry::descriptor(StateRestoreDescriptor),
-            GraphRestoreEntry::descriptor(StatefulJsonDescriptor),
-        ]);
-        let err = match restore_graph(checkpoint, RestoreGraphOptions::new(registry)) {
-            Ok(_) => panic!("duplicate checkpoint edges must fail"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("duplicate edge"));
     }
 
     #[test]

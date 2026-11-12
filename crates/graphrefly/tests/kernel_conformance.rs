@@ -2813,9 +2813,9 @@ fn c38_capture_and_restore() {
         e
     };
     let mut saved: Vec<(String, String)> = checkpoint
-        .edges
+        .nodes
         .iter()
-        .map(|e| (e.from.clone(), e.to.clone()))
+        .flat_map(|node| node.deps.iter().map(|dep| (dep.clone(), node.id.clone())))
         .collect();
     saved.sort();
     assert_eq!(edges(&restored), saved);
@@ -3130,7 +3130,6 @@ fn c38_replace_and_rewire_are_restored_as_the_instance() {
     .is_err());
     let mut without_local = checkpoint.clone();
     without_local.nodes.retain(|n| n.id != "n2");
-    without_local.edges.retain(|e| e.to != "n2");
     let restored = restore_graph(
         without_local,
         graphrefly::RestoreGraphOptions::new(registry(&counters)),

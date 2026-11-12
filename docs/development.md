@@ -206,7 +206,10 @@ hard error. This shared probe does not replace D687 qualification.
 Checkpoint records now require the actual kernel `kind`, the complete `policies`
 tuple, and explicit nullable `privateState` / `received` fields. Older incomplete
 records are refused; no defaults reconstruct omitted data. Saved policies override
-recipe defaults, including custom constructors.
+recipe defaults, including custom constructors. Checkpoint dependencies live only
+in each node's `deps` / `lifetimeDeps`; there is no separate `edges` field. The
+`graphrefly-rs/checkpoint@1` tag stays unchanged, and records carrying old `edges`
+or other unknown graph-level fields are refused, including mounted checkpoints.
 
 Restore creates a cold graph; explicitly retain the required runtime nodes before
 sending commands. Dependency views are borrowed only for setup/function invocation;

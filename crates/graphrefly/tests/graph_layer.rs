@@ -9,12 +9,11 @@ use graphrefly::{
     topology_to_ascii, topology_to_d2, topology_to_d2_with_direction, topology_to_json,
     topology_to_mermaid, topology_to_mermaid_url, topology_to_mermaid_with_direction,
     topology_to_pretty, validate_no_islands, DescribeEvent, DiagramDirection, Dispatcher, Explain,
-    ExplainPathOptions, ExplainPathReason, GraphCheckpointEdge, GraphCheckpointFactory,
-    GraphCheckpointJson, GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry,
-    IslandReport, Message, NodeOpts, ProfileSummaryOptions, ReachableDirection, ReachableOptions,
-    RestoreFactoryMeta, RestoreGraphOptions, TopologyEdge, TopologyEvent, TopologyEventKind,
-    TopologyGroupOptions, TopologyNode, TopologyOpts, TopologySnapshot, Values,
-    GRAPH_CHECKPOINT_VERSION,
+    ExplainPathOptions, ExplainPathReason, GraphCheckpointFactory, GraphCheckpointJson,
+    GraphNodeOpts, GraphOptions, GraphRestoreDefinition, GraphRestoreEntry, IslandReport, Message,
+    NodeOpts, ProfileSummaryOptions, ReachableDirection, ReachableOptions, RestoreFactoryMeta,
+    RestoreGraphOptions, TopologyEdge, TopologyEvent, TopologyEventKind, TopologyGroupOptions,
+    TopologyNode, TopologyOpts, TopologySnapshot, Values, GRAPH_CHECKPOINT_VERSION,
 };
 use serde_json::json;
 
@@ -1134,14 +1133,12 @@ fn checkpoint_auto_discovers_unregistered_live_deps_as_local_only() {
     assert!(timeout_node.id.starts_with("~timeout#"));
     assert!(timeout_node.deps.contains(&"source".to_owned()));
     assert!(timeout_node.deps.contains(&timer_node.id));
-    assert!(checkpoint.edges.contains(&GraphCheckpointEdge {
-        from: timeout_node.id.clone(),
-        to: "sink".to_owned(),
-    }));
-    assert!(checkpoint.edges.contains(&GraphCheckpointEdge {
-        from: timer_node.id.clone(),
-        to: timeout_node.id.clone(),
-    }));
+    let sink = checkpoint
+        .nodes
+        .iter()
+        .find(|node| node.id == "sink")
+        .unwrap();
+    assert_eq!(sink.deps, vec![timeout_node.id.clone()]);
 }
 
 #[test]

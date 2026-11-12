@@ -239,6 +239,9 @@ fn damaged_checkpoint_is_refused_before_any_recipe_side_effect() {
         .unwrap()
         .push(saved["nodes"][1].clone());
     cases.push(("duplicate id".into(), duplicate));
+    let mut declared_missing = saved.clone();
+    declared_missing["nodes"][1]["deps"] = json!(["missing"]);
+    cases.push(("missing declared dependency".into(), declared_missing));
     let mut missing = saved.clone();
     missing["nodes"][1]["lifetimeDeps"] = json!(["missing"]);
     cases.push(("missing lifetime dependency".into(), missing));
@@ -248,7 +251,6 @@ fn damaged_checkpoint_is_refused_before_any_recipe_side_effect() {
     cases.push(("lived computed with null received".into(), truncated));
     let mut cycle = saved.clone();
     cycle["nodes"][1]["deps"] = json!(["n"]);
-    cycle["edges"] = json!([{"from":"n","to":"n"}]);
     cases.push(("cycle".into(), cycle));
     let mut duplicate_lifetime = saved.clone();
     duplicate_lifetime["nodes"][1]["lifetimeDeps"] = json!(["a", "a"]);
@@ -334,7 +336,6 @@ fn initial_duplicate_dependencies_round_trip_without_a_rewire_record() {
     let _keep = n.subscribe(|_| {});
     let cp = g.checkpoint().unwrap();
     assert_eq!(cp.nodes[1].deps, vec!["a", "a"]);
-    assert_eq!(cp.edges.len(), 1);
     assert_eq!(cp.nodes[1].received.as_ref().unwrap().len(), 2);
     assert!(cp.nodes[1].lifetime_deps.is_none());
     let calls = Rc::new(Cell::new(0));
@@ -350,4 +351,51 @@ fn initial_duplicate_dependencies_round_trip_without_a_rewire_record() {
             .deps,
         vec!["a", "a"]
     );
+}
+
+#[test]
+fn checkpoint_has_no_edges_and_rejects_old_edges_at_every_graph_boundary() {
+    let g = graph();
+    let a = g.state_opts(json!(1), GraphNodeOpts::named("a"));
+    let mut opts = GraphNodeOpts::named("n");
+    opts.restore = Some(RestoreFactoryMeta::registry_ref("qa2"));
+    let n = g.node_opts::<serde_json::Value, _>(vec![a.erased()], |_| {}, opts);
+    let _keep = n.subscribe(|_| {});
+    let child = graph();
+    child.state_opts(json!(2), GraphNodeOpts::named("child-value"));
+    graphrefly::topology::mount(&g, child, "child");
+    let actual = serde_json::to_value(g.checkpoint().unwrap()).unwrap();
+    assert!(actual.get("edges").is_none());
+    assert!(actual["mounts"][0]["checkpoint"].get("edges").is_none());
+    let decoded: GraphCheckpoint = serde_json::from_value(actual.clone()).unwrap();
+    assert_eq!(decoded.version, "graphrefly-rs/checkpoint@1");
+    let restored = restore_graph(
+        decoded,
+        RestoreGraphOptions::new(registry(Rc::default(), false)),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .find("child::child-value")
+            .unwrap()
+            .as_node::<serde_json::Value>()
+            .cache(),
+        Some(json!(2))
+    );
+    for nested in [false, true] {
+        for edges in [json!([]), json!([{"from":"a","to":"n"}])] {
+            let mut old = actual.clone();
+            let record = if nested {
+                &mut old["mounts"][0]["checkpoint"]
+            } else {
+                &mut old
+            };
+            record["edges"] = edges;
+            let error = serde_json::from_value::<GraphCheckpoint>(old).unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field `edges`"),
+                "{error}"
+            );
+        }
+    }
 }
