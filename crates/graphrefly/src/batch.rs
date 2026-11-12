@@ -233,6 +233,16 @@ fn resolve(
     targets: &[BatchTarget],
     deferred: Vec<Option<StagedItems>>,
 ) -> std::thread::Result<Vec<(usize, Wave<AnyValue>)>> {
+    // Validate every host target before any updater runs. A terminal queued before
+    // this commit refuses the whole commit, including writes to other states.
+    catch_unwind(AssertUnwindSafe(|| {
+        for target in targets {
+            if let Some(core) = target.borrowed_core().filter(Core::is_state) {
+                crate::node::refuse_if_ended(&core);
+            }
+        }
+    }))?;
+
     let mut resolved = Vec::new();
     for (index, items) in deferred.into_iter().enumerate() {
         let Some(items) = items else { continue };

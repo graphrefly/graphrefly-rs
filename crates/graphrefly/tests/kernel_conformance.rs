@@ -4380,3 +4380,58 @@ fn a_chain_of_many_thousand_nodes_runs_on_a_small_stack() {
     again();
     drop((tail, last, src, g));
 }
+
+/// N2: a queued batch revalidates every host target before evaluating any write.
+#[test]
+fn queued_batch_refuses_an_ended_target_before_any_updater_or_commit() {
+    for function_write in [false, true] {
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let g = reporting_graph(&reports);
+        let trigger = g.state_empty::<i32>();
+        let ended = g.state(1i32);
+        let other = g.state(10i32);
+        let runs = Rc::new(Cell::new(0));
+        let topology_ran = Rc::new(Cell::new(false));
+        let requested = g.producer::<i32, _>({
+            let topology_ran = topology_ran.clone();
+            move |_| topology_ran.set(true)
+        });
+        let _trigger = trigger.subscribe({
+            let (g, ended, other, runs) = (g.clone(), ended.clone(), other.clone(), runs.clone());
+            move |msgs| {
+                if !msgs.iter().any(|msg| matches!(msg, Message::Data(_))) {
+                    return;
+                }
+                ended.complete();
+                g.batch(|_| {
+                    let runs = runs.clone();
+                    other.set(graphrefly::StateWrite::from_fn(move |v: Option<&i32>| {
+                        runs.set(runs.get() + 1);
+                        v.map(|v| v + 1)
+                    }));
+                    if function_write {
+                        ended.set(graphrefly::StateWrite::from_fn(|v: Option<&i32>| {
+                            v.copied()
+                        }));
+                    } else {
+                        ended.set(2);
+                    }
+                    let _stop = requested.subscribe(|_| {});
+                });
+            }
+        });
+        trigger.set(1);
+        assert_eq!(
+            runs.get(),
+            0,
+            "preflight precedes even another target's updater"
+        );
+        assert_eq!(ended.cache(), Some(1));
+        assert_eq!(other.cache(), Some(10), "no partial commit");
+        assert!(topology_ran.get(), "body requests survive a failed commit");
+        assert_eq!(reports.borrow().len(), 1);
+        assert!(reports.borrow()[0]
+            .error
+            .contains("host input to an ended node"));
+    }
+}

@@ -317,7 +317,7 @@ pub(crate) fn prepare_output(msgs: Wave<AnyValue>) -> Vec<Wave<AnyValue>> {
 
 /// A queued host input that finds its node ended is refused (R-terminals); the panic
 /// reaches the host reporter as the queued request's failure (R-failure@3).
-fn refuse_if_ended(core: &Core) {
+pub(crate) fn refuse_if_ended(core: &Core) {
     assert!(
         !core.with_inner_edges(|_, e| e.value.terminal),
         "host input to an ended node is refused (R-terminals)"
