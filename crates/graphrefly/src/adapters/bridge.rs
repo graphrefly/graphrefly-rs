@@ -810,7 +810,8 @@ where
     let outbound = project_outbound(graph, &events, &name);
     let acks = project_acks(graph, &events, &name);
     let nacks = project_nacks(graph, &events, &name);
-    let status = project_status(graph, &events, &name, opts.session_id.clone());
+    let event_count = project_event_count(graph, &events, &name);
+    let status = project_status(graph, &events, &event_count, &name, opts.session_id.clone());
     let errors = project_errors(graph, &events, &name);
     let cursor = project_cursor(graph, &events, &name);
     let attempts = project_attempts(graph, &events, &name);
@@ -2878,6 +2879,7 @@ where
 fn project_status<TOutbound, TInbound>(
     graph: &Graph,
     events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    event_count: &Node<u64>,
     name: &str,
     session_id: String,
 ) -> Node<WireBridgeStatus>
@@ -2885,29 +2887,42 @@ where
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
-    // The status counters are an audit ledger the bundle owns (review Q13).
+    // The status counters are an audit ledger the bundle owns (review Q13), with the
+    // number of the last event they counted: a new lifetime starts on the events
+    // node's snapshot, which replays its last array, and skips every event at or
+    // below that high water, so a reactivated status never counts an event twice.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/statusLedger"),
-        serde_json::to_value(initial_status(&session_id)).unwrap_or_default(),
+        serde_json::to_value(StatusLedger {
+            status: initial_status(&session_id),
+            high_water: 0,
+        })
+        .unwrap_or_default(),
     );
     graph.node_opts::<WireBridgeStatus, _>(
-        vec![events.erased(), ledger.erased()],
+        vec![events.erased(), event_count.erased(), ledger.erased()],
         move |ctx| {
-            let mut next: WireBridgeStatus = ctx
-                .state_get::<serde_json::Value>()
-                .and_then(|v| serde_json::from_value((*v).clone()).ok())
-                .or_else(|| {
-                    ctx.dep(1)
-                        .value::<serde_json::Value>()
-                        .and_then(|v| serde_json::from_value((*v).clone()).ok())
-                })
-                .unwrap_or_else(|| initial_status(&session_id));
-            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
-                next = reduce_status(next, event.as_ref());
+            let mut ledger: StatusLedger = crate::ledger::load_or(ctx, 2, || StatusLedger {
+                status: initial_status(&session_id),
+                high_water: 0,
+            });
+            // The delivered events are the bridge's latest ones: the last is event
+            // number `total`.
+            let delivered: Vec<AnyValue> = ctx.dep(0).raw_waves().concat();
+            let total = ctx.dep(1).value::<u64>().map_or(0, |total| *total);
+            let first = total.saturating_sub(delivered.len() as u64) + 1;
+            for (number, value) in (first..).zip(&delivered) {
+                if number <= ledger.high_water {
+                    continue;
+                }
+                if let Some(event) = value.downcast_ref::<WireBridgeEvent<TOutbound, TInbound>>() {
+                    ledger.status = reduce_status(ledger.status, event);
+                }
+                ledger.high_water = number;
             }
-            crate::ledger::store(ctx, &next);
-            ctx.emit(next);
+            crate::ledger::store(ctx, &ledger);
+            ctx.emit(ledger.status);
         },
         {
             let mut opts = GraphNodeOpts::named(format!("{name}/status"));
@@ -2915,6 +2930,38 @@ where
             opts
         },
     )
+}
+
+/// The bridge status and the number of the last event it counted (review Q13).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StatusLedger {
+    status: WireBridgeStatus,
+    high_water: u64,
+}
+
+/// How many events the bridge has emitted, held for the graph's life so it sees each
+/// one: the status numbers its events by it.
+fn project_event_count<TOutbound, TInbound>(
+    graph: &Graph,
+    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    name: &str,
+) -> Node<u64>
+where
+    TOutbound: Clone + 'static,
+    TInbound: Clone + 'static,
+{
+    let count = graph.node_opts::<u64, _>(
+        vec![events.erased()],
+        |ctx| {
+            let delivered: usize = ctx.dep(0).raw_waves().iter().map(Vec::len).sum();
+            let total = ctx.state_get::<u64>().map_or(0, |total| *total) + delivered as u64;
+            ctx.state_set(total);
+            ctx.emit(total);
+        },
+        GraphNodeOpts::named(format!("{name}/eventCount")),
+    );
+    let _held_for_graph_life = graph.retain(&format!("{name}/eventCount"));
+    count
 }
 
 fn initial_status(session_id: &str) -> WireBridgeStatus {
@@ -3334,6 +3381,7 @@ mod tests {
                 "bridge/command",
                 "bridge/cursor",
                 "bridge/errors",
+                "bridge/eventCount",
                 "bridge/events",
                 "bridge/inbound",
                 "bridge/nacks",

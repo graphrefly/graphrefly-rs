@@ -1058,3 +1058,27 @@ fn bridge_sequence_survives_its_subscribers_leaving() {
     bridge.send("c".to_owned(), None, None);
     assert_eq!(*seqs.borrow(), vec![1, 2, 3]);
 }
+
+/// Review Q13 — a reactivated status does not count an event twice: the held events
+/// node replays its last array as the new lifetime's snapshot, and the status ledger's
+/// high water skips it; a later event is counted once.
+#[test]
+fn bridge_status_counts_each_event_once_across_reactivation() {
+    let g = graph();
+    let bridge =
+        wire_bridge::<String, String>(&g, WireBridgeOptions::named("session-hw", "bridge"));
+    let stop = bridge.status.subscribe(|_| {});
+    bridge.send("a".to_owned(), None, None);
+    bridge.send("b".to_owned(), None, None);
+    let before = bridge.status.cache().unwrap();
+    assert_eq!((before.attempts, before.pending), (2, 2));
+    stop();
+
+    let _again = bridge.status.subscribe(|_| {});
+    assert_eq!(bridge.status.cache(), Some(before));
+
+    bridge.send("c".to_owned(), None, None);
+    let after = bridge.status.cache().unwrap();
+    assert_eq!((after.attempts, after.pending), (3, 3));
+    assert_eq!(after.last_seq, Some(3));
+}
