@@ -146,9 +146,9 @@ pub use adapters::bridge::{
     RemoteResponderHandlerDefinition, RemoteResponderOptions, RemoteResponderStatus,
     RemoteResponderStatusState, WireBridgeAck, WireBridgeAttempt, WireBridgeBundle,
     WireBridgeCommand, WireBridgeEnvelope, WireBridgeEnvelopeError, WireBridgeEnvelopeInput,
-    WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeInbound, WireBridgeIngress,
-    WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload, WireBridgeReceipt,
-    WireBridgeStatus, WireBridgeStatusState,
+    WireBridgeEnvelopeType, WireBridgeEvent, WireBridgeInbound, WireBridgeIndexedEvent,
+    WireBridgeIngress, WireBridgeMetadata, WireBridgeNack, WireBridgeOptions, WireBridgePayload,
+    WireBridgeReceipt, WireBridgeStatus, WireBridgeStatusState,
 };
 pub use adapters::bridge_protobuf::{
     decode_canonical_wire_bridge_envelope, decode_canonical_wire_edge_cause,

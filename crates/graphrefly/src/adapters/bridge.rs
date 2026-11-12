@@ -259,6 +259,15 @@ pub enum WireBridgeEvent<TOutbound, TInbound> {
     },
 }
 
+/// One event of a wire bridge with its index: a number local to the bridge, from 1,
+/// one more for each event the bridge emits, whatever its kind (review Q13). It is
+/// not an envelope's seq.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireBridgeIndexedEvent<TOutbound, TInbound> {
+    pub index: u64,
+    pub event: WireBridgeEvent<TOutbound, TInbound>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireBridgeAck<TInbound> {
     pub ack_for_seq: u64,
@@ -335,7 +344,7 @@ pub struct WireBridgeBundle<TOutbound: Clone + 'static, TInbound: Clone + 'stati
     pub command: Node<WireBridgeCommand<TOutbound>>,
     pub outbound: Node<WireBridgeEnvelope<TOutbound>>,
     pub inbound: WireBridgeInbound<TInbound>,
-    pub events: Node<WireBridgeEvent<TOutbound, TInbound>>,
+    pub events: Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     pub acks: Node<WireBridgeAck<TInbound>>,
     pub nacks: Node<WireBridgeNack<TInbound>>,
     pub status: Node<WireBridgeStatus>,
@@ -765,6 +774,8 @@ struct BridgeState<T> {
     next_seq: u64,
     cursor: u64,
     remote_cursor: u64,
+    /// The index the next event gets (review Q13).
+    next_index: u64,
     pending: BTreeMap<u64, PendingEnvelope<T>>,
 }
 
@@ -810,8 +821,7 @@ where
     let outbound = project_outbound(graph, &events, &name);
     let acks = project_acks(graph, &events, &name);
     let nacks = project_nacks(graph, &events, &name);
-    let event_count = project_event_count(graph, &events, &name);
-    let status = project_status(graph, &events, &event_count, &name, opts.session_id.clone());
+    let status = project_status(graph, &events, &name, opts.session_id.clone());
     let errors = project_errors(graph, &events, &name);
     let cursor = project_cursor(graph, &events, &name);
     let attempts = project_attempts(graph, &events, &name);
@@ -945,7 +955,9 @@ fn normalize_remote_handlers<TRequest, TResponse>(
 fn remote_call_responses_node<TRequest, TResponse>(
     graph: &Graph,
     commands: &Node<WireBridgeCommand<RemoteCallRequest<TRequest>>>,
-    events: &Node<WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>>,
+    events: &Node<
+        WireBridgeIndexedEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
+    >,
     timeouts: &Node<RemoteCallTimeout>,
     name: &str,
 ) -> Node<RemoteCallResponse<TResponse>>
@@ -977,46 +989,49 @@ where
                     .into_iter()
                     .filter_map(|command| pending_request_from_command(command.as_ref()))
                     .collect::<Vec<_>>();
-                let has_invalid_bridge_event = ctx.dep(1).values::<
-                    WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >()
-                .into_iter()
-                .any(|event| {
-                    matches!(
-                        event.as_ref(),
-                        WireBridgeEvent::Invalid { .. }
-                            | WireBridgeEvent::SessionMismatch { .. }
-                            | WireBridgeEvent::OutOfOrder { .. }
-                            | WireBridgeEvent::LateReceipt { .. }
-                    )
-                });
+                let has_invalid_bridge_event = ctx
+                    .dep(1)
+                    .values::<WireBridgeIndexedEvent<
+                        RemoteCallRequest<TRequest>,
+                        RemoteCallResponse<TResponse>,
+                    >>()
+                    .into_iter()
+                    .any(|event| {
+                        matches!(
+                            &event.event,
+                            WireBridgeEvent::Invalid { .. }
+                                | WireBridgeEvent::SessionMismatch { .. }
+                                | WireBridgeEvent::OutOfOrder { .. }
+                                | WireBridgeEvent::LateReceipt { .. }
+                        )
+                    });
                 if !has_invalid_bridge_event {
                     for request in preview_requests.iter().cloned() {
                         let _ = state.pending.insert(request);
                     }
                 }
-                for event in ctx.dep(1).values::<
-                    WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >() {
-                    if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
+                for event in ctx.dep(1).values::<WireBridgeIndexedEvent<
+                    RemoteCallRequest<TRequest>,
+                    RemoteCallResponse<TResponse>,
+                >>() {
+                    if let WireBridgeEvent::Outbound { envelope } = &event.event {
                         if let Some(request) = pending_request_from_envelope(envelope) {
                             let _ = state.pending.insert(request);
                         }
                     }
                 }
-                for event in ctx.dep(1).values::<
-                    WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-                >() {
-                    match event.as_ref() {
+                for event in ctx.dep(1).values::<WireBridgeIndexedEvent<
+                    RemoteCallRequest<TRequest>,
+                    RemoteCallResponse<TResponse>,
+                >>() {
+                    match &event.event {
                         WireBridgeEvent::Invalid { .. } => {
                             state.pending.remove_all_unbound();
                         }
                         WireBridgeEvent::Inbound { envelope } => {
                             if let Some(WireBridgePayload::Data(response)) = &envelope.payload {
                                 let request_id = remote_call_response_request_id(response);
-                                if let Some(request) =
-                                    state.pending.get_by_request_id(request_id)
-                                {
+                                if let Some(request) = state.pending.get_by_request_id(request_id) {
                                     if !remote_call_response_matches_pending(response, request) {
                                         continue;
                                     }
@@ -1329,7 +1344,9 @@ where
 fn remote_call_status_node<TRequest, TResponse>(
     graph: &Graph,
     commands: &Node<WireBridgeCommand<RemoteCallRequest<TRequest>>>,
-    events: &Node<WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>>,
+    events: &Node<
+        WireBridgeIndexedEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
+    >,
     responses: &Node<RemoteCallResponse<TResponse>>,
     results: &Node<RemoteCallResult<TResponse>>,
     timeouts: &Node<RemoteCallTimeout>,
@@ -1373,10 +1390,13 @@ where
                     }
                 }
             }
-            for event in ctx.dep(1).values::<
-                WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >() {
-                if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
+            for event in
+                ctx.dep(1).values::<WireBridgeIndexedEvent<
+                    RemoteCallRequest<TRequest>,
+                    RemoteCallResponse<TResponse>,
+                >>()
+            {
+                if let WireBridgeEvent::Outbound { envelope } = &event.event {
                     if let Some(request) = pending_request_from_envelope(envelope) {
                         reducer.status.state = RemoteCallStatusState::Requested;
                         reducer.status.operation = Some(request.operation.clone());
@@ -1394,10 +1414,13 @@ where
                     }
                 }
             }
-            for event in ctx.dep(1).values::<
-                WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
-            >() {
-                match event.as_ref() {
+            for event in
+                ctx.dep(1).values::<WireBridgeIndexedEvent<
+                    RemoteCallRequest<TRequest>,
+                    RemoteCallResponse<TResponse>,
+                >>()
+            {
+                match &event.event {
                     WireBridgeEvent::Invalid { .. } => {
                         reducer.pending.remove_all_unbound();
                         reducer.status.state = RemoteCallStatusState::BridgeErrored;
@@ -1444,8 +1467,7 @@ where
                                     reducer.status.state = RemoteCallStatusState::Errored;
                                     reducer.status.operation = Some(request.operation.clone());
                                     reducer.status.request_id = Some(request.request_id.clone());
-                                    reducer.status.errors =
-                                        reducer.status.errors.saturating_add(1);
+                                    reducer.status.errors = reducer.status.errors.saturating_add(1);
                                     continue;
                                 }
                             } else {
@@ -1457,14 +1479,10 @@ where
                                 continue;
                             }
                             match response {
-                                RemoteCallResponse::Result {
-                                    ..
-                                } => {
+                                RemoteCallResponse::Result { .. } => {
                                     // Terminal status is projected from the accepted responses dep below.
                                 }
-                                RemoteCallResponse::Error {
-                                    ..
-                                } => {
+                                RemoteCallResponse::Error { .. } => {
                                     // Terminal status is projected from the accepted responses dep below.
                                 }
                                 RemoteCallResponse::Status {
@@ -1577,7 +1595,9 @@ fn remote_call_errors_node<TRequest, TResponse>(
     graph: &Graph,
     responses: &Node<RemoteCallResponse<TResponse>>,
     timeouts: &Node<RemoteCallTimeout>,
-    events: &Node<WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>>,
+    events: &Node<
+        WireBridgeIndexedEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
+    >,
     name: &str,
 ) -> Node<RemoteCallError>
 where
@@ -1595,9 +1615,9 @@ where
         |ctx| {
             let mut pending = crate::ledger::load::<RemoteCallPendingState>(ctx, ctx.dep_len() - 1);
             for event in ctx.dep(2).values::<
-                WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
+                WireBridgeIndexedEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
             >() {
-                if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
+                if let WireBridgeEvent::Outbound { envelope } = &event.event {
                     if let Some(request) = pending_request_from_envelope(envelope) {
                         if !pending.insert(request.clone()) {
                             ctx.emit(RemoteCallError {
@@ -1649,9 +1669,9 @@ where
             }
             ctx.emit_all(emitted);
             for event in ctx.dep(2).values::<
-                WireBridgeEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
+                WireBridgeIndexedEvent<RemoteCallRequest<TRequest>, RemoteCallResponse<TResponse>>,
             >() {
-                match event.as_ref() {
+                match &event.event {
                     WireBridgeEvent::Nack {
                         outbound, error, ..
                     } => {
@@ -1715,7 +1735,7 @@ where
                     | WireBridgeEvent::LateReceipt { .. } => ctx.emit(RemoteCallError {
                         operation: None,
                         request_id: None,
-                        error: remote_call_bridge_error_message(event.as_ref()),
+                        error: remote_call_bridge_error_message(&event.event),
                     }),
                     _ => {}
                 }
@@ -2114,7 +2134,7 @@ fn wire_bridge_events_node<TOutbound, TInbound>(
     inbound: &Node<WireBridgeIngress<TInbound>>,
     name: String,
     opts: WireBridgeOptions,
-) -> Node<WireBridgeEvent<TOutbound, TInbound>>
+) -> Node<WireBridgeIndexedEvent<TOutbound, TInbound>>
 where
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
@@ -2144,7 +2164,7 @@ where
         }),
         ..GraphNodeOpts::default()
     };
-    graph.node_opts::<WireBridgeEvent<TOutbound, TInbound>, _>(
+    graph.node_opts::<WireBridgeIndexedEvent<TOutbound, TInbound>, _>(
         vec![command.erased(), inbound.erased()],
         move |ctx| {
             let state = bridge_state::<TOutbound>(ctx);
@@ -2164,7 +2184,7 @@ where
                     }),
                 }
             }
-            ctx.emit_all(emitted);
+            emit_events(ctx, &state, emitted);
             let mut emitted = Vec::new();
             for value in raw_data(ctx, 0) {
                 match value.downcast::<WireBridgeCommand<TOutbound>>() {
@@ -2184,7 +2204,7 @@ where
                     }),
                 }
             }
-            ctx.emit_all(emitted);
+            emit_events(ctx, &state, emitted);
             if let Some(terminal) = ctx.dep(1).terminal() {
                 let error = match terminal {
                     DepTerminal::Complete => format!(
@@ -2194,11 +2214,43 @@ where
                         "{session_id}: inbound protocol ERROR {error} is local misuse; remote errors must arrive as DATA envelope facts"
                     ),
                 };
-                ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid { error });
+                emit_event(ctx, &state, WireBridgeEvent::<TOutbound, TInbound>::Invalid { error });
             }
         },
         event_opts,
     )
+}
+
+/// Emits `event` with the bridge's next index (review Q13).
+fn emit_event<TOutbound: Clone + 'static, TInbound: Clone + 'static>(
+    ctx: &Ctx,
+    state: &Rc<RefCell<BridgeState<TOutbound>>>,
+    event: WireBridgeEvent<TOutbound, TInbound>,
+) {
+    ctx.emit(indexed(state, event));
+}
+
+/// Emits `events` as one array, each with the bridge's next index.
+fn emit_events<TOutbound: Clone + 'static, TInbound: Clone + 'static>(
+    ctx: &Ctx,
+    state: &Rc<RefCell<BridgeState<TOutbound>>>,
+    events: Vec<WireBridgeEvent<TOutbound, TInbound>>,
+) {
+    let events: Vec<_> = events
+        .into_iter()
+        .map(|event| indexed(state, event))
+        .collect();
+    ctx.emit_all(events);
+}
+
+fn indexed<TOutbound, TInbound>(
+    state: &Rc<RefCell<BridgeState<TOutbound>>>,
+    event: WireBridgeEvent<TOutbound, TInbound>,
+) -> WireBridgeIndexedEvent<TOutbound, TInbound> {
+    let mut state = state.borrow_mut();
+    let index = state.next_index;
+    state.next_index += 1;
+    WireBridgeIndexedEvent { index, event }
 }
 
 fn bridge_state<T: Clone + 'static>(ctx: &Ctx) -> Rc<RefCell<BridgeState<T>>> {
@@ -2210,6 +2262,7 @@ fn bridge_state<T: Clone + 'static>(ctx: &Ctx) -> Rc<RefCell<BridgeState<T>>> {
         next_seq: 1,
         cursor: 0,
         remote_cursor: 0,
+        next_index: 1,
         pending: BTreeMap::new(),
     });
     ctx.state_set(state);
@@ -2285,9 +2338,13 @@ fn process_command<TOutbound, TInbound>(
             request_id,
         } => {
             if ack_for_seq == 0 {
-                ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-                    error: "wireBridge: ack command ack_for_seq must be positive".to_owned(),
-                });
+                emit_event(
+                    ctx,
+                    state,
+                    WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                        error: "wireBridge: ack command ack_for_seq must be positive".to_owned(),
+                    },
+                );
                 return;
             }
             emit_outbound::<TOutbound, TInbound>(
@@ -2314,9 +2371,13 @@ fn process_command<TOutbound, TInbound>(
             request_id,
         } => {
             if ack_for_seq == 0 {
-                ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-                    error: "wireBridge: nack command ack_for_seq must be positive".to_owned(),
-                });
+                emit_event(
+                    ctx,
+                    state,
+                    WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                        error: "wireBridge: nack command ack_for_seq must be positive".to_owned(),
+                    },
+                );
                 return;
             }
             emit_outbound::<TOutbound, TInbound>(
@@ -2411,9 +2472,13 @@ fn emit_outbound<TOutbound, TInbound>(
             Some((state.next_seq, state.cursor, state.next_seq + 1))
         }
     }) else {
-        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-            error: format!("{}: next outbound seq exceeded u64::MAX", opts.session_id),
-        });
+        emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                error: format!("{}: next outbound seq exceeded u64::MAX", opts.session_id),
+            },
+        );
         return;
     };
     let envelope = match wire_bridge_envelope(WireBridgeEnvelopeInput {
@@ -2431,9 +2496,13 @@ fn emit_outbound<TOutbound, TInbound>(
     }) {
         Ok(envelope) => envelope,
         Err(error) => {
-            ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-                error: error.to_string(),
-            });
+            emit_event(
+                ctx,
+                state,
+                WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                    error: error.to_string(),
+                },
+            );
             return;
         }
     };
@@ -2441,9 +2510,13 @@ fn emit_outbound<TOutbound, TInbound>(
         clear_pending(state);
     }
     state.borrow_mut().next_seq = next_seq;
-    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Outbound {
-        envelope: envelope.clone(),
-    });
+    emit_event(
+        ctx,
+        state,
+        WireBridgeEvent::<TOutbound, TInbound>::Outbound {
+            envelope: envelope.clone(),
+        },
+    );
     if spec.track_ack {
         state.borrow_mut().pending.insert(
             envelope.metadata.seq,
@@ -2477,15 +2550,23 @@ fn process_ack_timeout_command<TOutbound, TInbound>(
         observed_at_ms,
     } = input;
     if seq == 0 {
-        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-            error: "wireBridge: ack-timeout command seq must be positive".to_owned(),
-        });
+        emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                error: "wireBridge: ack-timeout command seq must be positive".to_owned(),
+            },
+        );
         return;
     }
     if attempt == 0 {
-        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-            error: "wireBridge: ack-timeout command attempt must be positive".to_owned(),
-        });
+        emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                error: "wireBridge: ack-timeout command attempt must be positive".to_owned(),
+            },
+        );
         return;
     }
     let current = {
@@ -2521,14 +2602,22 @@ fn process_ack_timeout_command<TOutbound, TInbound>(
         emit_retry_outbound::<TOutbound, TInbound>(ctx, state, policy, now, current);
         return;
     }
-    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Timeout { seq, attempt });
+    emit_event(
+        ctx,
+        state,
+        WireBridgeEvent::<TOutbound, TInbound>::Timeout { seq, attempt },
+    );
     if !policy.should_retry(attempt) {
         state.borrow_mut().pending.remove(&seq);
-        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Exhausted {
-            seq,
-            attempt,
-            error: format!("{}: ack timeout for seq {seq}", opts.session_id),
-        });
+        emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::Exhausted {
+                seq,
+                attempt,
+                error: format!("{}: ack timeout for seq {seq}", opts.session_id),
+            },
+        );
         return;
     }
     let next_attempt = attempt.saturating_add(1);
@@ -2539,12 +2628,16 @@ fn process_ack_timeout_command<TOutbound, TInbound>(
             pending.retry_due_at_ms = observed_at_ms.map(|ms| ms.saturating_add(delay_ms));
         }
     }
-    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Retry {
-        seq,
-        attempt: next_attempt,
-        delay_ms,
-        error: format!("{}: ack timeout for seq {seq}", opts.session_id),
-    });
+    emit_event(
+        ctx,
+        state,
+        WireBridgeEvent::<TOutbound, TInbound>::Retry {
+            seq,
+            attempt: next_attempt,
+            delay_ms,
+            error: format!("{}: ack timeout for seq {seq}", opts.session_id),
+        },
+    );
     let should_wait = state
         .borrow()
         .pending
@@ -2589,7 +2682,11 @@ fn emit_retry_outbound<TOutbound, TInbound>(
         pending.timeout_reported_attempt = None;
         pending.retry_due_at_ms = None;
     }
-    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Outbound { envelope: retry });
+    emit_event(
+        ctx,
+        state,
+        WireBridgeEvent::<TOutbound, TInbound>::Outbound { envelope: retry },
+    );
 }
 
 fn process_inbound<TOutbound, TInbound>(
@@ -2604,21 +2701,33 @@ fn process_inbound<TOutbound, TInbound>(
     let envelope = match ingress {
         WireBridgeIngress::Envelope(envelope) => envelope,
         WireBridgeIngress::Invalid(error) => {
-            ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid { error });
+            emit_event(
+                ctx,
+                state,
+                WireBridgeEvent::<TOutbound, TInbound>::Invalid { error },
+            );
             return;
         }
     };
     if let Err(error) = validate_inbound_envelope(&envelope) {
-        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Invalid {
-            error: error.to_string(),
-        });
+        emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::Invalid {
+                error: error.to_string(),
+            },
+        );
         return;
     }
     if envelope.session_id != session_id {
-        ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::SessionMismatch {
-            expected: session_id.to_owned(),
-            actual: envelope.session_id,
-        });
+        emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::SessionMismatch {
+                expected: session_id.to_owned(),
+                actual: envelope.session_id,
+            },
+        );
         return;
     }
     let seq = envelope.metadata.seq;
@@ -2646,13 +2755,21 @@ fn process_inbound<TOutbound, TInbound>(
         }
     };
     if let Some(event) = early_event {
-        ctx.emit(event);
+        emit_event(ctx, state, event);
         return;
     }
-    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Cursor { cursor: seq });
-    ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Inbound {
-        envelope: envelope.clone(),
-    });
+    emit_event(
+        ctx,
+        state,
+        WireBridgeEvent::<TOutbound, TInbound>::Cursor { cursor: seq },
+    );
+    emit_event(
+        ctx,
+        state,
+        WireBridgeEvent::<TOutbound, TInbound>::Inbound {
+            envelope: envelope.clone(),
+        },
+    );
     match envelope.envelope_type {
         WireBridgeEnvelopeType::Ack => process_ack(ctx, state, envelope),
         WireBridgeEnvelopeType::Nack => process_nack(ctx, state, envelope),
@@ -2743,16 +2860,24 @@ fn process_ack<TOutbound, TInbound>(
     let pending = state.borrow_mut().pending.remove(&ack_for_seq);
     match pending {
         Some(pending) => {
-            ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Ack {
-                ack_for_seq,
-                envelope,
-                outbound: pending.envelope,
-            });
+            emit_event(
+                ctx,
+                state,
+                WireBridgeEvent::<TOutbound, TInbound>::Ack {
+                    ack_for_seq,
+                    envelope,
+                    outbound: pending.envelope,
+                },
+            );
         }
-        None => ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::LateReceipt {
-            receipt: WireBridgeReceipt::Ack,
-            ack_for_seq,
-        }),
+        None => emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::LateReceipt {
+                receipt: WireBridgeReceipt::Ack,
+                ack_for_seq,
+            },
+        ),
     }
 }
 
@@ -2772,23 +2897,31 @@ fn process_nack<TOutbound, TInbound>(
     let error = payload_error_string(&envelope.payload, "remote nack");
     match pending {
         Some(pending) => {
-            ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::Nack {
-                ack_for_seq,
-                envelope,
-                outbound: pending.envelope,
-                error,
-            });
+            emit_event(
+                ctx,
+                state,
+                WireBridgeEvent::<TOutbound, TInbound>::Nack {
+                    ack_for_seq,
+                    envelope,
+                    outbound: pending.envelope,
+                    error,
+                },
+            );
         }
-        None => ctx.emit(WireBridgeEvent::<TOutbound, TInbound>::LateReceipt {
-            receipt: WireBridgeReceipt::Nack,
-            ack_for_seq,
-        }),
+        None => emit_event(
+            ctx,
+            state,
+            WireBridgeEvent::<TOutbound, TInbound>::LateReceipt {
+                receipt: WireBridgeReceipt::Nack,
+                ack_for_seq,
+            },
+        ),
     }
 }
 
 fn project_outbound<TOutbound, TInbound>(
     graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    events: &Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     name: &str,
 ) -> Node<WireBridgeEnvelope<TOutbound>>
 where
@@ -2799,8 +2932,11 @@ where
         vec![events.erased()],
         |ctx| {
             let mut emitted = Vec::new();
-            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
-                if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
+            for event in ctx
+                .dep(0)
+                .values::<WireBridgeIndexedEvent<TOutbound, TInbound>>()
+            {
+                if let WireBridgeEvent::Outbound { envelope } = &event.event {
                     emitted.push(envelope.clone());
                 }
             }
@@ -2812,7 +2948,7 @@ where
 
 fn project_acks<TOutbound, TInbound>(
     graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    events: &Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     name: &str,
 ) -> Node<WireBridgeAck<TInbound>>
 where
@@ -2823,12 +2959,15 @@ where
         vec![events.erased()],
         |ctx| {
             let mut emitted = Vec::new();
-            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
+            for event in ctx
+                .dep(0)
+                .values::<WireBridgeIndexedEvent<TOutbound, TInbound>>()
+            {
                 if let WireBridgeEvent::Ack {
                     ack_for_seq,
                     envelope,
                     ..
-                } = event.as_ref()
+                } = &event.event
                 {
                     emitted.push(WireBridgeAck {
                         ack_for_seq: *ack_for_seq,
@@ -2844,7 +2983,7 @@ where
 
 fn project_nacks<TOutbound, TInbound>(
     graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    events: &Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     name: &str,
 ) -> Node<WireBridgeNack<TInbound>>
 where
@@ -2855,13 +2994,16 @@ where
         vec![events.erased()],
         |ctx| {
             let mut emitted = Vec::new();
-            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
+            for event in ctx
+                .dep(0)
+                .values::<WireBridgeIndexedEvent<TOutbound, TInbound>>()
+            {
                 if let WireBridgeEvent::Nack {
                     ack_for_seq,
                     envelope,
                     error,
                     ..
-                } = event.as_ref()
+                } = &event.event
                 {
                     emitted.push(WireBridgeNack {
                         ack_for_seq: *ack_for_seq,
@@ -2878,8 +3020,7 @@ where
 
 fn project_status<TOutbound, TInbound>(
     graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
-    event_count: &Node<u64>,
+    events: &Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     name: &str,
     session_id: String,
 ) -> Node<WireBridgeStatus>
@@ -2888,9 +3029,9 @@ where
     TInbound: Clone + 'static,
 {
     // The status counters are an audit ledger the bundle owns (review Q13), with the
-    // number of the last event they counted: a new lifetime starts on the events
-    // node's snapshot, which replays its last array, and skips every event at or
-    // below that high water, so a reactivated status never counts an event twice.
+    // index of the last event they counted: a new lifetime starts on the events node's
+    // snapshot, which replays its last array, and skips every event at or below that
+    // high water, so a reactivated status never counts an event twice.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/statusLedger"),
@@ -2901,25 +3042,21 @@ where
         .unwrap_or_default(),
     );
     graph.node_opts::<WireBridgeStatus, _>(
-        vec![events.erased(), event_count.erased(), ledger.erased()],
+        vec![events.erased(), ledger.erased()],
         move |ctx| {
-            let mut ledger: StatusLedger = crate::ledger::load_or(ctx, 2, || StatusLedger {
+            let mut ledger: StatusLedger = crate::ledger::load_or(ctx, 1, || StatusLedger {
                 status: initial_status(&session_id),
                 high_water: 0,
             });
-            // The delivered events are the bridge's latest ones: the last is event
-            // number `total`.
-            let delivered: Vec<AnyValue> = ctx.dep(0).raw_waves().concat();
-            let total = ctx.dep(1).value::<u64>().map_or(0, |total| *total);
-            let first = total.saturating_sub(delivered.len() as u64) + 1;
-            for (number, value) in (first..).zip(&delivered) {
-                if number <= ledger.high_water {
+            for event in ctx
+                .dep(0)
+                .values::<WireBridgeIndexedEvent<TOutbound, TInbound>>()
+            {
+                if event.index <= ledger.high_water {
                     continue;
                 }
-                if let Some(event) = value.downcast_ref::<WireBridgeEvent<TOutbound, TInbound>>() {
-                    ledger.status = reduce_status(ledger.status, event);
-                }
-                ledger.high_water = number;
+                ledger.status = reduce_status(ledger.status, &event.event);
+                ledger.high_water = event.index;
             }
             crate::ledger::store(ctx, &ledger);
             ctx.emit(ledger.status);
@@ -2932,36 +3069,11 @@ where
     )
 }
 
-/// The bridge status and the number of the last event it counted (review Q13).
+/// The bridge status and the index of the last event it counted (review Q13).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StatusLedger {
     status: WireBridgeStatus,
     high_water: u64,
-}
-
-/// How many events the bridge has emitted, held for the graph's life so it sees each
-/// one: the status numbers its events by it.
-fn project_event_count<TOutbound, TInbound>(
-    graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
-    name: &str,
-) -> Node<u64>
-where
-    TOutbound: Clone + 'static,
-    TInbound: Clone + 'static,
-{
-    let count = graph.node_opts::<u64, _>(
-        vec![events.erased()],
-        |ctx| {
-            let delivered: usize = ctx.dep(0).raw_waves().iter().map(Vec::len).sum();
-            let total = ctx.state_get::<u64>().map_or(0, |total| *total) + delivered as u64;
-            ctx.state_set(total);
-            ctx.emit(total);
-        },
-        GraphNodeOpts::named(format!("{name}/eventCount")),
-    );
-    let _held_for_graph_life = graph.retain(&format!("{name}/eventCount"));
-    count
 }
 
 fn initial_status(session_id: &str) -> WireBridgeStatus {
@@ -3073,7 +3185,7 @@ fn reduce_status<TOutbound, TInbound>(
 
 fn project_errors<TOutbound, TInbound>(
     graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    events: &Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     name: &str,
 ) -> Node<String>
 where
@@ -3086,8 +3198,8 @@ where
         vec![events.erased()],
         move |ctx| {
             let mut emitted = Vec::new();
-            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
-                match event.as_ref() {
+            for event in ctx.dep(0).values::<WireBridgeIndexedEvent<TOutbound, TInbound>>() {
+                match &event.event {
                     WireBridgeEvent::Nack { error, .. }
                     | WireBridgeEvent::Exhausted { error, .. }
                     | WireBridgeEvent::Invalid { error } => emitted.push(error.clone()),
@@ -3128,7 +3240,7 @@ where
 
 fn project_cursor<TOutbound, TInbound>(
     graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    events: &Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     name: &str,
 ) -> Node<u64>
 where
@@ -3139,8 +3251,11 @@ where
         vec![events.erased()],
         |ctx| {
             let mut emitted = Vec::new();
-            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
-                if let WireBridgeEvent::Cursor { cursor } = event.as_ref() {
+            for event in ctx
+                .dep(0)
+                .values::<WireBridgeIndexedEvent<TOutbound, TInbound>>()
+            {
+                if let WireBridgeEvent::Cursor { cursor } = &event.event {
                     emitted.push(*cursor);
                 }
             }
@@ -3152,7 +3267,7 @@ where
 
 fn project_attempts<TOutbound, TInbound>(
     graph: &Graph,
-    events: &Node<WireBridgeEvent<TOutbound, TInbound>>,
+    events: &Node<WireBridgeIndexedEvent<TOutbound, TInbound>>,
     name: &str,
 ) -> Node<WireBridgeAttempt>
 where
@@ -3163,8 +3278,11 @@ where
         vec![events.erased()],
         |ctx| {
             let mut emitted = Vec::new();
-            for event in ctx.dep(0).values::<WireBridgeEvent<TOutbound, TInbound>>() {
-                if let WireBridgeEvent::Outbound { envelope } = event.as_ref() {
+            for event in ctx
+                .dep(0)
+                .values::<WireBridgeIndexedEvent<TOutbound, TInbound>>()
+            {
+                if let WireBridgeEvent::Outbound { envelope } = &event.event {
                     if should_track_ack(envelope.envelope_type) {
                         emitted.push(WireBridgeAttempt {
                             seq: envelope.metadata.seq,
@@ -3381,7 +3499,6 @@ mod tests {
                 "bridge/command",
                 "bridge/cursor",
                 "bridge/errors",
-                "bridge/eventCount",
                 "bridge/events",
                 "bridge/inbound",
                 "bridge/nacks",
@@ -3469,9 +3586,10 @@ mod tests {
             move |msgs: &[crate::protocol::Message<crate::protocol::AnyValue>]| {
                 let handle = |msg: &crate::protocol::Message<crate::protocol::AnyValue>| {
                     if let Message::Data(value) = msg {
-                        if let Some(event) = value.downcast_ref::<WireBridgeEvent<String, String>>()
+                        if let Some(event) =
+                            value.downcast_ref::<WireBridgeIndexedEvent<String, String>>()
                         {
-                            seen_sink.borrow_mut().push(event.clone());
+                            seen_sink.borrow_mut().push(event.event.clone());
                         }
                     }
                 };

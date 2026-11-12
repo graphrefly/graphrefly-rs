@@ -6,7 +6,8 @@ use graphrefly::{
     wire_bridge, wire_bridge_envelope, Message, RemoteCallOptions, RemoteCallRequest,
     RemoteCallResponse, RemoteCallResult, RemoteCallStatusState, RemoteResponderOptions,
     RemoteResponderStatusState, WireBridgeCommand, WireBridgeEnvelopeInput, WireBridgeEnvelopeType,
-    WireBridgeEvent, WireBridgeOptions, WireBridgePayload, WireBridgeStatusState,
+    WireBridgeEvent, WireBridgeIndexedEvent, WireBridgeOptions, WireBridgePayload,
+    WireBridgeStatusState,
 };
 
 fn envelope<T>(
@@ -110,9 +111,10 @@ fn idempotency_key_is_metadata_not_duplicate_lookup() {
             .subscribe(move |msgs: &[graphrefly::Message<graphrefly::AnyValue>]| {
                 let handle = |msg: &graphrefly::Message<graphrefly::AnyValue>| {
                     if let Message::Data(value) = msg {
-                        if let Some(event) = value.downcast_ref::<WireBridgeEvent<String, String>>()
+                        if let Some(event) =
+                            value.downcast_ref::<WireBridgeIndexedEvent<String, String>>()
                         {
-                            events_sink.borrow_mut().push(event.clone());
+                            events_sink.borrow_mut().push(event.event.clone());
                         }
                     }
                 };
@@ -1059,25 +1061,40 @@ fn bridge_sequence_survives_its_subscribers_leaving() {
     assert_eq!(*seqs.borrow(), vec![1, 2, 3]);
 }
 
-/// Review Q13 — a reactivated status does not count an event twice: the held events
-/// node replays its last array as the new lifetime's snapshot, and the status ledger's
-/// high water skips it; a later event is counted once.
+/// Review Q13 — a reactivated status does not count an event twice: each bridge event
+/// has an index, the held events node replays its last array as the new lifetime's
+/// snapshot, and the status ledger's high water (the last index it counted) skips it;
+/// a later event is counted once.
 #[test]
 fn bridge_status_counts_each_event_once_across_reactivation() {
     let g = graph();
     let bridge =
         wire_bridge::<String, String>(&g, WireBridgeOptions::named("session-hw", "bridge"));
+    let high_water = || {
+        g.find("bridge/statusLedger")
+            .unwrap()
+            .as_node::<serde_json::Value>()
+            .cache()
+            .and_then(|ledger| ledger["high_water"].as_u64())
+    };
     let stop = bridge.status.subscribe(|_| {});
     bridge.send("a".to_owned(), None, None);
     bridge.send("b".to_owned(), None, None);
+    assert_eq!(bridge.events.cache().map(|event| event.index), Some(2));
     let before = bridge.status.cache().unwrap();
     assert_eq!((before.attempts, before.pending), (2, 2));
     stop();
+    // The closed lifetime wrote back the last index it counted.
+    assert_eq!(high_water(), Some(2));
 
+    // The new lifetime's snapshot replays event 2, at the high water: skipped.
     let _again = bridge.status.subscribe(|_| {});
     assert_eq!(bridge.status.cache(), Some(before));
 
     bridge.send("c".to_owned(), None, None);
+    let last = bridge.events.cache().unwrap();
+    assert_eq!(last.index, 3);
+    assert!(matches!(last.event, WireBridgeEvent::Outbound { .. }));
     let after = bridge.status.cache().unwrap();
     assert_eq!((after.attempts, after.pending), (3, 3));
     assert_eq!(after.last_seq, Some(3));
