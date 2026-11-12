@@ -178,3 +178,27 @@ sequence, background cargo, buffered output pipelines or sleep-based completion
 inference. Use mise in agent shells; `~/.cargo/bin/cargo` is the PATH fallback.
 
 [Documentation categories](README.md) locate work, drafts and dated evidence.
+
+## D797 rereview API checks
+
+`Graph::batch` takes `|| -> Result<_, E>`. Returning `Err` from the outer body
+aborts all staged work. A nested batch shares that staging; catching its `Err`
+inside an outer body that returns `Ok` keeps the accumulated writes.
+
+The minimal graph view is `graph.describe()`; use `graph.find(id)` for status and
+values. Optional diagnostics are free functions: `graphrefly::topology::snapshot(&graph)`,
+`snapshot_opts`, `observe`, `observe_path`, `profile`, `group`, `group_opts`, `mount`
+and `name`. Snapshot edges are derived with `snapshot.edges()` from node dependencies.
+The operator names are `combine`, `on_first_data`, `rescue`, `debounce` and `throttle`;
+the wire cause type is `WireEdgeCause`.
+
+The shared D808 trace runs with:
+
+```sh
+GRAPHREFLY_SPEC_ROOT=../graphrefly/spec cargo run -p graphrefly-rs --example d797_rereview_probe
+```
+
+It compares the actual trace against the root `d797-rereview.v1.json` fixture.
+Restore creates a cold graph; explicitly retain the required runtime nodes before
+sending commands. Dependency views are borrowed only for setup/function invocation;
+`Ctx::defer()` keeps output, state, rewire and signal capabilities for later work.
