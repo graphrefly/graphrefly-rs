@@ -34,10 +34,11 @@
 //!   `Arc<Mutex<…>>`. Parallelism = pool callback or several graphs joined by the
 //!   wire bridge. Each graph has its own wave, request queue and batch
 //!   (R-graph-domain@3).
-//! - **F-SYNC-CORE** — the wave core is synchronous; a node function is
+//! - **R-invocation@2** — the wave core is synchronous; a node function is
 //!   `Fn(&Ctx)` returning `()`. Async work runs through the local async driver, a
-//!   worker or the wire bridge, and comes back as a new wave.
-//! - **F-DISPATCH-ALL** — every node function goes through the dispatcher.
+//!   worker or the wire bridge, and comes back as a later wave (R-wave@2).
+//! - Every node function is registered in the dispatcher's one function table;
+//!   the table is implementation, with no pool kind (graphrefly:D807).
 //!
 //! ## The kernel and its graph (graphrefly:D797)
 //!

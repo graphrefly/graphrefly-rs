@@ -32,9 +32,10 @@ homepage     = "https://graphrefly.dev"
 authors      = ["David Chen<clfhhc@gmail.com>"]
 
 # ---------------------------------------------------------------------------
-# Shared dependencies — the clean-slate substrate is sync-core (F-SYNC-CORE)
-# and single-thread (D22), so it carries NO concurrency primitives. The async
-# pool (LocalAsync, D20) lands behind a `tokio` feature. Additional package
+# Shared dependencies — a node function runs synchronously (R-invocation@2) and
+# a graph is single-thread (D22, R-graph-domain@3), so the substrate carries NO
+# concurrency primitives. The local async driver lands behind a `tokio` feature.
+# Additional package
 # surfaces are reintroduced in the clean-slate crate only when re-derived from
 # the language-neutral authority.
 # ---------------------------------------------------------------------------
@@ -54,8 +55,8 @@ indexmap    = { version = "2.6" }
 # future field change can't silently widen the bounds (D22 single-thread).
 static_assertions = { version = "1.1" }
 
-# Async runtime — LocalAsync pool timer substrate, feature-gated (added in CSP-5
-# when the async pool arm lands). Declared here so the version is pinned now.
+# Async runtime — the local async driver's timer substrate, feature-gated.
+# Declared here so the version is pinned now.
 tokio       = { version = "1", default-features = false }
 
 # Test-only

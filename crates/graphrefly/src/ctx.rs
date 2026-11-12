@@ -353,8 +353,8 @@ impl Ctx {
         }
     }
 
-    /// Obtain an owned, `'static` deferred-emit handle for **async-pool** late emission
-    /// (R-sync-core / R-no-raw-async: async lives in the fn body; the emit serializes
+    /// Obtain an owned, `'static` deferred-emit handle for late emission
+    /// (R-wave@2 / R-no-raw-async: async lives in the fn body; the emit serializes
     /// back onto the single thread). The Rust analogue of the TS async fn capturing its
     /// `ctx` — here `&Ctx` is a borrow that cannot outlive `invoke`, so an async fn must
     /// stash this owned handle and call [`DeferredCtx::emit`] / [`DeferredCtx::down`]
@@ -370,7 +370,7 @@ impl Ctx {
     }
 }
 
-/// An owned, `'static` late-emit handle obtained via [`Ctx::defer`] — the async-pool
+/// An owned, `'static` late-emit handle obtained via [`Ctx::defer`] — the async
 /// boundary. An async node fn stashes one and emits LATER (the deferred result of
 /// async work). The emit re-enters the wave engine as a FRESH external wave (its own
 /// wave-owner / D30 catch boundary; the leading PENDING is the kernel's, R-wave). Holds the node handle ([`Core`] = an `Rc`) + the

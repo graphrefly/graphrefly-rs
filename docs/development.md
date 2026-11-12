@@ -149,8 +149,8 @@ existing constraints; root rules and owner decisions still govern meaning.
    per-partition `ReentrantMutex` machinery of the old port are **gone** — they were
    the ~9.5× concurrency tax (memory `project_rust_perf_value_investigation`). Lock the
    `!Send`/`!Sync` boundary with `static_assertions` once types stabilize.
-2. **No async runtime in the core (F-SYNC-CORE).** `dispatcher.invoke` is sync. `tokio`
-   enters only behind the `LocalAsync` pool (D20) and the wire bridge.
+2. **No async runtime in the core (R-invocation@2).** `dispatcher.invoke` is sync. `tokio`
+   enters only behind the local async driver and the wire bridge.
 3. **No `unsafe`. Anywhere.** `#![forbid(unsafe_code)]` at the crate root. Find a safe
    abstraction; if you truly cannot, escalate to spec-level discussion first.
 4. **Error = unknown, single value generic (D31).** `Node<T>` carries one value

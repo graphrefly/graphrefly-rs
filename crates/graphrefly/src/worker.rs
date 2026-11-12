@@ -18,13 +18,13 @@ use crate::node::{Core, Node, NodeOpts, Policy};
 use crate::operators::Operator;
 use crate::protocol::Message;
 
-/// Create an async-pool derived node whose CPU-heavy part runs on Tokio's
+/// Create an async derived node whose CPU-heavy part runs on Tokio's
 /// blocking worker pool.
 ///
 /// `prepare` runs synchronously on the graph thread and must return an owned
 /// worker input. `compute` runs off-thread and may only close over `Send + Sync`
 /// state. The result or error comes back as a brand-new graph wave via
-/// `DeferredCtx`, preserving F-SYNC-CORE and D22.
+/// `DeferredCtx`, preserving R-invocation@2 and D22.
 pub fn worker_derived<I, R, E, P, C>(
     graph: &Graph,
     deps: Vec<Core>,

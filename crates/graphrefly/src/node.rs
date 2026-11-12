@@ -819,7 +819,7 @@ impl DepEdges {
 
 /// Dispatcher-owned callable metadata for one node. Keeping this in GraphCore
 /// lets the hot wave path snapshot the call target by arena index, then invoke
-/// borrow-free through the dispatcher (R-dispatch-all).
+/// borrow-free through the dispatcher.
 struct NodeCallSlot {
     factory: Option<String>,
     handle: Option<Handle>,
@@ -3209,7 +3209,7 @@ impl Core {
             "kernel invariant: a running function is never reentered"
         );
         // Build ctx + call snapshot under one short arena borrow, then invoke
-        // borrow-free through the dispatcher (R-dispatch-all / R-sync-core).
+        // borrow-free through the dispatcher (R-invocation@2).
         let (handle, dispatcher, ctx, setup) = self.with_node_state_aux_mut(|n, c, cfg, e, a| {
             let invalidate_manual = cfg.invalidate == Policy::Manual;
             let dep_records: Vec<DepRecord> = e
@@ -3466,7 +3466,7 @@ impl Core {
         }
     }
 
-    /// External deferred emit — the async-pool late-emit path used by
+    /// External deferred emit — the async late-emit path used by
     /// [`crate::ctx::DeferredCtx`]: a FRESH wave from this node, under its own
     /// wave-owner boundary (D30).
     /// Output through a kept ctx of `lifetime`: in a batch body it is staged with

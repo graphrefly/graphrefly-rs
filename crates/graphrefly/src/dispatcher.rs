@@ -1,16 +1,16 @@
 //! The dispatcher — first-class invoke funnel + pool host (D20 / D21).
 //!
-//! **F-SYNC-CORE:** [`Dispatcher::invoke`] is synchronous and returns `()`. The
-//! wave-protocol core never blocks on async; async work runs through the local
-//! async driver, a worker, or the wire bridge, and comes back as a new wave.
+//! [`Dispatcher::invoke`] is synchronous and returns `()`: a node function has the
+//! shape `(ctx) => void` (R-invocation@2). The wave core never blocks on async;
+//! async work runs through the local async driver, a worker, or the wire bridge,
+//! and comes back as a later wave (R-wave@2, R-graph-domain@3).
 //!
-//! **F-DISPATCH-ALL:** every node fn goes through the dispatcher — no inline-fn
-//! bypass. A fn is registered into a pool and addressed by a pure-data [`Handle`]
-//! `(pool_id, handle_id)` (D7).
-//!
-//! One pool serves every node: an async function kicks off work and emits later
-//! through a kept [`crate::ctx::DeferredCtx`], with the same synchronous invoke
-//! (R-sync-core), so no pool kind is needed (review §5.6 of the D797 migration).
+//! Every node function is registered in the dispatcher's one function table and
+//! addressed by a pure-data [`Handle`] `(pool_id, handle_id)` (D7). The table's
+//! make-up is this crate's implementation, not protocol, and it has no pool kind
+//! (graphrefly:D807; review §5.6 of the D797 migration): an async function kicks
+//! off work and emits later through a kept [`crate::ctx::DeferredCtx`], with the
+//! same synchronous invoke.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -101,9 +101,8 @@ impl Pool {
 }
 
 struct DispatcherInner {
-    /// One pool (the LocalSync and LocalAsync pools behaved alike and were merged in
-    /// the D797 migration, review §5.6), indexed by a handle's `pool_id`; a `Vec` so
-    /// a worker or remote pool can still be appended (D20).
+    /// The one function table (graphrefly:D807; review §5.6), indexed by a handle's
+    /// `pool_id`; a `Vec` so a worker or remote table can still be appended (D20).
     pools: Vec<Pool>,
     /// Opt-in profile recorder (D39 / R-profile). Default off = one boolean branch
     /// per invoke; counters live on the dispatcher, not on the thin node.
@@ -243,7 +242,7 @@ impl Dispatcher {
         self.0.borrow_mut().worker_backend = installed.then_some(WorkerBackend);
     }
 
-    /// Register a fn in the sync pool, returning its [`Handle`] (R-dispatch-all).
+    /// Register a fn in the function table, returning its [`Handle`].
     pub fn register(&self, f: NodeFn) -> Handle {
         self.register_in(SYNC_POOL_ID, f)
     }
@@ -276,7 +275,7 @@ impl Dispatcher {
         drop(freed);
     }
 
-    /// Uniform sync-void invoke (R-sync-core / R-dispatch-all). Clones the fn out
+    /// Uniform synchronous invoke (R-invocation@2). Clones the fn out
     /// and drops the pool borrow before calling, so a nested downstream invoke
     /// triggered from inside the fn does not double-borrow the pool.
     pub fn invoke(&self, handle: Handle, ctx: &Ctx) {
@@ -289,7 +288,7 @@ impl Dispatcher {
         };
         // A live node is the SOLE invoker of its own handle, so the slot is present on
         // the live path. A generation mismatch (a stale handle — e.g. a future
-        // async-pool deferred callback firing after the node dropped + the slot was
+        // async deferred callback firing after the node dropped + the slot was
         // recycled) yields None → a silent no-op, never a recycled-slot misfire.
         if let Some(f) = f {
             if recording {
