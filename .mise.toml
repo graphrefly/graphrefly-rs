@@ -7,11 +7,6 @@
 [tools]
 rust = "1.95"
 
-# Python-binding tooling (only needed when working on graphrefly-bindings-py).
-# Uncomment when M6 binding work begins.
-# python = "3.13"
-# uv = "0.5"
-
 [env]
 # Disable cargo's default incremental compilation in CI for smaller artifacts.
 # Local dev uses CARGO_INCREMENTAL=1 (cargo's default).

@@ -8,9 +8,7 @@ kernels and talk to a Rust graph through the wire bridge, never in process.
 
 ## Python
 
-Python writes its own kernel (graphrefly:D800). The former binding crate,
-`crates/graphrefly-bindings-py`, is outside the workspace and is removed once the
-Python kernel merges.
+Python owns its independent kernel (graphrefly:D800).
 
 ## Optional runtime features
 

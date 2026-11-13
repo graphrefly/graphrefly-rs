@@ -5,10 +5,7 @@
 # (D#), formal model, and conformance scenarios live there — that repo wins on
 # any disagreement. See crates/graphrefly/CLEAN-SLATE.md for the CSP-5 scope map.
 #
-# The workspace is the one Rust package. graphrefly:D800 superseded D415: Python
-# writes its own kernel, so the Python binding below is excluded and is removed
-# once the Python branch merges. The old port-model crate directories have been
-# deleted; use git history for archaeology.
+# The workspace contains the Rust package. Python owns its independent kernel.
 # =============================================================================
 
 [workspace]
@@ -16,13 +13,6 @@ resolver = "2"
 members  = [
     "crates/graphrefly",
 ]
-# graphrefly:D800: Python writes its own kernel and builds against graphrefly-rs
-# cf02fc9 until then. The binding gets no new work and is out of the workspace
-# build; the crate is removed once Python no longer imports graphrefly._native.
-exclude  = [
-    "crates/graphrefly-bindings-py",
-]
-
 [workspace.package]
 edition      = "2021"
 rust-version = "1.95"

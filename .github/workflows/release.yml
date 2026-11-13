@@ -45,9 +45,6 @@
 #   4. (Optional) GitHub Environment "release" with branch + reviewer
 #      protection. The job below references it; remove the
 #      `environment:` line if you don't want this.
-#
-# The Python binding crate is excluded — it is marked `publish = false` in
-# its Cargo.toml and release-plz.toml mirrors that setting.
 
 name: Release-plz
 

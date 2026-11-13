@@ -8,7 +8,6 @@ Cargo package `graphrefly-rs`, library crate `graphrefly`.
 | Path | Contents |
 |---|---|
 | [crates/graphrefly/](crates/graphrefly/) | Rust package, source and examples |
-| [crates/graphrefly-bindings-py/](crates/graphrefly-bindings-py/) | Former Python binding, outside the workspace; removed once the Python kernel merges (graphrefly:D800) |
 | [docs/](docs/README.md) | Documentation map, architecture and development |
 | [website/](website/) | Package-local site and rustdoc integration |
 
