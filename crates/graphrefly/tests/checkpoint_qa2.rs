@@ -405,31 +405,41 @@ fn checkpoint_rejects_reserved_names_recursively_before_recipe_execution() {
     let base = capture(manual());
     for nested in [false, true] {
         for field in ["id", "name", "mount"] {
-            let mut cp = base.clone();
-            if field == "mount" {
-                cp.mounts = Some(vec![GraphCheckpointMount {
-                    at: "bad::mount".into(),
-                    checkpoint: base.clone(),
-                }]);
-            } else if field == "id" {
-                cp.nodes[0].id = "bad::node".into();
-            } else {
-                cp.nodes[0].name = Some("bad::name".into());
+            for invalid in ["bad::name", ":a", "a:", ":"] {
+                let mut cp = base.clone();
+                if field == "mount" {
+                    cp.mounts = Some(vec![GraphCheckpointMount {
+                        at: invalid.into(),
+                        checkpoint: base.clone(),
+                    }]);
+                } else if field == "id" {
+                    cp.nodes[0].id = invalid.into();
+                } else {
+                    cp.nodes[0].name = Some(invalid.into());
+                }
+                if nested {
+                    let mut parent = base.clone();
+                    parent.mounts = Some(vec![GraphCheckpointMount {
+                        at: "child".into(),
+                        checkpoint: cp,
+                    }]);
+                    cp = parent;
+                }
+                let calls = Rc::new(Cell::new(0));
+                let error =
+                    restore_graph(cp, RestoreGraphOptions::new(registry(calls.clone(), false)))
+                        .err()
+                        .unwrap();
+                assert_eq!(
+                    error.to_string(),
+                    if invalid.contains("::") {
+                        "name must not contain '::'"
+                    } else {
+                        "name must not start or end with ':'"
+                    }
+                );
+                assert_eq!(calls.get(), 0);
             }
-            if nested {
-                let mut parent = base.clone();
-                parent.mounts = Some(vec![GraphCheckpointMount {
-                    at: "child".into(),
-                    checkpoint: cp,
-                }]);
-                cp = parent;
-            }
-            let calls = Rc::new(Cell::new(0));
-            let error = restore_graph(cp, RestoreGraphOptions::new(registry(calls.clone(), false)))
-                .err()
-                .unwrap();
-            assert_eq!(error.to_string(), "name must not contain '::'");
-            assert_eq!(calls.get(), 0);
         }
     }
 }

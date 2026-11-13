@@ -62,3 +62,37 @@ fn every_local_name_boundary_rejects_mount_separator_without_registration() {
         Some(7)
     );
 }
+
+#[test]
+fn boundary_colons_fail_but_internal_colon_addresses_round_trip() {
+    for name in [":a", "a:", ":"] {
+        let g = graph();
+        for kind in ["node", "mount", "group"] {
+            let failure = catch_unwind(AssertUnwindSafe(|| match kind {
+                "node" => {
+                    g.state_opts(1, GraphNodeOpts::named(name));
+                }
+                "mount" => topology::mount(&g, graph(), name),
+                _ => {
+                    topology::group_opts(&g, TopologyGroupOptions::named(name));
+                }
+            }))
+            .unwrap_err();
+            let text = failure
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| failure.downcast_ref::<&str>().copied())
+                .unwrap();
+            assert_eq!(text, "name must not start or end with ':'");
+            assert!(g.describe().is_empty());
+        }
+    }
+    let parent = graph();
+    let child = graph();
+    child.state_opts(7, GraphNodeOpts::named("a:b"));
+    topology::mount(&parent, child, "c:d");
+    assert_eq!(
+        parent.find("c:d::a:b").unwrap().as_node::<i32>().cache(),
+        Some(7)
+    );
+}

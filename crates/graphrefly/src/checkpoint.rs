@@ -1521,8 +1521,12 @@ fn prepare_checkpoint(
     }
     let mut nodes = BTreeMap::new();
     for node in &checkpoint.nodes {
-        if node.id.contains("::") || node.name.as_ref().is_some_and(|name| name.contains("::")) {
-            return Err(GraphRestoreError::new(crate::graph::INVALID_LOCAL_NAME));
+        if let Some(error) = crate::graph::local_name_error(&node.id).or_else(|| {
+            node.name
+                .as_deref()
+                .and_then(crate::graph::local_name_error)
+        }) {
+            return Err(GraphRestoreError::new(error));
         }
         if nodes.contains_key(&node.id) {
             return Err(GraphRestoreError::new(format!(
@@ -1613,8 +1617,8 @@ fn prepare_checkpoint(
     let mut mount_paths = BTreeSet::new();
     let mut mounts = Vec::new();
     for mount in checkpoint.mounts.clone().unwrap_or_default() {
-        if mount.at.contains("::") {
-            return Err(GraphRestoreError::new(crate::graph::INVALID_LOCAL_NAME));
+        if let Some(error) = crate::graph::local_name_error(&mount.at) {
+            return Err(GraphRestoreError::new(error));
         }
         if mount.at.is_empty() {
             return Err(GraphRestoreError::new(format!(

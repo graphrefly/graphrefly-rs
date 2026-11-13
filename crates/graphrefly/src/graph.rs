@@ -20,8 +20,20 @@ use crate::protocol::{AnyValue, Message};
 
 pub(crate) const INVALID_LOCAL_NAME: &str = "name must not contain '::'";
 
-fn assert_local_name(name: &str) {
-    assert!(!name.contains("::"), "{INVALID_LOCAL_NAME}");
+pub(crate) fn local_name_error(name: &str) -> Option<&'static str> {
+    if name.contains("::") {
+        Some(INVALID_LOCAL_NAME)
+    } else if name.starts_with(':') || name.ends_with(':') {
+        Some("name must not start or end with ':'")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn assert_local_name(name: &str) {
+    if let Some(error) = local_name_error(name) {
+        panic!("{error}");
+    }
 }
 
 /// Graph construction options.
