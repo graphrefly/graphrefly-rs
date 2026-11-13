@@ -333,7 +333,8 @@ pub fn websocket_session_with_options(
     let name = opts
         .name
         .clone()
-        .unwrap_or_else(|| "websocketSession".to_owned());
+        .unwrap_or_else(|| graph.module_name("webSocketSession"));
+    crate::graph::assert_local_name(&name);
     validate_websocket_session_send_policy(&opts.send_policy);
     let command = graph
         .state_empty_opts::<WebSocketSessionCommand>(GraphNodeOpts::named(format!(
@@ -345,6 +346,9 @@ pub fn websocket_session_with_options(
         &command,
         request,
         name.clone(),
+        opts.name
+            .clone()
+            .unwrap_or_else(|| "websocketSession".to_owned()),
         opts.retry.clone(),
         opts.send_policy.clone(),
     );
@@ -364,11 +368,11 @@ fn websocket_session_events(
     graph: &Graph,
     command: &Node<WebSocketSessionCommand>,
     request: WebSocketRequest,
+    events_name: String,
     name: String,
     policy: RetryPolicy,
     send_policy: WebSocketSessionSendPolicy,
 ) -> Node<WebSocketSessionEvent> {
-    let events_name = name.clone();
     graph.node_opts::<WebSocketSessionEvent, _>(
         vec![command.erased()],
         move |ctx| {
@@ -1263,7 +1267,11 @@ where
     T: Clone + 'static,
     F: Fn(&T) -> HttpRequest + 'static,
 {
-    let name = opts.name.clone().unwrap_or_else(|| "toHttp".to_owned());
+    let name = opts
+        .name
+        .clone()
+        .unwrap_or_else(|| graph.module_name("toHttp"));
+    crate::graph::assert_local_name(&name);
     let request_of = Rc::new(request_of);
     let events = outbound_node(graph, source, name.clone(), opts.retry, move |ctx| {
         let driver = ctx.environment().http_driver()?;
@@ -1298,7 +1306,11 @@ where
     T: Clone + 'static,
     F: Fn(&T) -> ProcessCommand + 'static,
 {
-    let name = opts.name.clone().unwrap_or_else(|| "toProcess".to_owned());
+    let name = opts
+        .name
+        .clone()
+        .unwrap_or_else(|| graph.module_name("toProcess"));
+    crate::graph::assert_local_name(&name);
     let command_of = Rc::new(command_of);
     let events = outbound_node(graph, source, name.clone(), opts.retry, move |ctx| {
         let driver = ctx.environment().process_driver()?;
@@ -1344,7 +1356,8 @@ where
     let name = opts
         .name
         .clone()
-        .unwrap_or_else(|| "toWebSocket".to_owned());
+        .unwrap_or_else(|| graph.module_name("toWebSocket"));
+    crate::graph::assert_local_name(&name);
     let request = Rc::new(request);
     let send_of = Rc::new(send_of);
     let events = outbound_node(graph, source, name.clone(), opts.retry, move |ctx| {

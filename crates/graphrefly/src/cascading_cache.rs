@@ -164,7 +164,8 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
         meta,
     } = opts;
 
-    let base_name = name.unwrap_or_else(|| "reactiveCascadingCache".to_owned());
+    let base_name = name.unwrap_or_else(|| graph.module_name("reactiveCascadingCache"));
+    crate::graph::assert_local_name(&base_name);
     let mut event_deps = vec![request.erased()];
     let policy_index = policy.as_ref().map(|node| {
         event_deps.push(node.erased());
@@ -177,7 +178,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
 
     let ledger = crate::ledger::Ledger::new(
         graph,
-        format!("{base_name}.ledger"),
+        format!("{base_name}/ledger"),
         serde_json::to_value(DriverState::default()).unwrap_or_default(),
     );
     let mut event_deps = event_deps;
@@ -259,7 +260,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
             }
         },
         GraphNodeOpts {
-            name: Some(format!("{base_name}.events")),
+            name: Some(format!("{base_name}/events")),
             meta: meta.clone(),
             node: crate::ledger::write_back_json(NodeOpts::default()),
             ..GraphNodeOpts::default()
@@ -328,7 +329,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
             ctx.state_set(st);
         },
         GraphNodeOpts {
-            name: Some(format!("{base_name}.status")),
+            name: Some(format!("{base_name}/status")),
             meta: meta.clone(),
             node: NodeOpts {
                 ..NodeOpts::default()
@@ -376,7 +377,7 @@ pub fn reactive_cascading_cache<V: Clone + 'static>(
             ctx.state_set(st);
         },
         GraphNodeOpts {
-            name: Some(format!("{base_name}.value")),
+            name: Some(format!("{base_name}/value")),
             meta,
             node: NodeOpts {
                 ..NodeOpts::default()

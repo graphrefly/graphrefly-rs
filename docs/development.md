@@ -199,7 +199,7 @@ GRAPHREFLY_SPEC_ROOT=../graphrefly/spec cargo run -p graphrefly-rs --example d79
 ```
 
 It compares the actual trace against the root `d797-rereview.v1.json` fixture.
-CI checks out authority commit `4771691460538cd387197571d930128abdac90a2`
+CI checks out authority commit `f2e23490bafe94745f720da3ced5f0fff6fccd65`
 and runs both the behavior probe and its `--reasons` mode. A missing fixture is a
 hard error. This shared probe does not replace D687 qualification.
 
@@ -214,3 +214,7 @@ or other unknown graph-level fields are refused, including mounted checkpoints.
 Restore creates a cold graph; explicitly retain the required runtime nodes before
 sending commands. Dependency views are borrowed only for setup/function invocation;
 `Ctx::defer()` keeps output, state, rewire and signal capabilities for later work.
+
+## Module naming checks
+
+[Node and module names](node-naming.md) records the R-naming migration, exact errors, collision cases and shared inventory probe. Run `mise exec -- cargo test -p graphrefly-rs --test naming` with the root fixture available.

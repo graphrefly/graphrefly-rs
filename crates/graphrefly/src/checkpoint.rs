@@ -820,7 +820,7 @@ impl GraphRestoreDescriptor for CollectionSnapshotRequestRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        collection_existing_definition(ctx, self.0, ".snapshotRequest")
+        collection_existing_definition(ctx, self.0, "/request")
     }
 }
 
@@ -834,7 +834,7 @@ impl GraphRestoreDescriptor for ReactiveListDeltaRestoreDescriptor {
         collection_delta_definition(
             ctx,
             "reactiveList.delta",
-            ".delta",
+            "/delta",
             true,
             move |graph: &Graph, base: String, node: &GraphCheckpointNode| {
                 let state = backend_array(node, "reactiveList.delta")?;
@@ -863,7 +863,7 @@ impl GraphRestoreDescriptor for ReactiveListSnapshotRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        collection_existing_definition(ctx, "reactiveList.snapshot", ".snapshot")
+        collection_existing_definition(ctx, "reactiveList.snapshot", "/snapshot")
     }
 }
 
@@ -877,7 +877,7 @@ impl GraphRestoreDescriptor for ReactiveLogDeltaRestoreDescriptor {
         collection_delta_definition(
             ctx,
             "reactiveLog.delta",
-            ".delta",
+            "/delta",
             true,
             move |graph: &Graph, base: String, node: &GraphCheckpointNode| {
                 let state = backend_array(node, "reactiveLog.delta")?;
@@ -908,7 +908,7 @@ impl GraphRestoreDescriptor for ReactiveLogSnapshotRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        collection_existing_definition(ctx, "reactiveLog.snapshot", ".snapshot")
+        collection_existing_definition(ctx, "reactiveLog.snapshot", "/snapshot")
     }
 }
 
@@ -921,7 +921,7 @@ impl GraphRestoreDescriptor for ReactiveMapDeltaRestoreDescriptor {
         collection_delta_definition(
             ctx,
             "reactiveMap.delta",
-            ".delta",
+            "/delta",
             false,
             |graph: &Graph, base: String, node: &GraphCheckpointNode| {
                 let collection =
@@ -942,7 +942,7 @@ impl GraphRestoreDescriptor for ReactiveMapSnapshotRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        collection_existing_definition(ctx, "reactiveMap.snapshot", ".snapshot")
+        collection_existing_definition(ctx, "reactiveMap.snapshot", "/snapshot")
     }
 }
 
@@ -955,7 +955,7 @@ impl GraphRestoreDescriptor for ReactiveIndexDeltaRestoreDescriptor {
         collection_delta_definition(
             ctx,
             "reactiveIndex.delta",
-            ".delta",
+            "/delta",
             false,
             |graph: &Graph, base: String, node: &GraphCheckpointNode| {
                 let collection = crate::data_structures::reactive_index::<
@@ -979,7 +979,7 @@ impl GraphRestoreDescriptor for ReactiveIndexSnapshotRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        collection_existing_definition(ctx, "reactiveIndex.snapshot", ".snapshot")
+        collection_existing_definition(ctx, "reactiveIndex.snapshot", "/snapshot")
     }
 }
 

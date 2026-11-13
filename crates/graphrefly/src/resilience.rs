@@ -209,6 +209,7 @@ pub fn retry_status_node(
     name: impl Into<String>,
 ) -> Node<RetryStatus> {
     let name = name.into();
+    crate::graph::assert_local_name(&name);
     graph.node_opts::<RetryStatus, _>(
         vec![events.erased()],
         move |ctx| {
@@ -276,6 +277,7 @@ pub fn breaker_status_node(
         "breaker_status_node: failure_threshold must be > 0"
     );
     let name = name.into();
+    crate::graph::assert_local_name(&name);
     graph.node_opts::<BreakerStatus, _>(
         vec![events.erased()],
         move |ctx| {
@@ -327,6 +329,7 @@ where
     assert!(max > 0, "rate_limit_bundle: max must be > 0");
     assert!(window_ms > 0, "rate_limit_bundle: window_ms must be > 0");
     let name = name.into();
+    crate::graph::assert_local_name(&name);
     let events = graph.node_opts::<RateLimitEvent<T>, _>(
         vec![source.erased()],
         move |ctx| {
@@ -425,6 +428,7 @@ where
     T: Clone + 'static,
 {
     let name = name.into();
+    crate::graph::assert_local_name(&name);
     let node = timeout(source, ms);
     let status = graph.node_opts::<TimeoutStatus, _>(
         vec![node.erased()],

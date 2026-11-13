@@ -172,6 +172,7 @@ pub fn process_work_queue_recipe<TEffect: Clone + 'static>(
     opts: ProcessWorkQueueRecipeOptions<TEffect>,
 ) -> ProcessWorkQueueRecipeBundle<TEffect> {
     let name = opts.name.clone();
+    crate::graph::assert_local_name(&name);
     let submit_commands = opts.effect_requests.as_ref().map(|effect_requests| {
         process_effect_submit_commands(
             graph,

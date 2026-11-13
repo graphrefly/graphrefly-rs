@@ -863,6 +863,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         let projection_name = name
             .map(Into::into)
             .unwrap_or_else(|| format!("{}/available", self.name));
+        crate::graph::assert_local_name(&projection_name);
         let available_request = self.request_state::<WorkQueueAvailableParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<WorkQueueAvailablePage<T>, _>(
@@ -899,6 +900,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         let projection_name = name
             .map(Into::into)
             .unwrap_or_else(|| format!("{}/{work_id}", self.name));
+        crate::graph::assert_local_name(&projection_name);
         let snapshot_request = self.request_state::<()>(&projection_name);
         let state = self.state.clone();
         let work_id_for_fn = work_id.clone();
@@ -933,6 +935,7 @@ impl<T: Clone + 'static> WorkQueue<T> {
         let projection_name = name
             .map(Into::into)
             .unwrap_or_else(|| format!("{}/deadLetter", self.name));
+        crate::graph::assert_local_name(&projection_name);
         let snapshot_request = self.request_state::<WorkQueueDeadLetterParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<WorkQueueDeadLetterPage<T>, _>(
@@ -1060,6 +1063,7 @@ pub fn work_queue<T: Clone + 'static>(graph: &Graph, opts: WorkQueueOptions<T>) 
             .clone()
             .unwrap_or_else(|| format!("workQueue/{}", opts.queue_id)),
     );
+    crate::graph::assert_local_name(&name);
     let topic = Rc::new(opts.topic.clone());
     let admission = opts.bus.subscription(
         MessageBusSubscriptionOptions::new(opts.topic.clone(), opts.subscription_id.clone())

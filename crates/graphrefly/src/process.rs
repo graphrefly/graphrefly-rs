@@ -658,6 +658,7 @@ pub fn process_bundle<
         "process_bundle: name must be non-empty"
     );
     let name = opts.name;
+    crate::graph::assert_local_name(&name);
     let reduce = opts.reduce;
     let now = opts.now;
     let command_sources = crate::fan_in::FanInSources::new();
@@ -755,7 +756,7 @@ pub fn process_bundle<
         runtime_projection::<TCommand, TState, TEvent, TEffect, ProcessEffectRequest<TEffect>>(
             graph,
             &runtime,
-            &format!("{name}/effect_request"),
+            &format!("{name}/effectRequests"),
             "processEffectRequest",
             |fact| match fact {
                 ProcessRuntimeFact::EffectRequest(effect) => Some(effect.clone()),
@@ -775,7 +776,7 @@ pub fn process_bundle<
     let error = runtime_projection::<TCommand, TState, TEvent, TEffect, ProcessError<TCommand>>(
         graph,
         &runtime,
-        &format!("{name}/error"),
+        &format!("{name}/errors"),
         "processError",
         |fact| match fact {
             ProcessRuntimeFact::Error(error) => Some(error.clone()),
@@ -839,6 +840,7 @@ where
         "process_effect_runner: outcomes must contain at least one node"
     );
     let name = opts.name;
+    crate::graph::assert_local_name(&name);
     let command_payload = opts.command_payload;
 
     let requests = graph.init_node::<ProcessEffectRequest<TEffect>>(

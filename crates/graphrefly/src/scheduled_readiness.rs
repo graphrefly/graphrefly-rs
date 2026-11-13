@@ -205,7 +205,8 @@ pub fn scheduled_readiness_projector(
     let name = opts
         .name
         .clone()
-        .unwrap_or_else(|| "scheduledReadiness".to_owned());
+        .unwrap_or_else(|| graph.module_name("scheduledReadiness"));
+    crate::graph::assert_local_name(&name);
     let schedule_count = opts.schedules.len();
     let mut deps = Vec::with_capacity(opts.schedules.len() + opts.clocks.len());
     deps.extend(opts.schedules.iter().map(Node::erased));

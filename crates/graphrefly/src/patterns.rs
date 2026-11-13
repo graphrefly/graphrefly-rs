@@ -661,7 +661,10 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
     graph: &Graph,
     opts: MemoryRetrievalBundleOptions<T>,
 ) -> MemoryRetrievalBundle<T> {
-    let name = opts.name.unwrap_or_else(|| "memoryRetrieval".to_owned());
+    let name = opts
+        .name
+        .unwrap_or_else(|| graph.module_name("memoryRetrieval"));
+    crate::graph::assert_local_name(&name);
     let fragments = opts.fragments;
     let query = opts.query;
     // The evaluation cursor is a ledger the bundle owns (review Q13).
@@ -840,7 +843,10 @@ pub fn knowledge_graph_reducer_bundle(
     graph: &Graph,
     opts: KnowledgeGraphReducerBundleOptions,
 ) -> KnowledgeGraphReducerBundle {
-    let name = opts.name.unwrap_or_else(|| "knowledgeGraph".to_owned());
+    let name = opts
+        .name
+        .unwrap_or_else(|| graph.module_name("knowledgeGraph"));
+    crate::graph::assert_local_name(&name);
     let assertions = opts.assertions;
     let policy = opts.policy;
     let mut deps = vec![assertions.erased()];

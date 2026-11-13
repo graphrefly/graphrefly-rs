@@ -283,15 +283,20 @@ fn persist_agentic_memory_records_with_cursor(
         .name
         .clone()
         .or_else(|| options.storage_prefix.clone())
-        .unwrap_or_else(|| "agenticMemoryRecords.persistence".to_owned());
+        .unwrap_or_else(|| graph.module_name("agenticMemoryRecords/persistence"));
+    crate::graph::assert_local_name(&prefix);
     let snapshot_key = options
         .snapshot_key
         .clone()
         .unwrap_or(agentic_memory_records_snapshot_key(
-            options.storage_prefix.as_deref().unwrap_or(&prefix),
+            options
+                .storage_prefix
+                .as_deref()
+                .or(options.name.as_deref())
+                .unwrap_or("agenticMemoryRecords.persistence"),
         )?);
     let ready = graph
-        .state_opts(false, GraphNodeOpts::named(format!("{prefix}.ready")))
+        .state_opts(false, GraphNodeOpts::named(format!("{prefix}/ready")))
         .into_node();
     let status = graph
         .state_opts(
@@ -301,16 +306,16 @@ fn persist_agentic_memory_records_with_cursor(
                 0,
                 cursor_json(initial_change_seq, 0, 0),
             ),
-            GraphNodeOpts::named(format!("{prefix}.status")),
+            GraphNodeOpts::named(format!("{prefix}/status")),
         )
         .into_node();
     let error = graph
-        .state_opts(Value::Null, GraphNodeOpts::named(format!("{prefix}.error")))
+        .state_opts(Value::Null, GraphNodeOpts::named(format!("{prefix}/error")))
         .into_node();
     let cursor = graph
         .state_opts(
             cursor_json(initial_change_seq, 0, 0),
-            GraphNodeOpts::named(format!("{prefix}.cursor")),
+            GraphNodeOpts::named(format!("{prefix}/cursor")),
         )
         .into_node();
     let latest = Rc::new(RefCell::new(records.cache().unwrap_or_default()));

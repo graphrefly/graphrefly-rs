@@ -159,6 +159,7 @@ macro_rules! command_messaging_recipe {
             opts: $MessagingRecipeOptions<TPayload, TCommand, TEvent>,
         ) -> $MessagingRecipeBundle<TCommand, TEvent> {
             let name = opts.name.clone();
+            crate::graph::assert_local_name(&name);
             let policy = opts.policy.clone();
             let runtime = graph.node_opts::<$MessagingFact<TCommand>, _>(
                 vec![opts.deliveries.erased()],
@@ -246,6 +247,7 @@ macro_rules! command_messaging_recipe {
             graph: &Graph,
             opts: $MessageAckOptions<TCommand>,
         ) -> Node<MessageBusCommand<TCommand>> {
+            crate::graph::assert_local_name(&opts.name);
             let mut deps = vec![opts.delivered_commands.erased(), opts.status.erased()];
             if let Some(issues) = &opts.issues {
                 deps.push(issues.erased());

@@ -509,11 +509,22 @@ where
         .name
         .clone()
         .or_else(|| options.storage_prefix.clone())
-        .unwrap_or_else(|| "reactiveCollection.persistence".to_owned());
-    let ready = persistence_fact(graph, format!("{fact_prefix}.ready"), false);
+        .unwrap_or_else(|| {
+            graph.module_name(&format!(
+                "{}/persistence",
+                match kind {
+                    ReactiveCollectionKind::ReactiveList => "reactiveList",
+                    ReactiveCollectionKind::ReactiveLog => "reactiveLog",
+                    ReactiveCollectionKind::ReactiveMap => "reactiveMap",
+                    ReactiveCollectionKind::ReactiveIndex => "reactiveIndex",
+                }
+            ))
+        });
+    crate::graph::assert_local_name(&fact_prefix);
+    let ready = persistence_fact(graph, format!("{fact_prefix}/ready"), false);
     let status = persistence_fact(
         graph,
-        format!("{fact_prefix}.status"),
+        format!("{fact_prefix}/status"),
         status_json(
             ReactiveCollectionPersistenceStatus::Starting,
             0,
@@ -521,10 +532,10 @@ where
             cursor_json(kind, initial_cursor, 0, 0),
         ),
     );
-    let error = persistence_fact(graph, format!("{fact_prefix}.error"), Value::Null);
+    let error = persistence_fact(graph, format!("{fact_prefix}/error"), Value::Null);
     let cursor = persistence_fact(
         graph,
-        format!("{fact_prefix}.cursor"),
+        format!("{fact_prefix}/cursor"),
         cursor_json(kind, initial_cursor, 0, 0),
     );
 

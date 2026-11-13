@@ -522,7 +522,7 @@ fn public_crate_root_agentic_memory_csp10_acceptance() {
     assert!(described
         .edges()
         .iter()
-        .any(|edge| edge.from == "memory/context" && edge.to == "packing/snapshot"));
+        .any(|edge| edge.from == "memory/context" && edge.to == "packing/projection"));
 
     records.set(vec![record(
         "near-updated",
@@ -727,20 +727,20 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     );
     let with_view = graphrefly::topology::snapshot(&g);
     assert!(with_view.nodes.iter().any(|node| {
-        node.id == "acceptance/items.select#0.delta" && node.factory == "reactiveMap.select.delta"
+        node.id == "acceptance/items/select0/delta" && node.factory == "reactiveMap.select.delta"
     }));
     assert!(with_view.edges().iter().any(|edge| {
-        edge.from == "acceptance/items.delta" && edge.to == "acceptance/items.select#0.delta"
+        edge.from == "acceptance/items/delta" && edge.to == "acceptance/items/select0/delta"
     }));
     assert!(graphrefly::topology::profile(&g)
         .nodes
-        .contains_key("acceptance/items.select#0.delta"));
+        .contains_key("acceptance/items/select0/delta"));
     assert!(g
         .checkpoint()
         .unwrap()
         .nodes
         .iter()
-        .any(|node| node.id == "acceptance/items.select#0.snapshot"));
+        .any(|node| node.id == "acceptance/items/select0/snapshot"));
 
     unsubscribe_selected_snapshot();
     selected.dispose();
@@ -748,13 +748,13 @@ fn public_crate_root_b70_b71_composition_and_reactive_view_acceptance() {
     let dispose_diff = graphrefly::topology::diff(&with_view, &after_dispose);
     assert!(dispose_diff.events.iter().any(|event| matches!(
         event,
-        DescribeEvent::NodeRemoved { id } if id == "acceptance/items.select#0.delta"
+        DescribeEvent::NodeRemoved { id } if id == "acceptance/items/select0/delta"
     )));
     assert!(dispose_diff.events.iter().any(|event| matches!(
         event,
-        DescribeEvent::NodeRemoved { id } if id == "acceptance/items.select#0.snapshot"
+        DescribeEvent::NodeRemoved { id } if id == "acceptance/items/select0/snapshot"
     )));
-    assert!(g.find("acceptance/items.select#0.delta").is_none());
+    assert!(g.find("acceptance/items/select0/delta").is_none());
 }
 
 #[test]

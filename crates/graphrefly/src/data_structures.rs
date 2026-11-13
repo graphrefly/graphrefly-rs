@@ -232,10 +232,6 @@ impl<T: Clone> ListBackend<T> {
         self.buf.borrow().clone()
     }
 
-    fn instance_token(&self) -> usize {
-        Rc::as_ptr(&self.buf) as usize
-    }
-
     fn len(&self) -> usize {
         self.buf.borrow().len()
     }
@@ -355,10 +351,6 @@ impl<K: Clone + Ord, S: Clone + Ord, V: Clone> IndexBackend<K, S, V> {
         self.version.set(self.version.get().wrapping_add(1));
     }
 
-    fn instance_token(&self) -> usize {
-        Rc::as_ptr(&self.rows) as usize
-    }
-
     fn len(&self) -> usize {
         self.rows.borrow().len()
     }
@@ -460,10 +452,6 @@ impl<K: Clone + Ord, V: Clone> MapBackend<K, V> {
         self.version.set(self.version.get().wrapping_add(1));
     }
 
-    fn instance_token(&self) -> usize {
-        Rc::as_ptr(&self.rows) as usize
-    }
-
     fn len(&self) -> usize {
         self.rows.borrow().len()
     }
@@ -543,10 +531,6 @@ impl<T: Clone> LogBackend<T> {
 
     fn snapshot(&self) -> Vec<T> {
         self.buf.borrow().clone()
-    }
-
-    fn instance_token(&self) -> usize {
-        Rc::as_ptr(&self.buf) as usize
     }
 
     fn len(&self) -> usize {
@@ -635,11 +619,11 @@ impl<T: Clone + 'static> ReactiveList<T> {
             panic!("reactive_list: max_size must be a positive integer");
         }
         let backend = ListBackend::new(initial, options.max_size);
-        let token = backend.instance_token();
         let id_prefix = options
             .name
             .clone()
-            .unwrap_or_else(|| format!("reactiveList@{token:x}"));
+            .unwrap_or_else(|| graph.module_name("reactiveList"));
+        crate::graph::assert_local_name(&id_prefix);
         let restorable = options.name.is_some();
         let delta = make_delta_node::<T>(graph, &id_prefix, restorable, options.max_size);
         if restorable {
@@ -758,7 +742,7 @@ impl<T: Clone + 'static> ReactiveList<T> {
                 }
             },
         );
-        let mut opts = GraphNodeOpts::named(format!("{}.bind#{bind_idx}", self.id_prefix));
+        let mut opts = GraphNodeOpts::named(format!("{}/bind{bind_idx}", self.id_prefix));
         opts.meta
             .insert("kind".to_owned(), "collection_bind_source".to_owned());
         opts.meta
@@ -873,11 +857,11 @@ where
         options: ReactiveIndexOptions,
     ) -> Self {
         let backend = IndexBackend::new(initial);
-        let token = backend.instance_token();
         let id_prefix = options
             .name
             .clone()
-            .unwrap_or_else(|| format!("reactiveIndex@{token:x}"));
+            .unwrap_or_else(|| graph.module_name("reactiveIndex"));
+        crate::graph::assert_local_name(&id_prefix);
         let restorable = options.name.is_some();
         let delta = make_index_delta_node::<K, S, V>(graph, &id_prefix, restorable);
         if restorable {
@@ -989,7 +973,7 @@ where
         let name = Some({
             let next = self.range_seq.get();
             self.range_seq.set(next + 1);
-            format!("{}.range#{next}", self.id_prefix)
+            format!("{}/range{next}", self.id_prefix)
         });
         let backend = self.backend.clone();
         let materialize = move || backend.range_by_primary(&start, &end);
@@ -1040,11 +1024,11 @@ where
 
     pub fn new(graph: &Graph, initial: Vec<(K, V)>, options: ReactiveMapOptions) -> Self {
         let backend = MapBackend::new(initial);
-        let token = backend.instance_token();
         let id_prefix = options
             .name
             .clone()
-            .unwrap_or_else(|| format!("reactiveMap@{token:x}"));
+            .unwrap_or_else(|| graph.module_name("reactiveMap"));
+        crate::graph::assert_local_name(&id_prefix);
         let restorable = options.name.is_some();
         let delta = make_map_delta_node::<K, V>(graph, &id_prefix, restorable);
         if restorable {
@@ -1160,7 +1144,7 @@ where
         let name = Some({
             let next = self.select_seq.get();
             self.select_seq.set(next + 1);
-            format!("{}.select#{next}", self.id_prefix)
+            format!("{}/select{next}", self.id_prefix)
         });
         let backend = self.backend.clone();
         let materialize_predicate = predicate.clone();
@@ -1235,11 +1219,11 @@ impl<T: Clone + 'static> ReactiveLog<T> {
             panic!("reactive_log: max_size must be a positive integer");
         }
         let backend = LogBackend::new(initial, options.max_size);
-        let token = backend.instance_token();
         let id_prefix = options
             .name
             .clone()
-            .unwrap_or_else(|| format!("reactiveLog@{token:x}"));
+            .unwrap_or_else(|| graph.module_name("reactiveLog"));
+        crate::graph::assert_local_name(&id_prefix);
         let restorable = options.name.is_some();
         let delta = make_log_delta_node::<T>(graph, &id_prefix, restorable, options.max_size);
         if restorable {
@@ -1328,7 +1312,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 ctx.emit(all[start..].to_vec());
             }),
             vec![self.delta.erased()],
-            GraphNodeOpts::default(),
+            GraphNodeOpts::named(self.graph.module_name(&format!("{}/tail", self.id_prefix))),
         )
     }
 
@@ -1342,7 +1326,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 ctx.emit(all[start..end].to_vec());
             }),
             vec![self.delta.erased()],
-            GraphNodeOpts::default(),
+            GraphNodeOpts::named(self.graph.module_name(&format!("{}/slice", self.id_prefix))),
         )
     }
 
@@ -1359,7 +1343,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         let name = Some({
             let next = self.page_seq.get();
             self.page_seq.set(next + 1);
-            format!("{}.page#{next}", self.id_prefix)
+            format!("{}/page{next}", self.id_prefix)
         });
         let backend = self.backend.clone();
         let materialize = move || {
@@ -1441,7 +1425,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 ctx.emit(out);
             }),
             vec![self.delta.erased()],
-            GraphNodeOpts::default(),
+            GraphNodeOpts::named(self.graph.module_name(&format!("{}/scan", self.id_prefix))),
         )
     }
 
@@ -1465,7 +1449,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 }
             },
         );
-        let mut opts = GraphNodeOpts::named(format!("{}.bind#{bind_idx}", self.id_prefix));
+        let mut opts = GraphNodeOpts::named(format!("{}/bind{bind_idx}", self.id_prefix));
         opts.meta
             .insert("kind".to_owned(), "collection_bind_source".to_owned());
         opts.meta
@@ -1647,7 +1631,7 @@ pub fn merge_reactive_logs<T: Clone + 'static>(
             ctx.down(crate::protocol::data_wave(emitted));
         }),
         deps,
-        GraphNodeOpts::default(),
+        GraphNodeOpts::named(graph.module_name("mergedLogs")),
     )
 }
 
@@ -1900,7 +1884,7 @@ fn make_map_snapshot_node<K: Clone + Ord + 'static, V: Clone + 'static>(
 }
 
 fn node_name(prefix: &str, suffix: &str) -> String {
-    format!("{prefix}.{suffix}")
+    format!("{prefix}/{suffix}")
 }
 
 /// The request state a collection snapshot declares as its dependency
@@ -1913,7 +1897,7 @@ fn make_snapshot_request_node(
 ) -> State<()> {
     let request = graph.state_empty_opts(collection_node_opts(
         id_prefix,
-        "snapshotRequest",
+        "request",
         "collection_snapshot_request",
         restore_ref,
         restorable,
@@ -2108,7 +2092,7 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
     );
     let delta = {
         let mut opts =
-            graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}.delta")));
+            graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}/delta")));
         opts.meta
             .insert("kind".to_owned(), "collection_view_delta".to_owned());
         opts.meta
@@ -2116,9 +2100,8 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
         group.init_node(delta_op, vec![parent_delta.erased()], opts)
     };
     let snapshot_request: State<()> = {
-        let mut opts = graph_node_opts_with_optional_name(
-            name.as_ref().map(|n| format!("{n}.snapshotRequest")),
-        );
+        let mut opts =
+            graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}/request")));
         opts.meta.insert(
             "kind".to_owned(),
             "collection_view_snapshot_request".to_owned(),
@@ -2143,7 +2126,7 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
     let snapshot_deps = vec![delta.erased(), snapshot_request.erased()];
     let snapshot = {
         let mut opts =
-            graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}.snapshot")));
+            graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}/snapshot")));
         opts.meta
             .insert("kind".to_owned(), "collection_view_snapshot".to_owned());
         opts.meta

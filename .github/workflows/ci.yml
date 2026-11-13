@@ -77,7 +77,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: graphrefly/graphrefly
-          ref: 4771691460538cd387197571d930128abdac90a2
+          ref: f2e23490bafe94745f720da3ced5f0fff6fccd65
           path: graphrefly-authority
 
       # nextest `ci` profile: `default-filter = "all()"`, so every test runs
@@ -94,6 +94,7 @@ jobs:
         run: |
           cargo run -p graphrefly-rs --example d797_rereview_probe
           cargo run -p graphrefly-rs --example d797_rereview_probe -- --reasons
+          cargo run -p graphrefly-rs --example node_naming_probe
         env:
           GRAPHREFLY_SPEC_ROOT: ${{ github.workspace }}/graphrefly-authority/spec
           RUSTFLAGS: "-D warnings"

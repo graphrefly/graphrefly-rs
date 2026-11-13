@@ -791,7 +791,11 @@ where
         !opts.session_id.is_empty(),
         "wire_bridge: session_id must be non-empty"
     );
-    let name = opts.name.clone().unwrap_or_else(|| "wireBridge".to_owned());
+    let name = opts
+        .name
+        .clone()
+        .unwrap_or_else(|| graph.module_name("wireBridge"));
+    crate::graph::assert_local_name(&name);
     // The command and inbound inputs are states: the bundle's methods and the host
     // write commands and received envelopes into them, and a writer elsewhere does so
     // from a sink, as a request (graphrefly:D803).
@@ -860,6 +864,7 @@ where
     TResponse: Clone + 'static,
 {
     let name = opts.name;
+    crate::graph::assert_local_name(&name);
     let timeouts = graph
         .state_empty_opts::<RemoteCallTimeout>(GraphNodeOpts::named(format!("{name}/timeouts")))
         .into_node();
@@ -896,6 +901,7 @@ where
     TResponse: Clone + 'static,
 {
     let name = opts.name;
+    crate::graph::assert_local_name(&name);
     let reject_unknown = opts.reject_unknown;
     let handlers = Rc::new(normalize_remote_handlers(opts.handlers));
     let events = remote_responder_events_node(graph, bridge, &name, handlers, reject_unknown);

@@ -4878,7 +4878,7 @@ fn replacing_a_collection_helper_removes_its_checkpoint_exemption() {
     let snapshot = saved
         .nodes
         .iter()
-        .find(|n| n.id == "list.snapshot")
+        .find(|n| n.id == "list/snapshot")
         .unwrap();
     assert_eq!(snapshot.values, vec![serde_json::json!(42)]);
 }

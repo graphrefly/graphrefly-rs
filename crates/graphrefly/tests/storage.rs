@@ -1325,10 +1325,10 @@ fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(by_id["list.delta"].private_state, Some(json!([1, 2])));
-    assert!(by_id["list.snapshot"].values.is_empty());
+    assert_eq!(by_id["list/delta"].private_state, Some(json!([1, 2])));
+    assert!(by_id["list/snapshot"].values.is_empty());
     assert_eq!(
-        by_id["list.snapshot"].private_state, None,
+        by_id["list/snapshot"].private_state, None,
         "collection helper private state is a non-authoritative derived cache"
     );
 
@@ -1336,7 +1336,7 @@ fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
     stale
         .nodes
         .iter_mut()
-        .find(|node| node.id == "list.snapshot")
+        .find(|node| node.id == "list/snapshot")
         .expect("snapshot node exists")
         .values = vec![json!(["stale"])];
     let restored = restore_graph(stale, RestoreGraphOptions::new(default_restore_registry()))
@@ -1345,7 +1345,7 @@ fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
     let restored_delta = restored_checkpoint
         .nodes
         .iter()
-        .find(|node| node.id == "list.delta")
+        .find(|node| node.id == "list/delta")
         .expect("restored delta exists");
     assert_eq!(restored_delta.private_state, Some(json!([1, 2])));
 
@@ -1363,10 +1363,10 @@ fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
-    assert!(view_by_id["map.select#0.delta"].values.is_empty());
-    assert!(view_by_id["map.select#0.snapshot"].values.is_empty());
+    assert!(view_by_id["map/select0/delta"].values.is_empty());
+    assert!(view_by_id["map/select0/snapshot"].values.is_empty());
     assert_eq!(
-        view_by_id["map.select#0.snapshot"].private_state, None,
+        view_by_id["map/select0/snapshot"].private_state, None,
         "collection light-view helper caches are also non-authoritative"
     );
 }
@@ -1382,7 +1382,7 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
     let err = unsupported.checkpoint().unwrap_err();
     assert!(
         err.to_string()
-            .starts_with("not restorable: unsupported.delta: its private state is not JSON"),
+            .starts_with("not restorable: unsupported/delta: its private state is not JSON"),
         "unsupported host-ish backend values are refused, not widened implicitly: {err}"
     );
 
@@ -1396,7 +1396,7 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
     let capped = checkpoint
         .nodes
         .iter()
-        .find(|node| node.id == "capped.delta")
+        .find(|node| node.id == "capped/delta")
         .expect("capped list delta exists");
     // A capped list carries its maxSize in its recipe, as a capped log does.
     assert!(matches!(
@@ -1409,7 +1409,7 @@ fn collection_checkpoint_fails_honestly_for_unsupported_backend_and_policy_state
         graphrefly::RestoreGraphOptions::new(graphrefly::default_restore_registry()),
     )
     .expect("a capped list restores");
-    assert!(restored.find("capped.delta").is_some());
+    assert!(restored.find("capped/delta").is_some());
 }
 
 #[test]
@@ -1428,9 +1428,9 @@ fn capped_reactive_log_checkpoint_restores_with_max_size_config() {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(by_id["log.delta"].private_state, Some(json!([3, 4])));
+    assert_eq!(by_id["log/delta"].private_state, Some(json!([3, 4])));
     assert!(matches!(
-        &by_id["log.delta"].factory,
+        &by_id["log/delta"].factory,
         GraphCheckpointFactory::RegistryRef { config, .. }
             if config.as_ref().is_some_and(|value| value == &json!({ "maxSize": 2 }))
     ));
@@ -1444,7 +1444,7 @@ fn capped_reactive_log_checkpoint_restores_with_max_size_config() {
     let restored_log = restored_checkpoint
         .nodes
         .iter()
-        .find(|node| node.id == "log.delta")
+        .find(|node| node.id == "log/delta")
         .expect("restored log delta exists");
     assert_eq!(restored_log.private_state, Some(json!([3, 4])));
 }
@@ -2999,29 +2999,29 @@ fn reactive_cascading_cache_exposes_visible_topology_and_default_no_promotion() 
     assert_eq!(
         ids,
         vec![
-            "cache.events",
-            "cache.ledger",
-            "cache.status",
-            "cache.value",
+            "cache/events",
+            "cache/ledger",
+            "cache/status",
+            "cache/value",
             "request"
         ]
     );
     // The request sequence is a ledger the bundle owns (review Q13).
     assert!(snap.edges().contains(&graphrefly::TopologyEdge {
-        from: "cache.ledger".to_owned(),
-        to: "cache.events".to_owned(),
+        from: "cache/ledger".to_owned(),
+        to: "cache/events".to_owned(),
     }));
     assert!(snap.edges().contains(&graphrefly::TopologyEdge {
         from: "request".to_owned(),
-        to: "cache.events".to_owned(),
+        to: "cache/events".to_owned(),
     }));
     assert!(snap.edges().contains(&graphrefly::TopologyEdge {
-        from: "cache.events".to_owned(),
-        to: "cache.status".to_owned(),
+        from: "cache/events".to_owned(),
+        to: "cache/status".to_owned(),
     }));
     assert!(snap.edges().contains(&graphrefly::TopologyEdge {
-        from: "cache.events".to_owned(),
-        to: "cache.value".to_owned(),
+        from: "cache/events".to_owned(),
+        to: "cache/value".to_owned(),
     }));
 
     assert_eq!(*values.borrow(), vec![7]);

@@ -265,7 +265,8 @@ pub fn work_queue_scheduled_readiness_projector<T: Clone + 'static>(
     let name = opts
         .name
         .clone()
-        .unwrap_or_else(|| "workQueueScheduledReadiness".to_owned());
+        .unwrap_or_else(|| graph.module_name("workQueueScheduledReadiness"));
+    crate::graph::assert_local_name(&name);
     let mut deps = opts.records.iter().map(Node::erased).collect::<Vec<_>>();
     let dep_count = opts.records.len();
     let ledger = crate::ledger::Ledger::new(
@@ -379,7 +380,8 @@ pub fn work_queue_readiness_handoff_projector<T: Clone + 'static>(
     let name = opts
         .name
         .clone()
-        .unwrap_or_else(|| "workQueueReadinessHandoff".to_owned());
+        .unwrap_or_else(|| graph.module_name("workQueueReadinessHandoff"));
+    crate::graph::assert_local_name(&name);
     let record_count = opts.records.len();
     let ready_start = record_count;
     let overdue_start = ready_start + opts.ready.len();
@@ -510,7 +512,8 @@ pub fn work_queue_lease_expiration_command_projector<T: Clone + 'static>(
     let name = opts
         .name
         .clone()
-        .unwrap_or_else(|| "workQueueLeaseExpirationCommands".to_owned());
+        .unwrap_or_else(|| graph.module_name("workQueueLeaseExpirationCommands"));
+    crate::graph::assert_local_name(&name);
     let prefix = opts
         .command_prefix
         .clone()

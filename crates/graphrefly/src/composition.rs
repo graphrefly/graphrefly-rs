@@ -117,8 +117,18 @@ where
     R: Clone + 'static,
     F: Fn(&R, &T) -> bool + 'static,
 {
+    crate::graph::assert_local_name(&opts.prefix);
+    if let Some(name) = &opts.rules.name {
+        crate::graph::assert_local_name(name);
+    }
+    for options in opts.branches.values() {
+        if let Some(name) = &options.name {
+            crate::graph::assert_local_name(name);
+        }
+    }
     let mut seen = BTreeSet::new();
     for rule in &rules {
+        crate::graph::assert_local_name(&rule.name);
         assert!(
             seen.insert(rule.name.clone()),
             "stratify: duplicate rule name '{}'",
@@ -153,7 +163,7 @@ where
         );
         let mut branch_opts = opts.branches.get(&rule.name).cloned().unwrap_or_default();
         if branch_opts.name.is_none() {
-            branch_opts.name = Some(format!("{}/{}", opts.prefix, rule.name));
+            branch_opts.name = Some(format!("{}/branches/{}", opts.prefix, rule.name));
         }
         for (key, value) in rule.meta {
             branch_opts.meta.entry(key).or_insert(value);

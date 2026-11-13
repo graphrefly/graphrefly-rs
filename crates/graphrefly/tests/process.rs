@@ -241,7 +241,7 @@ fn process_bundle_topology_is_describe_visible_with_declared_deps() {
     let process_effect = snap
         .nodes
         .iter()
-        .find(|node| node.id == "process/effect_request")
+        .find(|node| node.id == "process/effectRequests")
         .unwrap();
     assert_eq!(process_command.factory, "processCommand");
     assert_eq!(process_runtime.deps, vec!["process/command"]);
@@ -515,7 +515,7 @@ fn process_effect_runner_projects_result_commands_through_declared_process_edge(
     assert!(snap
         .edges()
         .iter()
-        .any(|edge| edge.from == "order/effect_request" && edge.to == "notify/requests"));
+        .any(|edge| edge.from == "order/effectRequests" && edge.to == "notify/requests"));
     assert!(snap
         .edges()
         .iter()

@@ -891,6 +891,7 @@ impl<T: Clone + 'static> MessageBus<T> {
 
     pub fn with_options(graph: &Graph, opts: MessageBusOptions) -> Self {
         let name = Rc::new(opts.name);
+        crate::graph::assert_local_name(&name);
         // The input rewires itself to the attached command sources (graphrefly-rs:D8).
         let command_sources = crate::fan_in::FanInSources::new();
         let mut commands_opts = node_opts(format!("{name}/commands"), "messageBusCommands");
@@ -1050,9 +1051,12 @@ impl<T: Clone + 'static> MessageBus<T> {
     ) -> MessageBusTopicProjection<T> {
         let topic = topic.into();
         assert_topic_key(&topic, "messageBus.topic");
-        let projection_name = name
-            .map(Into::into)
-            .unwrap_or_else(|| format!("{}/{topic}/topic", self.name));
+        let projection_name = name.map(Into::into).unwrap_or_else(|| {
+            crate::graph::assert_local_name(&topic);
+            self.graph
+                .module_name(&format!("{}/topics/{topic}", self.name))
+        });
+        crate::graph::assert_local_name(&projection_name);
         let snapshot_request = self.request_state::<MessageBusTopicParams>(&projection_name);
         let state = self.state.clone();
         let topic_for_fn = topic.clone();
@@ -1084,7 +1088,8 @@ impl<T: Clone + 'static> MessageBus<T> {
     ) -> MessageBusProjection<MessageBusCatalogPage, MessageBusCatalogParams> {
         let projection_name = name
             .map(Into::into)
-            .unwrap_or_else(|| format!("{}/catalog", self.name));
+            .unwrap_or_else(|| self.graph.module_name(&format!("{}/catalog", self.name)));
+        crate::graph::assert_local_name(&projection_name);
         let snapshot_request = self.request_state::<MessageBusCatalogParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<MessageBusCatalogPage, _>(
@@ -1117,7 +1122,8 @@ impl<T: Clone + 'static> MessageBus<T> {
     ) -> MessageBusProjection<MessageBusDeadLetterPage<T>, MessageBusDeadLetterParams> {
         let projection_name = name
             .map(Into::into)
-            .unwrap_or_else(|| format!("{}/deadLetter", self.name));
+            .unwrap_or_else(|| self.graph.module_name(&format!("{}/deadLetter", self.name)));
+        crate::graph::assert_local_name(&projection_name);
         let snapshot_request = self.request_state::<MessageBusDeadLetterParams>(&projection_name);
         let state = self.state.clone();
         let snapshot = self.graph.node_opts::<MessageBusDeadLetterPage<T>, _>(
@@ -1145,11 +1151,16 @@ impl<T: Clone + 'static> MessageBus<T> {
     pub fn subscription(&self, opts: MessageBusSubscriptionOptions) -> MessageBusSubscription<T> {
         assert_topic_key(&opts.topic, "messageBus.subscription");
         assert_non_empty(&opts.subscription_id, "messageBus.subscriptionId");
+        let projection_name = opts.name.clone().unwrap_or_else(|| {
+            crate::graph::assert_local_name(&opts.topic);
+            crate::graph::assert_local_name(&opts.subscription_id);
+            self.graph.module_name(&format!(
+                "{}/subscriptions/{}/{}",
+                self.name, opts.topic, opts.subscription_id
+            ))
+        });
+        crate::graph::assert_local_name(&projection_name);
         let (sub, opened, issue) = ensure_subscription(&mut self.state.borrow_mut(), &opts);
-        let projection_name = opts
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("{}/{}/{}", self.name, opts.topic, opts.subscription_id));
         let available_request = self
             .request_state::<MessageBusAvailableParams>(&format!("{projection_name}/available"));
         let available_state = self.state.clone();

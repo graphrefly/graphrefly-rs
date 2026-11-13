@@ -312,6 +312,7 @@ pub fn cqrs_with_options<TCommand: Clone + 'static, TEvent: Clone + 'static>(
     opts: CqrsOptions<TCommand, TEvent>,
 ) -> CqrsBundle<TCommand, TEvent> {
     let name = opts.name;
+    crate::graph::assert_local_name(&name);
     let handlers = Rc::new(normalize_handlers(opts.handlers));
     let known_events = Rc::new(normalize_events(opts.events));
     let now = opts.now;
@@ -499,6 +500,7 @@ pub fn cqrs_projection<TState: Clone + 'static, TEvent: Clone + 'static>(
     opts: CqrsProjectionOptions<TState, TEvent>,
 ) -> CqrsProjection<TState> {
     let name = opts.name;
+    crate::graph::assert_local_name(&name);
     let event_filter = Rc::new(normalize_events(opts.events));
     let reducer = opts.reducer;
     let initial = opts.initial;

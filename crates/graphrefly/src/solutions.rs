@@ -733,7 +733,10 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
     graph: &Graph,
     opts: AgenticMemoryBundleOptions<T>,
 ) -> AgenticMemoryBundle<T> {
-    let name = opts.name.unwrap_or_else(|| "agenticMemory".to_owned());
+    let name = opts
+        .name
+        .unwrap_or_else(|| graph.module_name("agenticMemory"));
+    crate::graph::assert_local_name(&name);
     let records = opts.records;
     let query = opts.query;
     // The evaluation cursor is a ledger the bundle owns (review Q13).
@@ -931,7 +934,8 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
 ) -> AgenticMemoryKgProjectionBundle<T> {
     let name = opts
         .name
-        .unwrap_or_else(|| "agenticMemoryKgProjection".to_owned());
+        .unwrap_or_else(|| graph.module_name("agenticMemoryKgProjection"));
+    crate::graph::assert_local_name(&name);
     let records = opts.records;
     let drafts = opts.drafts;
     // The evaluation cursor is a ledger the bundle owns (review Q13).
@@ -1074,7 +1078,7 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(format!("{name}/snapshot")),
+        named_solution_node_opts(name.clone()),
     );
 
     AgenticMemoryKgProjectionBundle {
@@ -1118,7 +1122,8 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
 ) -> AgenticMemoryRetentionBundle<T> {
     let name = opts
         .name
-        .unwrap_or_else(|| "agenticMemoryRetention".to_owned());
+        .unwrap_or_else(|| graph.module_name("agenticMemoryRetention"));
+    crate::graph::assert_local_name(&name);
     let records = opts.records;
     let commands = opts.commands;
     // The evaluation cursor is a ledger the bundle owns (review Q13).
@@ -1259,7 +1264,7 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(format!("{name}/snapshot")),
+        named_solution_node_opts(format!("{name}/projection")),
     );
 
     AgenticMemoryRetentionBundle {
@@ -1268,21 +1273,21 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
         active_records: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/active_records"),
+            format!("{name}/activeRecords"),
             "agenticMemoryActiveRecords",
             |snapshot: &AgenticMemoryRetentionSnapshot<T>| snapshot.active_records.clone(),
         ),
         archived_records: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/archived_records"),
+            format!("{name}/archivedRecords"),
             "agenticMemoryArchivedRecords",
             |snapshot: &AgenticMemoryRetentionSnapshot<T>| snapshot.archived_records.clone(),
         ),
         consolidation_requests: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/consolidation_requests"),
+            format!("{name}/requests"),
             "agenticMemoryConsolidationRequests",
             |snapshot: &AgenticMemoryRetentionSnapshot<T>| snapshot.consolidation_requests.clone(),
         ),
@@ -1317,7 +1322,8 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
 ) -> AgenticMemoryConsolidationBundle<T> {
     let name = opts
         .name
-        .unwrap_or_else(|| "agenticMemoryConsolidation".to_owned());
+        .unwrap_or_else(|| graph.module_name("agenticMemoryConsolidation"));
+    crate::graph::assert_local_name(&name);
     let requests = opts.requests;
     let outcomes = opts.outcomes;
     // The evaluation cursor is a ledger the bundle owns (review Q13).
@@ -1400,7 +1406,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(format!("{name}/snapshot")),
+        named_solution_node_opts(format!("{name}/projection")),
     );
     AgenticMemoryConsolidationBundle {
         requests_input: requests,
@@ -1415,7 +1421,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
         proposed_record_drafts: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/proposed_record_drafts"),
+            format!("{name}/drafts"),
             "agenticMemoryConsolidationRecordDrafts",
             |snapshot: &AgenticMemoryConsolidationSnapshot<T>| {
                 snapshot.proposed_record_drafts.clone()
@@ -1459,7 +1465,8 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
 ) -> AgenticMemoryContextPackingBundle<T> {
     let name = opts
         .name
-        .unwrap_or_else(|| "agenticMemoryContextPacking".to_owned());
+        .unwrap_or_else(|| graph.module_name("agenticMemoryPacking"));
+    crate::graph::assert_local_name(&name);
     let context = opts.context;
     let texts = opts.texts;
     let policy = opts.policy;
@@ -1523,7 +1530,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(format!("{name}/snapshot")),
+        named_solution_node_opts(format!("{name}/projection")),
     );
 
     AgenticMemoryContextPackingBundle {
@@ -1533,7 +1540,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
         packed_context: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/packed_context"),
+            format!("{name}/context"),
             "agenticMemoryPackedContext",
             |snapshot: &AgenticMemoryContextPackingSnapshot| snapshot.packed_context.clone(),
         ),

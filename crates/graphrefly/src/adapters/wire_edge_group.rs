@@ -293,7 +293,7 @@ pub fn frame_source(
 }
 
 /// The receiver side of group `group`: the gate `name` over `frames`, an inbound node
-/// `{name}/{edge}` per declared edge and the issues node `{name}.issues`.
+/// `{name}/edges/{edge}` per declared edge and the issues node `{name}/issues`.
 pub fn wire_edge_group_in(
     graph: &Graph,
     name: impl Into<String>,
@@ -303,6 +303,10 @@ pub fn wire_edge_group_in(
 ) -> WireEdgeGroupIn {
     let name = name.into();
     let group = group.into();
+    crate::graph::assert_local_name(&name);
+    for edge in edges {
+        crate::graph::assert_local_name(edge);
+    }
     let declared: BTreeSet<String> = edges.iter().map(|e| (*e).to_owned()).collect();
     let gate = graph.node_opts::<WireEdgeGateValue, _>(
         vec![frames.erased()],
@@ -315,7 +319,7 @@ pub fn wire_edge_group_in(
             let node = graph.node_opts::<Vec<u8>, _>(
                 vec![gate.erased()],
                 inbound_fn((*edge).to_owned()),
-                manual_opts(&format!("{name}/{edge}"), false),
+                manual_opts(&format!("{name}/edges/{edge}"), false),
             );
             ((*edge).to_owned(), node)
         })
@@ -323,7 +327,7 @@ pub fn wire_edge_group_in(
     let issues = graph.node_opts::<WireEdgeIssue, _>(
         vec![gate.erased()],
         issues_fn,
-        manual_opts(&format!("{name}.issues"), false),
+        manual_opts(&format!("{name}/issues"), false),
     );
     WireEdgeGroupIn {
         gate,

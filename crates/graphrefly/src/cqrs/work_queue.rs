@@ -199,6 +199,7 @@ pub fn cqrs_work_queue_recipe<TCommand: Clone + 'static>(
     opts: CqrsWorkQueueRecipeOptions<TCommand>,
 ) -> CqrsWorkQueueRecipeBundle<TCommand> {
     let name = opts.name.clone();
+    crate::graph::assert_local_name(&name);
     let mut deps = vec![opts.records.erased(), opts.status.erased()];
     if let Some(errors) = &opts.errors {
         deps.push(errors.erased());

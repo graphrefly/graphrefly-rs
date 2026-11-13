@@ -196,7 +196,7 @@ fn stratify_builds_static_named_branches_with_metadata() {
     let even_node = snap
         .nodes
         .iter()
-        .find(|node| node.id == "topic/even")
+        .find(|node| node.id == "topic/branches/even")
         .unwrap();
     assert_eq!(even_node.factory, "stratifyBranch");
     assert_eq!(
@@ -206,7 +206,7 @@ fn stratify_builds_static_named_branches_with_metadata() {
     let odd_node = snap
         .nodes
         .iter()
-        .find(|node| node.id == "topic/odd")
+        .find(|node| node.id == "topic/branches/odd")
         .unwrap();
     assert_eq!(
         odd_node.meta.as_ref().and_then(|meta| meta.get("priority")),
@@ -214,11 +214,11 @@ fn stratify_builds_static_named_branches_with_metadata() {
     );
     assert!(snap.edges().contains(&TopologyEdge {
         from: "source".to_owned(),
-        to: "topic/even".to_owned(),
+        to: "topic/branches/even".to_owned(),
     }));
     assert!(snap.edges().contains(&TopologyEdge {
         from: "topic/rules".to_owned(),
-        to: "topic/odd".to_owned(),
+        to: "topic/branches/odd".to_owned(),
     }));
     assert_eq!(
         odd_node.deps,

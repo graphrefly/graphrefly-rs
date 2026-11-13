@@ -199,6 +199,7 @@ struct GraphInner {
     retired_ids: RefCell<HashSet<String>>,
     mounts: RefCell<Vec<Mount>>,
     seq: Cell<usize>,
+    module_names: RefCell<HashSet<String>>,
     clock: Rc<Cell<u64>>,
     topology_observers: RefCell<Vec<Option<TopologyObserverEntry>>>,
     topology_observer_active: Cell<usize>,
@@ -420,6 +421,7 @@ impl Graph {
                 retired_ids: RefCell::new(HashSet::new()),
                 mounts: RefCell::new(Vec::new()),
                 seq: Cell::new(0),
+                module_names: RefCell::new(HashSet::new()),
                 clock: Rc::new(Cell::new(0)),
                 topology_observers: RefCell::new(Vec::new()),
                 topology_observer_active: Cell::new(0),
@@ -428,6 +430,32 @@ impl Graph {
                 topology_queue: RefCell::new(VecDeque::new()),
             }),
         }
+    }
+
+    /// Allocate a module namespace without changing anonymous kernel ids.
+    pub(crate) fn module_name(&self, prefix: &str) -> String {
+        assert_local_name(prefix);
+        let mut names = self.inner.module_names.borrow_mut();
+        let registered = self.inner.by_id.borrow();
+        let retired = self.inner.retired_ids.borrow();
+        for index in 0usize.. {
+            let candidate = if index == 0 {
+                prefix.to_owned()
+            } else {
+                format!("{prefix}{index}")
+            };
+            let namespace = format!("{candidate}/");
+            let occupied = names.contains(&candidate)
+                || registered
+                    .keys()
+                    .chain(retired.iter())
+                    .any(|id| id == &candidate || id.starts_with(&namespace));
+            if !occupied {
+                names.insert(candidate.clone());
+                return candidate;
+            }
+        }
+        unreachable!("the graph cannot exhaust usize module names")
     }
 
     /// Look up a registered graph node by stable id.
