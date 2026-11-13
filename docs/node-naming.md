@@ -2,7 +2,7 @@
 
 The current language-neutral contract is [R-naming](../../graphrefly/spec/rules.jsonl), introduced by graphrefly:D809. `::` crosses a mounted graph boundary; `/` joins module roles inside one graph. Local node IDs/names, group names and mount paths reject `::` and leading/trailing `:` before registration or restore recipes run. The exact errors are `name must not contain '::'` and `name must not start or end with ':'`; the first takes precedence. An internal single colon, such as `tenant:item`, remains a legal user label.
 
-Fixed module segments use lower camelCase and a short role. Caller labels and payload keys are preserved. Storage keys (including the legacy agentic-memory persistence default), function names, recipe references, checkpoint format tags, and anonymous core `factory#N` IDs are unchanged. Generated names have no aliases or migration map. Collection checkpoints use the new role suffixes; old collection names are not accepted by their restore descriptors.
+Fixed module segments use lower camelCase and a short role. Caller labels and payload keys are preserved. Storage keys (including the legacy agentic-memory persistence default), function names, recipe references, checkpoint format tags, and anonymous core `factory#N` IDs are unchanged. Generated names have no aliases or migration map. Built-in collection restore descriptors require the new role suffixes and reject the previous dotted collection IDs. Generic custom recipes can still restore legal caller-authored dotted IDs; no blanket old-name rejection or migration is added.
 
 ## Naming migration map
 
