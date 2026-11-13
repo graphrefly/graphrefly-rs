@@ -14,4 +14,4 @@
 [Docs policy](docs.jsonl) owns maintenance. Shared public website records live in
 root [guide/](../../graphrefly/guide/guide.jsonl) and [website/](../../graphrefly/website/);
 root [docs/README.md](../../graphrefly/docs/README.md) is their navigation map.
-No archive/trash moves were needed. Existing local guides retain their ownership.
+Existing local guides retain their ownership.

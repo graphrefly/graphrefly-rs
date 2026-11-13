@@ -26,8 +26,6 @@ rust = "1.95"
 # nextest (never a `;`-chain), process-group teardown, bounded jobs +
 # RAM precheck, direct file log, self-timeout with a thrash-vs-deadlock
 # diagnostic. Never hand-launch `;`-chained cargo in the background.
-# Rationale: ~/src/graphrefly-ts/docs/test-guidance.md § "Running the
-# full Rust gate / diagnosing a stuck run".
 
 [tasks.gate]
 description = "FULL gate: fmt --check + clippy + nextest --profile ci (incl. cascade_depth). The only sanctioned long-gate runner."
@@ -44,8 +42,6 @@ run = "scripts/gate.sh core"
 # terminal sentinel a monitor greps, process-group teardown, self-timeout
 # with a macOS-correct thrash/lock diagnostic. gate.sh sources it.
 # Usage: `mise run run-logged -- cargo build --release`
-# Rationale: ~/src/graphrefly-ts/docs/test-guidance.md § "Running long
-# commands reliably / diagnosing a stuck run".
 
 [tasks.run-logged]
 description = "Run ANY long command with a direct log + guaranteed terminal sentinel + self-timeout diagnostic. Usage: mise run run-logged -- <cmd>"

@@ -38,11 +38,6 @@
 # failure, timeout and signal — so a monitor can NEVER false-hang on the
 # gate either.
 #
-# See `~/src/graphrefly-ts/docs/test-guidance.md` § "Running long commands
-# reliably / diagnosing a stuck run" and memory feedback
-# `feedback_no_chained_background_cargo.md` for the full rationale + the
-# thrash-vs-deadlock signature table.
-#
 # ─── Usage ──────────────────────────────────────────────────────────────────
 #   scripts/gate.sh                 # FULL gate: fmt --check, clippy,
 #                                   #   `cargo nextest run --profile ci`

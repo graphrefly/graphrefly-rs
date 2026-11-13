@@ -76,8 +76,7 @@
 set -u
 
 # The ONE token a monitor greps. Guaranteed on every terminal path, emitted
-# to stdout AND the log. Do not change without updating test-guidance.md and
-# every monitor that depends on it.
+# to stdout AND the log. Every monitor depends on this token.
 RL_SENTINEL_TOKEN='<<<RUN-LOGGED:DONE>>>'
 
 RL_TAG="${RUN_TAG:-run-logged}"
