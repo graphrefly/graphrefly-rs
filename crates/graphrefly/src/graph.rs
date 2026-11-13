@@ -18,6 +18,12 @@ use crate::node::{Core, GraphArena, Node, NodeOpts, State, Status};
 use crate::operators::Operator;
 use crate::protocol::{AnyValue, Message};
 
+pub(crate) const INVALID_LOCAL_NAME: &str = "name must not contain '::'";
+
+fn assert_local_name(name: &str) {
+    assert!(!name.contains("::"), "{INVALID_LOCAL_NAME}");
+}
+
 /// Graph construction options.
 #[derive(Clone, Default)]
 pub struct GraphOptions {
@@ -213,6 +219,9 @@ pub struct TopologyGroup {
 
 impl TopologyGroup {
     fn new(graph: Graph, opts: TopologyGroupOptions) -> Self {
+        if let Some(name) = &opts.name {
+            assert_local_name(name);
+        }
         Self {
             inner: Rc::new(TopologyGroupInner {
                 graph,
@@ -826,6 +835,10 @@ impl Graph {
         id: String,
         opts: GraphNodeOpts,
     ) -> Node<T> {
+        assert_local_name(&id);
+        if let Some(name) = &opts.name {
+            assert_local_name(name);
+        }
         assert!(
             node.erased().same_graph_arena(&self.inner.arena),
             "graph node belongs to a different graph arena"
@@ -2039,6 +2052,7 @@ pub mod topology {
     /// Mount a child graph under a stable `::` path prefix.
     pub fn mount(graph: &Graph, child: Graph, at: impl Into<String>) {
         let at = at.into();
+        assert_local_name(&at);
         assert!(!at.is_empty(), "mount path must not be empty");
         assert!(
             !child.contains_graph(graph),

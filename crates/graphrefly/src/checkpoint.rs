@@ -1063,7 +1063,7 @@ pub fn restore_graph(
     checkpoint: GraphCheckpoint,
     options: RestoreGraphOptions,
 ) -> RestoreResult<Graph> {
-    let prepared = prepare_checkpoint(&checkpoint, &options.registry, "checkpoint", None)?;
+    let prepared = prepare_checkpoint(&checkpoint, &options.registry, "checkpoint")?;
     construct_prepared(&prepared, &options)
 }
 
@@ -1513,7 +1513,6 @@ fn prepare_checkpoint(
     checkpoint: &GraphCheckpoint,
     registry: &GraphRestoreRegistry,
     path: &str,
-    mount_at: Option<&str>,
 ) -> RestoreResult<PreparedCheckpoint> {
     if checkpoint.version != GRAPH_CHECKPOINT_VERSION {
         return Err(GraphRestoreError::new(format!(
@@ -1522,21 +1521,14 @@ fn prepare_checkpoint(
     }
     let mut nodes = BTreeMap::new();
     for node in &checkpoint.nodes {
+        if node.id.contains("::") || node.name.as_ref().is_some_and(|name| name.contains("::")) {
+            return Err(GraphRestoreError::new(crate::graph::INVALID_LOCAL_NAME));
+        }
         if nodes.contains_key(&node.id) {
             return Err(GraphRestoreError::new(format!(
                 "restore_graph: duplicate node id '{}'",
                 node.id
             )));
-        }
-        if let Some(at) = mount_at {
-            let prefix = format!("{at}::");
-            if node.id.starts_with(&prefix) {
-                return Err(GraphRestoreError::new(format!(
-                    "restore_graph: mounted checkpoint at '{at}' must use child-local node id '{}', not '{}'",
-                    node.id.trim_start_matches(&prefix),
-                    node.id
-                )));
-            }
         }
         let descriptor = match &node.factory {
             GraphCheckpointFactory::LocalOnly { .. } => {
@@ -1621,6 +1613,9 @@ fn prepare_checkpoint(
     let mut mount_paths = BTreeSet::new();
     let mut mounts = Vec::new();
     for mount in checkpoint.mounts.clone().unwrap_or_default() {
+        if mount.at.contains("::") {
+            return Err(GraphRestoreError::new(crate::graph::INVALID_LOCAL_NAME));
+        }
         if mount.at.is_empty() {
             return Err(GraphRestoreError::new(format!(
                 "restore_graph: mount path at {path}.mounts[] must not be empty"
@@ -1638,7 +1633,6 @@ fn prepare_checkpoint(
                 &mount.checkpoint,
                 registry,
                 &format!("{path}.mounts.{}", mount.at),
-                Some(&mount.at),
             )?,
         ));
     }
