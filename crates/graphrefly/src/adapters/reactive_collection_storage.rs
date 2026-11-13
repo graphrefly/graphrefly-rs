@@ -509,17 +509,7 @@ where
         .name
         .clone()
         .or_else(|| options.storage_prefix.clone())
-        .unwrap_or_else(|| {
-            graph.module_name(&format!(
-                "{}/persistence",
-                match kind {
-                    ReactiveCollectionKind::ReactiveList => "reactiveList",
-                    ReactiveCollectionKind::ReactiveLog => "reactiveLog",
-                    ReactiveCollectionKind::ReactiveMap => "reactiveMap",
-                    ReactiveCollectionKind::ReactiveIndex => "reactiveIndex",
-                }
-            ))
-        });
+        .unwrap_or_else(|| graph.module_name("reactiveCollection/persistence"));
     crate::graph::assert_local_name(&fact_prefix);
     let ready = persistence_fact(graph, format!("{fact_prefix}/ready"), false);
     let status = persistence_fact(

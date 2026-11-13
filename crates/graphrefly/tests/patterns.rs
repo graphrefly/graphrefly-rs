@@ -945,11 +945,11 @@ fn agentic_memory_kg_projection_validates_drafts_and_exposes_topology() {
     assert!(described
         .edges()
         .iter()
-        .any(|edge| edge.from == "records" && edge.to == "kg"));
+        .any(|edge| edge.from == "records" && edge.to == "kg/snapshot"));
     assert!(described
         .edges()
         .iter()
-        .any(|edge| edge.from == "drafts" && edge.to == "kg"));
+        .any(|edge| edge.from == "drafts" && edge.to == "kg/snapshot"));
     assert!(described
         .nodes
         .iter()
@@ -1304,15 +1304,15 @@ fn agentic_memory_context_packing_is_deterministic_and_projection_only() {
     assert!(described
         .edges()
         .iter()
-        .any(|edge| edge.from == "memory/context" && edge.to == "packing/projection"));
+        .any(|edge| edge.from == "memory/context" && edge.to == "packing/snapshot"));
     assert!(described
         .edges()
         .iter()
-        .any(|edge| edge.from == "texts" && edge.to == "packing/projection"));
+        .any(|edge| edge.from == "texts" && edge.to == "packing/snapshot"));
     assert!(described
         .edges()
         .iter()
-        .any(|edge| edge.from == "policy" && edge.to == "packing/projection"));
+        .any(|edge| edge.from == "policy" && edge.to == "packing/snapshot"));
 
     let _packed = packing.packed_context.subscribe(|_| {});
     let _status = packing.status.subscribe(|_| {});

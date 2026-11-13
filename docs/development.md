@@ -199,7 +199,7 @@ GRAPHREFLY_SPEC_ROOT=../graphrefly/spec cargo run -p graphrefly-rs --example d79
 ```
 
 It compares the actual trace against the root `d797-rereview.v1.json` fixture.
-CI checks out authority commit `f2e23490bafe94745f720da3ced5f0fff6fccd65`
+CI pins the authority checkout in `.github/workflows/ci.yml`
 and runs both the behavior probe and its `--reasons` mode. A missing fixture is a
 hard error. This shared probe does not replace D687 qualification.
 
@@ -215,6 +215,8 @@ Restore creates a cold graph; explicitly retain the required runtime nodes befor
 sending commands. Dependency views are borrowed only for setup/function invocation;
 `Ctx::defer()` keeps output, state, rewire and signal capabilities for later work.
 
-## Module naming checks
+## Module names
 
-[Node and module names](node-naming.md) records the R-naming migration, exact errors, collision cases and shared inventory probe. Run `mise exec -- cargo test -p graphrefly-rs --test naming` with the root fixture available.
+Follow [R-naming@1](../../graphrefly/spec/rules.jsonl): module roles use `/` and lower camelCase; `::` separates mounted graphs. Local names reject `::` and leading/trailing `:`, while internal single colons remain legal.
+Generated scopes, bindings and views start with `base`, then `base1`, `base2`; retain semantic words and remove only repetition. Caller labels, payload identities and anonymous core IDs remain unchanged.
+The shared naming probe and `tests/naming.rs` check these boundaries; no old-name aliases or checkpoint-name migration are provided.

@@ -136,21 +136,47 @@ fn default_collections_and_dynamic_views_use_camel_case_names() {
     let g = graph();
     let source = input::<i32>(&g, "input");
     let list = reactive_list::<i32>(&g, vec![], ReactiveListOptions::default());
-    let _bind = list.append_from(&source);
+    let _binds: Vec<_> = (0..3).map(|_| list.append_from(&source)).collect();
     let log = reactive_log::<i32>(&g, vec![], ReactiveLogOptions::default());
-    let _bind = log.attach(&source);
-    let _ = log.page(0, 1);
+    let _log_binds: Vec<_> = (0..3).map(|_| log.attach(&source)).collect();
+    for offset in 0..3 {
+        let _ = log.page(offset, 1);
+        let _ = log.page(offset, 1); // A memo hit must not consume the next name.
+    }
     let _ = log.tail(1);
     let _ = log.tail(2);
     let _ = log.slice(0, None);
     let _ = log.scan(0, |acc, value| acc + value);
     let map = reactive_map::<String, i32>(&g, vec![], ReactiveMapOptions::default());
-    let _ = map.select(|_, _| true);
+    for _ in 0..3 {
+        let predicate = std::rc::Rc::new(|_: &i32, _: &String| true);
+        let _ = map.select_by(predicate.clone());
+        let _ = map.select_by(predicate); // Same predicate returns its memoized view.
+    }
     let index = reactive_index::<i32, String, i32>(&g, vec![], ReactiveIndexOptions::default());
-    let _ = index.range(0, 1);
+    for start in 0..3 {
+        let _ = index.range(start, start + 1);
+        let _ = index.range(start, start + 1);
+    }
     let _ = merge_reactive_logs(&g, vec![log]);
     scan_graph(&g);
-    assert!(g.find("reactiveList/request").is_some());
+    for (scope, role, child) in [
+        ("reactiveList", "bind", ""),
+        ("reactiveLog", "bind", ""),
+        ("reactiveLog", "page", "/snapshot"),
+        ("reactiveMap", "select", "/snapshot"),
+        ("reactiveIndex", "range", "/snapshot"),
+    ] {
+        for suffix in ["", "1", "2"] {
+            assert!(g.find(&format!("{scope}/{role}{suffix}{child}")).is_some());
+        }
+        assert!(g.find(&format!("{scope}/{role}0{child}")).is_none());
+    }
+    g.state_opts(0, GraphNodeOpts::named("reactiveList/bind3/occupied"));
+    let _collision_bind = list.append_from(&source);
+    assert!(g.find("reactiveList/bind4").is_some());
+    assert!(g.find("mergeReactiveLogs").is_some());
+    assert!(g.find("reactiveList/snapshotRequest").is_some());
     assert!(g.find("reactiveLog/tail1").is_some());
     let _other = reactive_list::<i32>(&g, vec![], ReactiveListOptions::default());
     assert!(g.find("reactiveList1/delta").is_some());
@@ -194,19 +220,13 @@ fn default_memory_modules_use_camel_case_role_names() {
         ),
     );
     scan_graph(&g);
-    for id in [
-        "agenticMemoryPacking/context",
-        "agenticMemoryPacking/projection",
-        "agenticMemoryRetention/projection",
-        "agenticMemoryConsolidation/projection",
-        "agenticMemoryKgProjection",
-        "memoryRetrieval/snapshot",
-        "knowledgeGraph/snapshot",
-    ] {
-        assert!(g.find(id).is_some(), "missing corresponding role {id}");
-    }
-    assert!(g.find("agenticMemoryConsolidation/drafts").is_some());
-    assert!(g.find("agenticMemoryRetention/requests").is_some());
+    assert!(g.find("agenticMemoryContextPacking/packed").is_some());
+    assert!(g
+        .find("agenticMemoryConsolidation/proposedRecordDrafts")
+        .is_some());
+    assert!(g
+        .find("agenticMemoryRetention/consolidationRequests")
+        .is_some());
 }
 
 #[test]
@@ -482,8 +502,8 @@ fn persistence_default_node_scopes_do_not_rename_storage_keys() {
         options.snapshot_key = Some(key.into());
         let _ = persist_reactive_list(&list, options).unwrap();
     }
-    assert!(g.find("reactiveList/persistence/ready").is_some());
-    assert!(g.find("reactiveList/persistence1/ready").is_some());
+    assert!(g.find("reactiveCollection/persistence/ready").is_some());
+    assert!(g.find("reactiveCollection/persistence1/ready").is_some());
     scan_graph(&g);
 }
 

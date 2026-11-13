@@ -1078,7 +1078,7 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(name.clone()),
+        named_solution_node_opts(format!("{name}/snapshot")),
     );
 
     AgenticMemoryKgProjectionBundle {
@@ -1264,7 +1264,7 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(format!("{name}/projection")),
+        named_solution_node_opts(format!("{name}/snapshot")),
     );
 
     AgenticMemoryRetentionBundle {
@@ -1287,7 +1287,7 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
         consolidation_requests: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/requests"),
+            format!("{name}/consolidationRequests"),
             "agenticMemoryConsolidationRequests",
             |snapshot: &AgenticMemoryRetentionSnapshot<T>| snapshot.consolidation_requests.clone(),
         ),
@@ -1406,7 +1406,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(format!("{name}/projection")),
+        named_solution_node_opts(format!("{name}/snapshot")),
     );
     AgenticMemoryConsolidationBundle {
         requests_input: requests,
@@ -1421,7 +1421,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
         proposed_record_drafts: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/drafts"),
+            format!("{name}/proposedRecordDrafts"),
             "agenticMemoryConsolidationRecordDrafts",
             |snapshot: &AgenticMemoryConsolidationSnapshot<T>| {
                 snapshot.proposed_record_drafts.clone()
@@ -1465,7 +1465,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
 ) -> AgenticMemoryContextPackingBundle<T> {
     let name = opts
         .name
-        .unwrap_or_else(|| graph.module_name("agenticMemoryPacking"));
+        .unwrap_or_else(|| graph.module_name("agenticMemoryContextPacking"));
     crate::graph::assert_local_name(&name);
     let context = opts.context;
     let texts = opts.texts;
@@ -1530,7 +1530,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
             deps.push(ledger.erased());
             deps
         },
-        named_solution_node_opts(format!("{name}/projection")),
+        named_solution_node_opts(format!("{name}/snapshot")),
     );
 
     AgenticMemoryContextPackingBundle {
@@ -1540,7 +1540,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
         packed_context: solution_projection(
             graph,
             &snapshot,
-            format!("{name}/context"),
+            format!("{name}/packed"),
             "agenticMemoryPackedContext",
             |snapshot: &AgenticMemoryContextPackingSnapshot| snapshot.packed_context.clone(),
         ),

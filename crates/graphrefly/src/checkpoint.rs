@@ -820,7 +820,7 @@ impl GraphRestoreDescriptor for CollectionSnapshotRequestRestoreDescriptor {
     }
 
     fn define(&self, ctx: RestoreDefineCtx<'_>) -> RestoreResult<RestoreNodeDefinition> {
-        collection_existing_definition(ctx, self.0, "/request")
+        collection_existing_definition(ctx, self.0, "/snapshotRequest")
     }
 }
 

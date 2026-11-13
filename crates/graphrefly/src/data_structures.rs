@@ -604,7 +604,6 @@ pub struct ReactiveList<T> {
     max_size: Option<usize>,
     graph: Graph,
     id_prefix: String,
-    bind_seq: Rc<Cell<usize>>,
     disposers: DisposerSlots,
 }
 
@@ -654,7 +653,6 @@ impl<T: Clone + 'static> ReactiveList<T> {
             max_size: options.max_size,
             graph: graph.clone(),
             id_prefix,
-            bind_seq: Rc::new(Cell::new(0)),
             disposers: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -723,8 +721,6 @@ impl<T: Clone + 'static> ReactiveList<T> {
 
     pub fn append_from(&self, src: &Node<T>) -> Disposer {
         let graph = &self.graph;
-        let bind_idx = self.bind_seq.get();
-        self.bind_seq.set(bind_idx + 1);
         let backend = self.backend.clone();
         let delta = self.delta.clone();
         let max_size = self.max_size;
@@ -742,7 +738,7 @@ impl<T: Clone + 'static> ReactiveList<T> {
                 }
             },
         );
-        let mut opts = GraphNodeOpts::named(format!("{}/bind{bind_idx}", self.id_prefix));
+        let mut opts = GraphNodeOpts::named(graph.module_name(&format!("{}/bind", self.id_prefix)));
         opts.meta
             .insert("kind".to_owned(), "collection_bind_source".to_owned());
         opts.meta
@@ -796,8 +792,6 @@ pub struct ReactiveLog<T> {
     backend: LogBackend<T>,
     graph: Graph,
     id_prefix: String,
-    bind_seq: Rc<Cell<usize>>,
-    page_seq: Rc<Cell<usize>>,
     page_memo: PageMemo<T>,
     disposers: DisposerSlots,
 }
@@ -822,7 +816,6 @@ pub struct ReactiveIndex<K, S, V> {
     backend: IndexBackend<K, S, V>,
     graph: Graph,
     id_prefix: String,
-    range_seq: Rc<Cell<usize>>,
     range_memo: IndexRangeMemo<K, S, V>,
 }
 
@@ -836,7 +829,6 @@ pub struct ReactiveMap<K, V> {
     backend: MapBackend<K, V>,
     graph: Graph,
     id_prefix: String,
-    select_seq: Rc<Cell<usize>>,
     select_memo: MapSelectMemo<K, V>,
 }
 
@@ -891,7 +883,6 @@ where
             backend,
             graph: graph.clone(),
             id_prefix,
-            range_seq: Rc::new(Cell::new(0)),
             range_memo: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -970,11 +961,7 @@ where
         {
             return view.clone();
         }
-        let name = Some({
-            let next = self.range_seq.get();
-            self.range_seq.set(next + 1);
-            format!("{}/range{next}", self.id_prefix)
-        });
+        let name = Some(self.graph.module_name(&format!("{}/range", self.id_prefix)));
         let backend = self.backend.clone();
         let materialize = move || backend.range_by_primary(&start, &end);
         let memo = self.range_memo.clone();
@@ -1058,7 +1045,6 @@ where
             backend,
             graph: graph.clone(),
             id_prefix,
-            select_seq: Rc::new(Cell::new(0)),
             select_memo: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -1141,11 +1127,10 @@ where
         {
             return view.clone();
         }
-        let name = Some({
-            let next = self.select_seq.get();
-            self.select_seq.set(next + 1);
-            format!("{}/select{next}", self.id_prefix)
-        });
+        let name = Some(
+            self.graph
+                .module_name(&format!("{}/select", self.id_prefix)),
+        );
         let backend = self.backend.clone();
         let materialize_predicate = predicate.clone();
         let materialize = move || backend.selected_snapshot(&materialize_predicate);
@@ -1253,8 +1238,6 @@ impl<T: Clone + 'static> ReactiveLog<T> {
             backend,
             graph: graph.clone(),
             id_prefix,
-            bind_seq: Rc::new(Cell::new(0)),
-            page_seq: Rc::new(Cell::new(0)),
             page_memo: Rc::new(RefCell::new(Vec::new())),
             disposers: Rc::new(RefCell::new(Vec::new())),
         }
@@ -1340,11 +1323,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
         {
             return view.clone();
         }
-        let name = Some({
-            let next = self.page_seq.get();
-            self.page_seq.set(next + 1);
-            format!("{}/page{next}", self.id_prefix)
-        });
+        let name = Some(self.graph.module_name(&format!("{}/page", self.id_prefix)));
         let backend = self.backend.clone();
         let materialize = move || {
             let all = backend.snapshot();
@@ -1431,8 +1410,6 @@ impl<T: Clone + 'static> ReactiveLog<T> {
 
     pub fn attach(&self, src: &Node<T>) -> Disposer {
         let graph = &self.graph;
-        let bind_idx = self.bind_seq.get();
-        self.bind_seq.set(bind_idx + 1);
         let backend = self.backend.clone();
         let delta = self.delta.clone();
         let op = Operator::with_opts(
@@ -1449,7 +1426,7 @@ impl<T: Clone + 'static> ReactiveLog<T> {
                 }
             },
         );
-        let mut opts = GraphNodeOpts::named(format!("{}/bind{bind_idx}", self.id_prefix));
+        let mut opts = GraphNodeOpts::named(graph.module_name(&format!("{}/bind", self.id_prefix)));
         opts.meta
             .insert("kind".to_owned(), "collection_bind_source".to_owned());
         opts.meta
@@ -1631,7 +1608,7 @@ pub fn merge_reactive_logs<T: Clone + 'static>(
             ctx.down(crate::protocol::data_wave(emitted));
         }),
         deps,
-        GraphNodeOpts::named(graph.module_name("mergedLogs")),
+        GraphNodeOpts::named(graph.module_name("mergeReactiveLogs")),
     )
 }
 
@@ -1897,7 +1874,7 @@ fn make_snapshot_request_node(
 ) -> State<()> {
     let request = graph.state_empty_opts(collection_node_opts(
         id_prefix,
-        "request",
+        "snapshotRequest",
         "collection_snapshot_request",
         restore_ref,
         restorable,
@@ -2100,8 +2077,9 @@ fn light_reactive_view<C: Clone + 'static, S: Clone + 'static, F: Fn() -> S + 's
         group.init_node(delta_op, vec![parent_delta.erased()], opts)
     };
     let snapshot_request: State<()> = {
-        let mut opts =
-            graph_node_opts_with_optional_name(name.as_ref().map(|n| format!("{n}/request")));
+        let mut opts = graph_node_opts_with_optional_name(
+            name.as_ref().map(|n| format!("{n}/snapshotRequest")),
+        );
         opts.meta.insert(
             "kind".to_owned(),
             "collection_view_snapshot_request".to_owned(),

@@ -1363,10 +1363,10 @@ fn graph_checkpoint_saves_a_collection_backend_as_private_state() {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<std::collections::BTreeMap<_, _>>();
-    assert!(view_by_id["map/select0/delta"].values.is_empty());
-    assert!(view_by_id["map/select0/snapshot"].values.is_empty());
+    assert!(view_by_id["map/select/delta"].values.is_empty());
+    assert!(view_by_id["map/select/snapshot"].values.is_empty());
     assert_eq!(
-        view_by_id["map/select0/snapshot"].private_state, None,
+        view_by_id["map/select/snapshot"].private_state, None,
         "collection light-view helper caches are also non-authoritative"
     );
 }
