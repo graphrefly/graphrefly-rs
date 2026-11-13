@@ -51,7 +51,7 @@ pub type GraphError = Box<dyn std::error::Error + 'static>;
 pub enum Message<T> {
     /// Subscribe handshake, followed by the node's snapshot (R-subscription).
     Start,
-    /// Kernel-only first message of each settling array (R-wave); formerly DIRTY.
+    /// Kernel-only first message of each settling array (R-wave).
     /// Node output containing PENDING is rejected.
     Pending,
     /// A real value. Absence of DATA is the SENTINEL (`None` per D16), represented
@@ -107,8 +107,8 @@ impl<T> std::fmt::Debug for Message<T> {
 /// One array of messages delivered by one call (R-wave).
 pub type Wave<T> = Vec<Message<T>>;
 
-/// `values` as one array of DATA, in order, for a single `ctx.down` (review Q4: the
-/// kernel's only per-call value sugar is `ctx.emit`; an empty array sends nothing).
+/// `values` as one array of DATA, in order, for a single `ctx.down`. The
+/// kernel's only per-call value sugar is `ctx.emit`; an empty array sends nothing.
 pub(crate) fn data_wave<T: 'static>(values: impl IntoIterator<Item = T>) -> Wave<AnyValue> {
     values
         .into_iter()

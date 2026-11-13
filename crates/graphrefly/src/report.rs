@@ -1,12 +1,12 @@
 //! The host reporter (R-failure@3): a callback that receives failures with no caller
 //! and no node to end, such as a sink that panics during a fanout. The kernel keeps
 //! no failure history. Without a reporter such a failure is written to standard
-//! error (review Q9); with one, it goes to the reporter only.
+//! error; with one, it goes to the reporter only.
 //!
 //! The reporter belongs to the graph, the concurrency domain (R-graph-domain@2): it
 //! is the `report` option of [`crate::GraphOptions`], as the reference's
-//! `createGraph({ report })` (graphrefly-rs:D6). Every node belongs to a graph
-//! (review Q2), so every failure has a graph whose option decides where it goes.
+//! `createGraph({ report })` (graphrefly-rs:D6). Every node belongs to a graph,
+//! so every failure has a graph whose option decides where it goes.
 
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -25,7 +25,7 @@ pub struct HostFailure {
 pub type HostReporter = Rc<dyn Fn(&HostFailure)>;
 
 /// Hands a failure to the domain's host reporter, or writes it to standard error when
-/// the graph has none (review Q9). A reporter that panics is ignored, so it cannot
+/// the graph has none. A reporter that panics is ignored, so it cannot
 /// break the wave it reports.
 pub(crate) fn report(reporter: Option<&HostReporter>, source: &str, payload: &(dyn Any + Send)) {
     let failure = HostFailure {

@@ -163,7 +163,7 @@ struct CqrsQueueState<TCommand> {
 }
 
 /// The part of [`CqrsQueueState`] that must outlive a lifetime: the terminal-claim
-/// dedupe, in the bundle's ledger (review Q13). Payloads, active claims and errors
+/// dedupe, in the bundle's ledger. Payloads, active claims and errors
 /// carry the command type and are the lifetime's own work.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct CqrsQueueLedger {

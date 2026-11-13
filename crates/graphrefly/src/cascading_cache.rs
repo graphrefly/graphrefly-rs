@@ -129,7 +129,7 @@ pub struct ReactiveCascadingCache<V: Clone + 'static> {
     pub events: Node<CascadingCacheEvent<V>>,
 }
 
-/// The request sequence and latest key: a ledger the bundle owns (review Q13), kept
+/// The request sequence and latest key: a ledger the bundle owns, kept
 /// as JSON.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct DriverState {

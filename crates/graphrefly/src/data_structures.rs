@@ -598,7 +598,7 @@ pub struct ReactiveList<T> {
     pub delta: Node<ListChange<T>>,
     pub snapshot: Node<Vec<T>>,
     /// Request state for `snapshot`: each write asks for one snapshot delivery
-    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    /// (graphrefly-rs:D1 (1)).
     pub snapshot_request: State<()>,
     backend: ListBackend<T>,
     max_size: Option<usize>,
@@ -787,7 +787,7 @@ pub struct ReactiveLog<T> {
     pub delta: Node<LogChange<T>>,
     pub snapshot: Node<Vec<T>>,
     /// Request state for `snapshot`: each write asks for one snapshot delivery
-    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    /// (graphrefly-rs:D1 (1)).
     pub snapshot_request: State<()>,
     backend: LogBackend<T>,
     graph: Graph,
@@ -800,7 +800,7 @@ pub struct ReactiveView<C, S> {
     pub delta: Node<C>,
     pub snapshot: Node<S>,
     /// Request state for `snapshot`: each write asks for one snapshot delivery
-    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    /// (graphrefly-rs:D1 (1)).
     pub snapshot_request: State<()>,
     disposed: Rc<Cell<bool>>,
     dispose_action: ViewDisposeAction,
@@ -811,7 +811,7 @@ pub struct ReactiveIndex<K, S, V> {
     pub delta: Node<IndexChange<K, S, V>>,
     pub snapshot: Node<Vec<IndexRow<K, S, V>>>,
     /// Request state for `snapshot`: each write asks for one snapshot delivery
-    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    /// (graphrefly-rs:D1 (1)).
     pub snapshot_request: State<()>,
     backend: IndexBackend<K, S, V>,
     graph: Graph,
@@ -824,7 +824,7 @@ pub struct ReactiveMap<K, V> {
     pub delta: Node<MapChange<K, V>>,
     pub snapshot: Node<BTreeMap<K, V>>,
     /// Request state for `snapshot`: each write asks for one snapshot delivery
-    /// (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    /// (graphrefly-rs:D1 (1)).
     pub snapshot_request: State<()>,
     backend: MapBackend<K, V>,
     graph: Graph,

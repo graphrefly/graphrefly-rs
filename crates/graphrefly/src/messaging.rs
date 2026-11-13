@@ -1,7 +1,7 @@
 //! Graph-visible messaging application infrastructure.
 //!
 //! D279/D282/D284/D285/D276 define `messageBus` as a retained topic log plus
-//! independent subscription cursors. DynamicHub is intentionally retired: topic
+//! independent subscription cursors. Topic
 //! lifecycle, publish, cursor movement, status, and issues are graph-visible
 //! command/fact streams on one static bus surface.
 
@@ -771,7 +771,7 @@ pub struct MessageBusAvailableParams {
 pub struct MessageBusProjection<TPage, TRequest> {
     pub snapshot: Node<TPage>,
     /// Request state for `snapshot`: each write asks for one page with the written
-    /// params (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    /// params (graphrefly-rs:D1 (1)).
     pub snapshot_request: State<TRequest>,
     pub status: Node<MessageBusStatus>,
     pub issues: Node<DataIssue>,

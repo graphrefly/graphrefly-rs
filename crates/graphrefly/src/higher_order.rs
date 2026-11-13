@@ -82,18 +82,6 @@ pub fn merge_map_with_options<TIn: Clone + 'static, TOut: 'static>(
     )
 }
 
-/// flat_map: alias-shaped Rust helper for [`merge_map`].
-pub fn flat_map<TIn: Clone + 'static, TOut: 'static>(
-    project: impl Fn(&TIn) -> Node<TOut> + 'static,
-) -> Operator<TOut> {
-    map_operator(
-        "flatMap",
-        move |_ctx, value| project(value),
-        Mode::Merge,
-        None,
-    )
-}
-
 /// concat_map: queue source values and run one projected inner at a time.
 pub fn concat_map<TIn: Clone + 'static, TOut: 'static>(
     project: impl Fn(&TIn) -> Node<TOut> + 'static,

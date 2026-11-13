@@ -594,7 +594,7 @@ pub struct WorkQueueDeadLetterParams {
 pub struct WorkQueueProjection<TPage, TRequest = ()> {
     pub snapshot: Node<TPage>,
     /// Request state for `snapshot`: each write asks for one page with the written
-    /// params (graphrefly-rs:D1 (1); it replaces the retired PULL pull id).
+    /// params (graphrefly-rs:D1 (1)).
     pub snapshot_request: State<TRequest>,
     pub status: Node<WorkQueueStatus>,
     pub issues: Node<DataIssue>,

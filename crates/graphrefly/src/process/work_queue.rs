@@ -132,7 +132,7 @@ struct ProcessQueueState<TEffect> {
 }
 
 /// The part of [`ProcessQueueState`] that must outlive a lifetime: the terminal-record
-/// dedupe and the audit sequence, in the bundle's ledger (review Q13). The payloads
+/// dedupe and the audit sequence, in the bundle's ledger. The payloads
 /// are the lifetime's own work.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ProcessQueueLedger {

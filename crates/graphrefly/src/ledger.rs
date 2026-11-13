@@ -1,4 +1,4 @@
-//! Bundle-owned ledgers (review Q13; the shape of graphrefly-ts:D180).
+//! Bundle-owned ledgers (graphrefly-ts:D180).
 //!
 //! A ledger that carries idempotency, a cursor or an audit sequence must not reset
 //! when a node's lifetime closes. The bundle owns it as a state node holding strict
@@ -156,7 +156,7 @@ mod tests {
         g.find(id)?.as_node::<Value>().cache()
     }
 
-    /// Review Q13 — a capture in the middle of a lifetime keeps the working copy (the
+    /// A capture in the middle of a lifetime keeps the working copy (the
     /// ledger is written only at a close), and the restored instance goes on from it;
     /// its next close writes the restored ledger.
     #[test]

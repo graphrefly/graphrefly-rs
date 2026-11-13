@@ -175,8 +175,8 @@ enum ScheduledReadinessFact {
     Views(ScheduledReadinessViews),
 }
 
-/// The emitted and issue keys and the audit sequence: a ledger the bundle owns
-/// (review Q13). The schedules and views are the lifetime's cache.
+/// The emitted and issue keys and the audit sequence: a ledger the bundle owns.
+/// The schedules and views are the lifetime's cache.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ScheduledReadinessLedger {
     emitted_keys: BTreeSet<String>,

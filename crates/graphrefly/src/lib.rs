@@ -259,8 +259,7 @@ pub use graph::{
     TopologyNode, TopologyOpts, TopologySnapshot, TopologyStream, Values,
 };
 pub use higher_order::{
-    concat_map, exhaust_map, flat_map, merge_map, merge_map_with_options, repeat, switch_map,
-    MergeMapOptions,
+    concat_map, exhaust_map, merge_map, merge_map_with_options, repeat, switch_map, MergeMapOptions,
 };
 pub use json::{
     assert_decimal_integer_string, assert_non_negative_decimal_integer_string,

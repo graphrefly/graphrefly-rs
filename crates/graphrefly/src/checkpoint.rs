@@ -45,12 +45,11 @@ use crate::json::validate_strict_json_value;
 use crate::node::{Core, NodeSeed, Policy};
 use crate::protocol::AnyValue;
 
-/// The tag of this package's checkpoint layout (R-checkpoint@1, graphrefly:D802; review
-/// Q5): each package defines its own layout, so the tag names the package. The layout:
+/// The tag of this package's checkpoint layout (R-checkpoint@1, graphrefly:D802):
+/// each package defines its own layout, so the tag names the package. The layout:
 /// each node's last-array values, terminal (an ERROR payload included), private state,
 /// received inputs and lifetime dependencies; no status, lifecycle or version
-/// evidence. A checkpoint with any other tag is refused, the earlier
-/// `graphrefly.checkpoint.v2` (a string TS used for a different layout) included.
+/// evidence. A checkpoint with any other tag is refused.
 pub const GRAPH_CHECKPOINT_VERSION: &str = "graphrefly-rs/checkpoint@1";
 
 pub type GraphCheckpointJson = Value;

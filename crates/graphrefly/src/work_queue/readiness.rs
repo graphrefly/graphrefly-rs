@@ -247,7 +247,7 @@ struct HandoffState {
 }
 
 /// The emitted-key dedupe and the audit sequence of a readiness runtime: a ledger the
-/// bundle owns (review Q13). The views the runtime keeps are the lifetime's cache.
+/// bundle owns. The views the runtime keeps are the lifetime's cache.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ReadinessLedger {
     emitted: BTreeSet<String>,

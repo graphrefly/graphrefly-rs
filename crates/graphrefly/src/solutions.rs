@@ -739,7 +739,7 @@ pub fn agentic_memory_bundle<T: Clone + 'static>(
     crate::graph::assert_local_name(&name);
     let records = opts.records;
     let query = opts.query;
-    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    // The evaluation cursor is a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/projectionLedger"),
@@ -938,7 +938,7 @@ pub fn agentic_memory_kg_projection_bundle<T: Clone + 'static>(
     crate::graph::assert_local_name(&name);
     let records = opts.records;
     let drafts = opts.drafts;
-    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    // The evaluation cursor is a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/snapshotLedger"),
@@ -1126,7 +1126,7 @@ pub fn agentic_memory_retention_bundle<T: Clone + 'static>(
     crate::graph::assert_local_name(&name);
     let records = opts.records;
     let commands = opts.commands;
-    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    // The evaluation cursor is a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/snapshotLedger"),
@@ -1326,7 +1326,7 @@ pub fn agentic_memory_consolidation_bundle<T: Clone + 'static>(
     crate::graph::assert_local_name(&name);
     let requests = opts.requests;
     let outcomes = opts.outcomes;
-    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    // The evaluation cursor is a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/snapshotLedger"),
@@ -1470,7 +1470,7 @@ pub fn agentic_memory_context_packing_bundle<T: Clone + 'static>(
     let context = opts.context;
     let texts = opts.texts;
     let policy = opts.policy;
-    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    // The evaluation cursor is a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/snapshotLedger"),

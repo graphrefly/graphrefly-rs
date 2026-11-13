@@ -31,7 +31,7 @@
 //! releasing its dependencies, running its cleanup and dropping its private state.
 //! Requests made during a wave (host writes, subscribes, replaces, rewires, a
 //! batch's commit) wait and run in order after it. Activation, delivery and closing
-//! run with a constant stack depth, however long the graph (review Q15).
+//! run with a constant stack depth, however long the graph.
 
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashSet, VecDeque};
@@ -131,7 +131,7 @@ pub enum Policy {
 /// (D6/D24); this is the minimal substrate surface: the node's policies (the
 /// dep-terminal propagation policy among them, R-deps-terminal), setup and recipe.
 ///
-/// A node has no runtime version (D109 is retired, review Q7):
+/// A node has no runtime version:
 ///
 /// ```compile_fail
 /// let _ = graphrefly::NodeOpts { versioning: None, ..Default::default() };
@@ -422,7 +422,7 @@ struct GraphCore {
     domain: DomainRef,
 }
 
-/// One node's parts, kept together in its arena entry (review §5.6).
+/// One node's parts, kept together in its arena entry.
 struct NodeSlot {
     topology: NodeTopologySlot,
     call: NodeCallSlot,
@@ -444,7 +444,7 @@ struct ArenaEntry {
 /// A graph's concurrency domain (R-graph-domain@3): its own wave scope, delivery
 /// scope, request queue and batch frame. Graphs on one thread share none of them: a
 /// request to one graph is never held by another graph's wave or batch. Every node
-/// belongs to a graph (review Q2), so every node has a domain.
+/// belongs to a graph, so every node has a domain.
 pub(crate) struct Domain {
     wave: RefCell<Option<WaveScope>>,
     delivery_depth: Cell<usize>,
@@ -454,13 +454,13 @@ pub(crate) struct Domain {
     draining: Cell<bool>,
     /// The deferred settles are being drained: a delivery that ends inside the drain
     /// leaves its settles to the running loop instead of draining again, so a long
-    /// chain settles with a constant stack depth (review Q15).
+    /// chain settles with a constant stack depth.
     settling: Cell<bool>,
-    /// Lifetime closes in progress, as work items run by one loop (review Q15).
+    /// Lifetime closes in progress, as work items run by one loop.
     closing: RefCell<VecDeque<CloseWork>>,
     closing_loop: Cell<bool>,
     /// Nodes whose dependents still have to receive the pending mark, passed on by one
-    /// loop (review Q15); only dependent nodes receive a lone mark, so its order is not
+    /// loop; only dependent nodes receive a lone mark, so its order is not
     /// observable.
     marking: RefCell<VecDeque<Core>>,
     marking_loop: Cell<bool>,
@@ -1247,7 +1247,7 @@ fn free_taken_slot(graph_ref: &Rc<RefCell<GraphCore>>, key: NodeKey, mut slot: N
     drop(free_slot);
     // The freed node's parts hold handles to its dependencies, whose own frees would
     // nest one level per node: they are dropped by one loop instead, so a long chain
-    // frees with a constant stack depth (review Q15).
+    // frees with a constant stack depth.
     drop_later(Box::new(slot));
 }
 
@@ -1760,8 +1760,8 @@ fn with_delivery_scope(domain: &DomainRef, body: impl FnOnce()) {
 
 /// Runs the settles deferred to the delivery boundary. One loop serves the domain: a
 /// delivery that ends while it runs leaves its settles to it, and the settles a step
-/// adds run before the rest of the batch, the order nested drains gave, with a
-/// constant stack depth however long the chain (review Q15).
+/// adds run before the rest of the batch, with a constant stack depth however long
+/// the chain.
 fn drain_deferred_runs(d: &Domain) {
     if d.settling.get() {
         return;
@@ -2407,8 +2407,7 @@ impl Core {
         });
         // The inactive nodes upstream are activated first, deepest first, each held by
         // a temporary subscription, so no activation recurses into its dependencies
-        // and a long chain activates with a constant stack depth (review Q15). The
-        // order of first runs is the one nested activations gave.
+        // and a long chain activates with a constant stack depth.
         let holds = self.hold_inactive_upstream();
         self.activate_on_held_deps();
         for release in holds.into_iter().rev() {
@@ -2542,7 +2541,7 @@ impl Core {
     fn finish_close(&self, unsubs: Vec<Unsub>, lifetime: Option<crate::lifetime::Lifetime>) {
         // The releases, then this node's cleanup, as work items in front of whatever
         // close is in progress: a released dependency's own close runs before the rest
-        // of this one, as nested calls did, with a constant stack depth (review Q15).
+        // of this one, with a constant stack depth.
         let d = self.domain();
         {
             let mut work = d.closing.borrow_mut();
@@ -2959,7 +2958,7 @@ impl Core {
                 !n.deps.is_empty() && e.state.inputs.iter().all(|input| input.ended.is_some());
             // Under auto COMPLETE the node completes after the run that sees the last
             // terminal, so that run happens even when the terminal is its only input
-            // (R-terminals@1, C-17; graphrefly:D806, review Q12).
+            // (R-terminals@1, C-17; graphrefly:D806).
             let last_terminal = cfg.complete == Policy::Auto
                 && all_ended
                 && e.state.inputs.iter().any(|input| {
@@ -3055,7 +3054,7 @@ impl Core {
 
     /// A lifetime's first run, on the dependencies' snapshots (R-lifetime@2). The kernel
     /// has no first-run gate: waiting for every dependency to have a value is
-    /// derived and effect sugar (graphrefly:D797 (9), review Q1).
+    /// derived and effect sugar (graphrefly:D797 (9)).
     fn first_run(&self) {
         let all = self.first_run_frames();
         if !all.is_empty() {
@@ -3735,7 +3734,7 @@ fn same_ordered_deps(old_deps: &[Core], new_deps: &[Core]) -> bool {
 /// No `PartialEq` bound (D49: the substrate does no value-equality — dedup is
 /// opt-in at the operator layer, e.g. `distinctUntilChanged`).
 ///
-/// Every node belongs to a [`Graph`](crate::Graph) (review Q2): it is built by the
+/// Every node belongs to a [`Graph`](crate::Graph): it is built by the
 /// graph (`graph.state`, `graph.node`, ...), and a batch is the graph's. There is no
 /// constructor outside a graph and no free `batch`:
 ///
@@ -3760,7 +3759,7 @@ pub struct Node<T> {
 
 impl<T: 'static> Node<T> {
     // Arena-level constructors for the kernel's own unit tests; shipped code builds
-    // every node through a Graph (review Q2).
+    // every node through a Graph.
     #[cfg(test)]
     pub(crate) fn state_in_arena(arena: &GraphArena, initial: T) -> Node<T> {
         Self::state_in_arena_with_dispatcher(arena, default_dispatcher(), initial)
@@ -4469,7 +4468,7 @@ mod tests {
         let g = crate::graph::graph();
         // The kernel runs a function on whatever its dependencies delivered; waiting
         // for every dependency to have a value is derived and effect sugar
-        // (graphrefly:D797 (9), review Q1).
+        // (graphrefly:D797 (9)).
         let a = g.state_empty::<i32>();
         let b = g.state_empty::<i32>();
         let runs = Rc::new(Cell::new(0usize));
@@ -4586,10 +4585,8 @@ mod tests {
     #[test]
     fn b32_dropped_node_unregisters_its_fn_releasing_captures() {
         let g = TestArena::new();
-        // B32: the dispatcher's function table no longer holds a dropped node's fn forever. Before the
-        // slotmap + unregister-on-Drop, a registered fn lived for the process, pinning the
-        // upstream `Core`s it captured (the no-GC leak). Probe via a guard captured by the
-        // fn: when the node drops, its fn slot is freed → the fn (and the guard) drop.
+        // A guard captured by the fn verifies that dropping the node frees its fn
+        // slot, releasing the fn and its captured handles.
         struct DropFlag(Rc<Cell<bool>>);
         impl Drop for DropFlag {
             fn drop(&mut self) {

@@ -15,7 +15,7 @@ use futures_core::Stream;
 use graphrefly::{
     audit, audit_time, buffer, buffer_count, buffer_time, combine, concat, concat_map, debounce,
     delay, distinct_until_changed, element_at, empty, exhaust_map, filter, find, first, first_any,
-    first_sync_value_from, flat_map, from_cron, from_cron_with_options, from_fs_watch,
+    first_sync_value_from, from_cron, from_cron_with_options, from_fs_watch,
     from_fs_watch_with_options, from_git_hook, from_git_hook_with_options, from_http, from_iter,
     from_process, from_sse, from_sse_with_options, from_timer, from_webhook,
     from_webhook_with_options, from_websocket, future_local, graph, interval, last, last_any, map,
@@ -4463,20 +4463,20 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
     concat_inner_1.complete();
     assert_eq!(*concat_shapes.borrow(), vec!["DATA", "DATA", "COMPLETE"]);
 
-    let flat_source = g.init_node(
+    let single_source = g.init_node(
         from_iter(vec![3i32]),
         vec![],
-        GraphNodeOpts::named("flat_outer"),
+        GraphNodeOpts::named("single_outer"),
     );
-    let flattened = g.init_node(
-        flat_map::<i32, i32>({
+    let merged_single = g.init_node(
+        merge_map::<i32, i32>({
             let g = g.clone();
             move |v| g.state(*v * 10).into_node()
         }),
-        vec![flat_source.erased()],
-        GraphNodeOpts::named("flat_map"),
+        vec![single_source.erased()],
+        GraphNodeOpts::named("merged_single"),
     );
-    assert_eq!(*collect_data(&flattened).borrow(), vec![30]);
+    assert_eq!(*collect_data(&merged_single).borrow(), vec![30]);
 
     let snap = graphrefly::topology::snapshot(&g);
     let factories = snap
@@ -4486,7 +4486,7 @@ fn higher_order_merge_concat_and_flatten_lifecycle_are_pinned() {
         .collect::<Vec<_>>();
     assert!(factories.contains(&("merge_map", "mergeMap")));
     assert!(factories.contains(&("concat_map", "concatMap")));
-    assert!(factories.contains(&("flat_map", "flatMap")));
+    assert!(factories.contains(&("merged_single", "mergeMap")));
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //! addressed by a pure-data [`Handle`]: its index and the slot's generation (D7,
 //! B32). The table's
 //! make-up is this crate's implementation, not protocol, and it has no pools
-//! (graphrefly:D807; review §5.6 of the D797 migration): an async function kicks
+//! (graphrefly:D807): an async function kicks
 //! off work and emits later through a kept [`crate::ctx::DeferredCtx`], with the
 //! same synchronous invoke.
 
@@ -42,11 +42,8 @@ struct Slot {
 /// The dispatcher's one function table: a **slotmap** of fns addressed by
 /// `(index, generation)`.
 ///
-/// B32: a node's fn is freed (slot recycled) when the node drops, so the table no
-/// longer holds a dropped node's fn — and thus its captured upstream handles —
-/// alive for the whole process (the no-GC leak; `Node: Clone` made capturing
-/// handles-into-fns idiomatic). Without this, every registered fn leaked, pinning
-/// its captured `Core`s forever.
+/// A node's fn is freed (slot recycled) when the node drops, releasing its captured
+/// upstream handles (B32).
 struct FunctionTable {
     slots: Vec<Slot>,
     /// Recycled (freed) slot ids, reused on the next register.
@@ -110,7 +107,7 @@ impl FunctionTable {
 }
 
 struct DispatcherInner {
-    /// The one function table (graphrefly:D807; review §5.6).
+    /// The one function table (graphrefly:D807).
     functions: FunctionTable,
     /// Opt-in profile recorder (D39 / R-profile). Default off = one boolean branch
     /// per invoke; counters live on the dispatcher, not on the thin node.

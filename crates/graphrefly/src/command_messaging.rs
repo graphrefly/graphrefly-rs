@@ -1,6 +1,5 @@
-//! The command-over-message-bus recipe, written once for the CQRS and process
-//! bundles (review §4.2: the two copies differed in nothing but names): retained
-//! delivery is lowered to the bundle's command facts, and ack commands are emitted
+//! The command-over-message-bus recipe shared by the CQRS and process
+//! bundles: retained delivery is lowered to the bundle's command facts, and ack commands are emitted
 //! only after a graph-visible accepted/rejected status or lowering issue exists;
 //! receiving a retained message is never itself an ack. Each bundle's `messaging`
 //! module instantiates [`command_messaging_recipe`] with its own types.
@@ -143,8 +142,8 @@ macro_rules! command_messaging_recipe {
             Issue(DataIssue),
         }
 
-        /// The pending deliveries an ack is matched against: a ledger the bundle owns
-        /// (review Q13), kept as JSON.
+        /// The pending deliveries an ack is matched against: a ledger the bundle owns,
+        /// kept as JSON.
         #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
         struct AckState {
             deliveries: BTreeMap<String, Vec<MessageBusDelivery>>,

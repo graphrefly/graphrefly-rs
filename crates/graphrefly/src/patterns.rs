@@ -667,7 +667,7 @@ pub fn memory_retrieval_bundle<T: Clone + 'static>(
     crate::graph::assert_local_name(&name);
     let fragments = opts.fragments;
     let query = opts.query;
-    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    // The evaluation cursor is a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/snapshotLedger"),
@@ -854,7 +854,7 @@ pub fn knowledge_graph_reducer_bundle(
         deps.push(policy.erased());
     }
     let has_policy = policy.is_some();
-    // The evaluation cursor is a ledger the bundle owns (review Q13).
+    // The evaluation cursor is a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/snapshotLedger"),

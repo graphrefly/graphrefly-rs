@@ -260,7 +260,7 @@ pub enum WireBridgeEvent<TOutbound, TInbound> {
 }
 
 /// One event of a wire bridge with its index: a number local to the bridge, from 1,
-/// one more for each event the bridge emits, whatever its kind (review Q13). It is
+/// one more for each event the bridge emits, whatever its kind. It is
 /// not an envelope's seq.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireBridgeIndexedEvent<TOutbound, TInbound> {
@@ -774,7 +774,7 @@ struct BridgeState<T> {
     next_seq: u64,
     cursor: u64,
     remote_cursor: u64,
-    /// The index the next event gets (review Q13).
+    /// The index the next event gets.
     next_index: u64,
     pending: BTreeMap<u64, PendingEnvelope<T>>,
 }
@@ -971,7 +971,7 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
-    // The pending-request correlation: a ledger the bundle owns (review Q13).
+    // The pending-request correlation: a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/responsesLedger"),
@@ -1362,7 +1362,7 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
-    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    // Correlation, dedupe and audit state: a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/statusLedger"),
@@ -1610,7 +1610,7 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
-    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    // Correlation, dedupe and audit state: a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/errorsLedger"),
@@ -1787,7 +1787,7 @@ where
     TResponse: Clone + 'static,
 {
     let session_id = bridge.inbound.session_id().to_owned();
-    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    // Correlation, dedupe and audit state: a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/cursorLedger"),
@@ -1975,7 +1975,7 @@ where
     TRequest: Clone + 'static,
     TResponse: Clone + 'static,
 {
-    // Correlation, dedupe and audit state: a ledger the bundle owns (review Q13).
+    // Correlation, dedupe and audit state: a ledger the bundle owns.
     let ledger = crate::ledger::Ledger::new(
         graph,
         format!("{name}/statusLedger"),
@@ -2227,7 +2227,7 @@ where
     )
 }
 
-/// Emits `event` with the bridge's next index (review Q13).
+/// Emits `event` with the bridge's next index.
 fn emit_event<TOutbound: Clone + 'static, TInbound: Clone + 'static>(
     ctx: &Ctx,
     state: &Rc<RefCell<BridgeState<TOutbound>>>,
@@ -3034,7 +3034,7 @@ where
     TOutbound: Clone + 'static,
     TInbound: Clone + 'static,
 {
-    // The status counters are an audit ledger the bundle owns (review Q13), with the
+    // The status counters are an audit ledger the bundle owns, with the
     // index of the last event they counted: a new lifetime starts on the events node's
     // snapshot, which replays its last array, and skips every event at or below that
     // high water, so a reactivated status never counts an event twice.
@@ -3075,7 +3075,7 @@ where
     )
 }
 
-/// The bridge status and the index of the last event it counted (review Q13).
+/// The bridge status and the index of the last event it counted.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StatusLedger {
     status: WireBridgeStatus,

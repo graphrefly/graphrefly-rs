@@ -551,7 +551,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<CanonicalWireBridgeMetadata, Canonical
 }
 
 fn parse_data_payload(bytes: &[u8]) -> Result<CanonicalWireBridgeDataBody, CanonicalProtobufError> {
-    // Field 2 carried the per-edge WireEdgeFrame until D803 and is reserved.
+    // Field 2 is reserved.
     let fields = read_fields(bytes, &[(1, 2), (3, 2)], "WireBridgeDataPayload")?;
     let value = bytes_field(&fields, 1);
     let edge_cause = bytes_field(&fields, 3);

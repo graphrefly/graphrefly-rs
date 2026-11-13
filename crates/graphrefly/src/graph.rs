@@ -45,7 +45,7 @@ pub struct GraphOptions {
     pub environment: EnvironmentDrivers,
     /// The host reporter (R-failure@3): failures in this graph with no caller and no
     /// node to end, such as a panicking sink or cleanup, go to it, and only to it.
-    /// Without one they are written to standard error (review Q9); a panicking
+    /// Without one they are written to standard error; a panicking
     /// reporter is ignored (graphrefly-rs:D6).
     pub report: Option<crate::HostReporter>,
 }
@@ -1440,8 +1440,8 @@ pub struct Explain {
     pub to: String,
 }
 
-/// The gate of `derived` and `effect` (sugar, not kernel: graphrefly:D797 (9), review
-/// Q1): the callback runs once every dependency has a value, and after that when a
+/// The gate of `derived` and `effect` (sugar, not kernel: graphrefly:D797 (9)):
+/// the callback runs once every dependency has a value, and after that when a
 /// dependency sent DATA in this invocation. A dependency's latest value is kept while
 /// the gate waits, so the first callback sees every value. A node with no
 /// dependencies runs on its first run.
